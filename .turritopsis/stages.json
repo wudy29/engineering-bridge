@@ -1,0 +1,55 @@
+{
+  "title": "Engineering Bridge",
+  "subtitle": "Turritopsis Stage-1 handoff index; checked-in Engineering Bridge docs remain authoritative.",
+  "version": 1,
+  "currents": [
+    {
+      "id": "handoff",
+      "name": "Handoff",
+      "blurb": "Current work, next step, and do-not-redo",
+      "stages": [
+        {
+          "id": "handoff.current",
+          "title": "Current handoff",
+          "body": "# Current handoff\n\nType: handoff\nPurpose: Let a blank agent resume the Engineering Bridge project without a long chat handoff.\nSearch hints: current work next step do not redo Turritopsis pilot\nSummary: Stage-1 continuity skeleton only; formal checked-in docs remain authoritative and live Git/runtime must be re-verified through Engineering Bridge.\nVerified: 2026-09-04 against live repo state and official Turritopsis 0.2.0 source\nStatus: current\nAuthority: project navigation and current handoff only\n\n## Current work\n- Establish the minimal Turritopsis handoff skeleton for Engineering Bridge; do not change business code.\n- Turritopsis does not replace design, spec, acceptance, incident, Git, or runtime evidence.\n\n## Next\n- After a reviewed APPLY, provision an isolated Python >=3.10 runtime outside this patch and outside the personal Bridge deployment.\n- Install Turritopsis 0.2.0 from its official source checkout, then run the blank-agent A/B handoff test.\n- Before any project action, BIND this repo through Engineering Bridge and re-check branch, HEAD, git status, and relevant runtime state.\n\n## Do not redo\n- Do not re-brainstorm whether Turritopsis is worth using.\n- Do not bulk-copy formal docs or project history into Turritopsis.\n- Do not enable scan, automatic maintenance, cron, LLM/API keys, screenpipe, Peekaboo, ContextKeep, or a second agent memory.\n- Until read-only tool exposure is implemented, the upstream four-tool Turritopsis server must NOT be connected directly to ChatGPT.\n- Do not treat stored Git/runtime values as live truth."
+        }
+      ]
+    },
+    {
+      "id": "bounds",
+      "name": "Bounds",
+      "blurb": "Non-negotiable engineering boundaries",
+      "stages": [
+        {
+          "id": "bounds.invariants",
+          "title": "Engineering bounds",
+          "body": "# Engineering bounds\n\nType: boundary\nPurpose: Route questions about non-negotiable Engineering Bridge boundaries.\nSearch hints: boundary write gate apply commit validation authoritative docs\nSummary: Formal repo docs are truth; Turritopsis only points to them, and writes remain behind Bridge gates.\nVerified: 2026-09-04 against current checked-in docs\nStatus: current\nAuthority: pilot boundaries and source locators, not replacement specifications\n\n## Boundaries\n- Formal truth: docs/architecture.md, docs/security.md, docs/threat-model.md, docs/tools.md, docs/superpowers/specs/, docs/superpowers/plans/, and RELEASE_NOTES.md.\n- run_task is read-only; that is not OS-level filesystem read containment. Locator: docs/architecture.md § Read-only supervised task flow.\n- APPLY is the exact controlled file-application checkpoint; validation does not grant write permission. Locators: docs/architecture.md § Controlled patch flow; docs/tools.md validate_controlled_patch.\n- COMMIT is a separate Git-history checkpoint, never pushes, and does not rewrite a created commit after post-commit verification failure. Locators: docs/architecture.md § Controlled patch flow; docs/tools.md commit_controlled_patch.\n- This pilot may expose/use only Turritopsis `list_stages`, `search_stages`, and `get_stage`; upstream `update_stage` is NOT an authorized Engineering Bridge write path; any update to tracked `.turritopsis/stages.json` must go through the Engineering Bridge controlled-patch path.\n- This pilot changes no business code, personal deployment, runtime automation, or release state."
+        }
+      ]
+    },
+    {
+      "id": "decisions",
+      "name": "Decisions",
+      "blurb": "Durable design decisions and source locators",
+      "stages": [
+        {
+          "id": "decisions.key",
+          "title": "Key decisions",
+          "body": "# Key decisions\n\nType: decision\nPurpose: Route a blank agent to durable Engineering Bridge design decisions and their authoritative sources.\nSearch hints: decision architecture write gate workspace trust persistence validation\nSummary: Keep only a few durable decisions here; read the linked source before relying on details.\nVerified: 2026-09-04 against current checked-in docs\nStatus: current\nAuthority: decision signposts only\n\n## Decisions\n1. Read execution and controlled writes are separated; prompt compliance is not a security boundary. Locators: docs/architecture.md § Read-only supervised task flow and § Security boundaries; docs/security.md § Enforced in code.\n2. APPLY and COMMIT are distinct human-confirmed checkpoints; COMMIT never pushes. Locators: docs/architecture.md § Controlled patch flow; docs/tools.md commit_controlled_patch.\n3. Manual workspace registrations remain authoritative; managed onboarding is constrained by canonical project_root containment and exact confirmations. Locator: docs/security.md § Workspace trust.\n4. Validation is read-only and cannot confer write permission or mutate proposal state. Locators: docs/architecture.md § Controlled patch flow; docs/tools.md validate_controlled_patch.\n5. Active supervision is process-local; persisted sidecars are not an audit log. Locator: docs/security.md § Persistence boundary."
+        }
+      ]
+    },
+    {
+      "id": "incidents",
+      "name": "Incidents",
+      "blurb": "Resolved regressions that affect future judgment",
+      "stages": [
+        {
+          "id": "incidents.key",
+          "title": "Incident signposts",
+          "body": "# Incident signposts\n\nType: incident\nPurpose: Route future agents to regressions that changed Engineering Bridge engineering judgment.\nSearch hints: incident regression BOM watchdog recovery anchor unborn root commit\nSummary: These are resolved signposts; inspect RELEASE_NOTES.md and the fixing commit before changing adjacent logic.\nVerified: 2026-09-04 against current Git history and RELEASE_NOTES.md\nStatus: historical\nAuthority: incident locators only\n\n## Incidents\n1. UTF-8 BOM workspace configs were rejected; v1.4.1 accepts exactly one leading BOM while keeping strict JSON parsing. Fixed by 8d06495dc23e1fa47fa51380b85d1abf0e00bdaa. Locator: RELEASE_NOTES.md § v1.4.1 / Fixed.\n2. Wrong-thread or wrong-turn notifications could keep an active turn alive; watchdog liveness now requires exact threadId and turnId. Fixed by 8d06495dc23e1fa47fa51380b85d1abf0e00bdaa. Locator: RELEASE_NOTES.md § v1.4.1 / Fixed.\n3. Controlled COMMIT could disturb unrelated untracked recovery anchors; preservation and post-commit behavior were tightened. Fixed by 2769b4a2bdf6908c7b18e9166c9d29a78d626d62. Locator: RELEASE_NOTES.md § v1.4.1 / Fixed.\n4. Controlled COMMIT failed on fresh unborn repositories; v1.4.2 added exact root-commit handling and verification. Fixed by dd7f2e50766a1cc85efacdbe982d88d8ecba9c6e; release commit de09c35de9f7611bc0ee8c592bef4feb38e22e32. Locator: RELEASE_NOTES.md § v1.4.2."
+        }
+      ]
+    }
+  ]
+}

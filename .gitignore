@@ -9,3 +9,14 @@ var/
 .DS_Store
 *.tsbuildinfo
 .worktrees/
+
+# Turritopsis Stage-1 generated/runtime state
+.turritopsis/backups/
+.turritopsis/proposals/
+.turritopsis/changelog.jsonl
+.turritopsis/maintenance.jsonl
+.turritopsis/scan-evidence.json
+.turritopsis/scan-anomalies.json
+.turritopsis/scan-run.json
+.turritopsis/*.lock
+.turritopsis/*.tmp
