@@ -136,7 +136,7 @@ test("records completed output and preserves the instruction", async () => {
 
   await waitForTerminal(service, taskId);
 
-  assert.deepEqual(calls, [{ taskId, instruction }]);
+  assert.deepEqual(calls.map(({ onDiagnostics: _onDiagnostics, ...request }) => request), [{ taskId, instruction }]);
   assert.deepEqual(service.status(taskId), { taskId, state: "completed" });
   assert.deepEqual(service.result(taskId), { id: taskId, state: "completed", output: "exact output\n\n" });
 });
@@ -418,7 +418,7 @@ test("an interrupted interactive task without any partial output omits the field
   });
 });
 
-test("failed and interrupted interactive results do not expose executor diagnostics", async () => {
+test("failed and interrupted interactive results retain the latest executor diagnostics", async () => {
   const results: ExecutorResult[] = [
     {
       kind: "failed",
@@ -463,7 +463,7 @@ test("failed and interrupted interactive results do not expose executor diagnost
 
     const view = service.taskView(taskId);
     assert.equal(view?.state, "failed");
-    assert.equal("diagnostics" in (view ?? {}), false, result.kind);
+    assert.deepEqual(view?.diagnostics, result.diagnostics, result.kind);
   }
 });
 
@@ -1173,3 +1173,63 @@ test("submitControlledPatchTask registers a retained completed task with submitt
   assert.equal("executor" in (view ?? {}), false);
   assert.equal(view?.state, "completed");
 });
+
+
+for (const path of ["legacy", "interactive"] as const) {
+  test(`${path} task views expose live executor phase diagnostics while running`, async () => {
+    const pending = deferred<ExecutorResult>();
+    let runningRequest: ExecutorRequest | undefined;
+    const executor: Executor = {
+      execute: (request) => { runningRequest = request; return pending.promise; }
+    };
+    const service = new RegisteredWorkspaceTaskService(registry(), () => executor);
+    const request = { workspace_id: "known", instruction: "inspect" };
+    const { taskId } = path === "legacy" ? service.runTask(request) : service.startTask(request);
+    await Promise.resolve();
+    const progress = {
+      executor_started_at: "2026-09-07T01:02:03.004Z",
+      protocol_phase: "initialize",
+      rpc_method: "initialize",
+      last_activity_at: "2026-09-07T01:02:03.004Z"
+    };
+    runningRequest?.onDiagnostics?.(progress);
+    try {
+      const view = service.taskView(taskId);
+      assert.equal(view?.state, "running");
+      assert.equal(view?.ready, false);
+      assert.deepEqual(view?.diagnostics, progress);
+      assert.equal("executor_ended_at" in (view?.diagnostics ?? {}), false);
+      assert.equal(service.result(taskId), undefined);
+    } finally {
+      pending.resolve({ kind: "completed", output: "done" });
+      if (path === "legacy") await waitForTerminal(service, taskId);
+      else await waitForInteractiveReady(service, taskId);
+    }
+  });
+}
+
+for (const kind of ["completed", "failed", "interrupted"] as const) {
+  test(`legacy ${kind} task retains executor diagnostics alongside finalization times`, async () => {
+    const diagnostics = {
+      executor_started_at: "2026-09-07T01:02:03.004Z",
+      executor_ended_at: "2026-09-07T01:02:04.005Z",
+      protocol_phase: "turn/start",
+      rpc_method: "turn/start",
+      rpc_timeout: kind === "failed",
+      last_activity_at: "2026-09-07T01:02:03.500Z"
+    };
+    const result: ExecutorResult = kind === "failed"
+      ? { kind, error: { code: "CODEX_EXECUTION_FAILED", message: "Codex execution failed." }, diagnostics }
+      : { kind, output: "output", diagnostics };
+    const executor: Executor = { execute: async () => result };
+    const service = new RegisteredWorkspaceTaskService(registry(), () => executor);
+    const { taskId } = service.runTask({ workspace_id: "known", instruction: "inspect" });
+    await waitForTerminal(service, taskId);
+    const view = service.taskView(taskId);
+    const { finalization_started_at, finalization_ended_at, ...retained } = view?.diagnostics ?? {};
+    assert.deepEqual(retained, diagnostics);
+    assert.equal(typeof finalization_started_at, "string");
+    assert.equal(typeof finalization_ended_at, "string");
+    assert.equal(view?.state, kind === "completed" ? "completed" : "failed");
+  });
+}

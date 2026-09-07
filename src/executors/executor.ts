@@ -22,12 +22,25 @@ export interface ExecutorRequest {
   readonly reasoning_effort?: string;
   readonly threadId?: string | undefined;
   readonly onEvidence?: (evidence: readonly ExecutorEvidence[]) => void;
+  readonly onDiagnostics?: (diagnostics: ExecutorProgressDiagnostics) => void;
 }
 
 export interface ExecutorDiagnostics {
   readonly executor_started_at: string;
   readonly executor_ended_at: string;
+  readonly protocol_phase?: string;
+  readonly last_valid_method?: string;
+  readonly last_activity_at?: string;
+  readonly rpc_method?: string;
+  readonly rpc_timeout?: boolean;
+  readonly process_exit_code?: number | null;
+  readonly failure_category?: string;
+  readonly protocol_error_kind?: string;
+  readonly upstream_error_code?: number;
+  readonly upstream_error_message?: string;
 }
+
+export type ExecutorProgressDiagnostics = Omit<ExecutorDiagnostics, "executor_ended_at">;
 
 export type ExecutorResult =
   | { readonly kind: "completed" | "interrupted"; readonly output: string; readonly threadId?: string | undefined; readonly evidence?: readonly ExecutorEvidence[]; readonly diagnostics?: ExecutorDiagnostics }
