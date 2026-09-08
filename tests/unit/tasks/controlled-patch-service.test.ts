@@ -7,6 +7,8 @@ import test from "node:test";
 
 import { CoreError } from "../../../src/core/errors.js";
 import type { Executor, ExecutorRequest, ExecutorResult } from "../../../src/executors/executor.js";
+import { CodexExecutor } from "../../../src/executors/codex-executor.js";
+import type { ProcessStarter } from "../../../src/executors/codex-executor.js";
 import { ControlledPatchService } from "../../../src/tasks/controlled-patch-service.js";
 import type { GitStarter } from "../../../src/tasks/controlled-patch-service.js";
 import { RegisteredWorkspaceTaskService } from "../../../src/tasks/registered-workspace-task-service.js";
@@ -501,6 +503,79 @@ test("generation records base metadata, binds the task, and keeps Codex instruct
     () => controlled.apply({ patch_task_id: generated.taskId, confirmation: "APPLY" }),
     "INVALID_STATE_TRANSITION"
   );
+});
+
+test("generate_controlled_patch reaches the explicit Codex gate before starting", async () => {
+  const root = repository();
+  const starterCalls = { value: 0 };
+  const starter: ProcessStarter = () => {
+    starterCalls.value += 1;
+    throw new Error("Codex starter must not run");
+  };
+  const registry = new RegisteredWorkspaceRegistry([{ id: "workspace", root, allow_write: true }]);
+  const tasks = new RegisteredWorkspaceTaskService(registry, (_executor, workspaceRoot) =>
+    new CodexExecutor(workspaceRoot, starter, {}, process.platform, undefined, "explicit")
+  );
+  const controlled = new ControlledPatchService(registry, tasks);
+
+  const generated = await controlled.generate({
+    workspace_id: "workspace",
+    change_request: "change note"
+  });
+  await terminal(tasks, generated.taskId);
+
+  assert.deepEqual(tasks.result(generated.taskId), {
+    id: generated.taskId,
+    state: "failed",
+    error: {
+      code: "CODEX_ROUTING_REQUIRED",
+      message: "Explicit model and reasoning_effort are required for Codex execution."
+    }
+  });
+  assert.equal(starterCalls.value, 0);
+});
+
+test("refine_controlled_patch requires fresh explicit Codex routing", async () => {
+  const root = repository();
+  const starterCalls = { value: 0 };
+  const starter: ProcessStarter = () => {
+    starterCalls.value += 1;
+    throw new Error("Codex starter must not run");
+  };
+  const registry = new RegisteredWorkspaceRegistry([{ id: "workspace", root, allow_write: true }]);
+  let factoryCalls = 0;
+  const tasks = new RegisteredWorkspaceTaskService(registry, (_executor, workspaceRoot) => {
+    factoryCalls += 1;
+    if (factoryCalls === 1) {
+      return { execute: async () => ({ kind: "completed", output: validPatch }) };
+    }
+    return new CodexExecutor(workspaceRoot, starter, {}, process.platform, undefined, "explicit");
+  });
+  const controlled = new ControlledPatchService(registry, tasks);
+
+  const source = await controlled.generate({
+    workspace_id: "workspace",
+    change_request: "original",
+    model: "gpt-5-codex",
+    reasoning_effort: "high"
+  });
+  await terminal(tasks, source.taskId);
+
+  const refined = await controlled.refine({
+    patch_task_id: source.taskId,
+    change_request: "refine without routing"
+  });
+  await terminal(tasks, refined.taskId);
+
+  assert.deepEqual(tasks.result(refined.taskId), {
+    id: refined.taskId,
+    state: "failed",
+    error: {
+      code: "CODEX_ROUTING_REQUIRED",
+      message: "Explicit model and reasoning_effort are required for Codex execution."
+    }
+  });
+  assert.equal(starterCalls.value, 0);
 });
 
 test("refines a complete multi-file proposal without changing its source and applies the complete replacement", async () => {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -47,6 +47,80 @@ test("workspace configuration strips exactly one leading UTF-8 BOM", async () =>
         rmSync(configRoot, { recursive: true, force: true });
       }
     }
+  }
+});
+
+test("startup fails closed for an invalid Codex routing policy", async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), "engineering-bridge-routing-policy-startup-"));
+  const configPath = join(configRoot, "workspaces.json");
+  writeFileSync(configPath, "[]\n");
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(process.cwd(), "dist/src/mcp-stdio.js"), configPath],
+    cwd: process.cwd(),
+    env: { ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY: "STRICT" },
+    stderr: "pipe"
+  });
+
+  try {
+    await assert.rejects(client.connect(transport));
+  } finally {
+    await client.close();
+    rmSync(configRoot, { recursive: true, force: true });
+  }
+});
+
+test("explicit Codex routing from the environment reaches run_task before Codex spawn", async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), "engineering-bridge-routing-policy-mcp-"));
+  const workspaceRoot = join(configRoot, "workspace");
+  mkdirSync(workspaceRoot);
+  const markerPath = join(configRoot, "codex-started");
+  const codexPath = join(configRoot, "codex");
+  writeFileSync(codexPath, `#!${process.execPath}\nrequire("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "started");\n`);
+  chmodSync(codexPath, 0o755);
+  const configPath = join(configRoot, "workspaces.json");
+  writeFileSync(configPath, `${JSON.stringify([{ id: "workspace", root: workspaceRoot }])}\n`);
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(process.cwd(), "dist/src/mcp-stdio.js"), configPath],
+    cwd: process.cwd(),
+    env: {
+      PATH: configRoot,
+      ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY: "explicit"
+    },
+    stderr: "pipe"
+  });
+
+  const call = async (name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const result = await client.callTool({ name, arguments: args });
+    const content = result.content as Array<{ type?: string; text?: string }>;
+    return JSON.parse(content[0]?.text ?? "{}");
+  };
+
+  try {
+    await client.connect(transport);
+    const started = await call("run_task", {
+      workspace_id: "workspace",
+      instruction: "inspect"
+    });
+    const taskId = started.task_id;
+    assert.equal(typeof taskId, "string");
+    let terminal: Record<string, unknown> = {};
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      terminal = await call("task_result", { task_id: taskId });
+      if (terminal.state !== "queued" && terminal.state !== "running") break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.deepEqual(terminal.error, {
+      code: "CODEX_ROUTING_REQUIRED",
+      message: "Explicit model and reasoning_effort are required for Codex execution."
+    });
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    await client.close();
+    rmSync(configRoot, { recursive: true, force: true });
   }
 });
 

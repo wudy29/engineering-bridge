@@ -2,6 +2,14 @@
 
 This is the tool surface of Engineering Bridge V1 (1.4.2). The local STDIO MCP server exposes thirteen tools.
 
+## Codex routing policy
+
+The optional `ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY` environment variable belongs to Bridge and accepts exactly `inherit` or `explicit`. When unset, the default is `inherit`, preserving the v1.4.x public compatibility behavior: Codex may use its existing configuration when `model` and/or `reasoning_effort` are omitted. Set it to `explicit` when the deployment must fail closed unless every Codex invocation supplies both non-blank fields.
+
+With `explicit`, the hard gate runs inside `CodexExecutor.execute()` before executable resolution or process start. Missing or blank `model` or `reasoning_effort` returns `CODEX_ROUTING_REQUIRED` with `Explicit model and reasoning_effort are required for Codex execution.`; it does not start Codex. Provided values still pass the existing Codex `model/list` and reasoning-effort validation and are sent through `turn/start`. This policy does not constrain DSH; DSH's existing rejection of Codex-only selection fields remains `UNSUPPORTED_ACTION`.
+
+Any other policy value, including an empty string or a case variant, fails Bridge startup rather than falling back to `inherit`.
+
 ## `run_task`
 
 Inputs: `workspace_id`, `instruction`, optional `executor` (`"codex" | "dsh"`, default `codex`), and optional Codex-only `model` and `reasoning_effort`.

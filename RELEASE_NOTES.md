@@ -1,5 +1,15 @@
 # Release notes
 
+## Unreleased
+
+### Added
+
+- Add `ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY=explicit` as a Bridge-owned Codex routing hard gate. Each Codex invocation must provide both `model` and `reasoning_effort` before executable resolution or process start; missing or blank values return `CODEX_ROUTING_REQUIRED`. The default remains `inherit` for v1.4.x compatibility, and DSH behavior is unchanged.
+
+### Compatibility
+
+- Invalid routing policy values fail Bridge startup. Explicit routing values continue through the existing Codex `model/list` and reasoning validation and are propagated to `turn/start`.
+
 ## v1.4.2
 
 v1.4.2 is a correctness release for controlled initial commits in fresh Git repositories with no existing commit.

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "node:child_process";
 import { CoreError, serializeError } from "../core/errors.js";
+import type { CodexRoutingPolicy } from "../core/codex-routing-policy.js";
 import { VERSION } from "../version.js";
 import { resolveCommand } from "./command-resolution.js";
 import {
@@ -31,7 +32,7 @@ const CODEX_NODE_TARGET = ["@openai", "codex", "bin", "codex.js"] as const;
 // entries that make list and count truncation visible.
 const TRUNCATION_MARKER = "[truncated]";
 
-function failure(code: "CODEX_UNAVAILABLE" | "CODEX_PROTOCOL_ERROR" | "CODEX_EXECUTION_FAILED" | "EXECUTOR_STALLED"): ExecutorResult {
+function failure(code: "CODEX_UNAVAILABLE" | "CODEX_PROTOCOL_ERROR" | "CODEX_EXECUTION_FAILED" | "CODEX_ROUTING_REQUIRED" | "EXECUTOR_STALLED"): ExecutorResult {
   return { kind: "failed", error: serializeError(new CoreError(code)) };
 }
 function failedTurn(turn: Record<string, unknown>): ExecutorResult {
@@ -96,6 +97,9 @@ function bounded(value: unknown): string {
   const retained = MAX_TEXT - TRUNCATION_MARKER.length - 1;
   return `${value.slice(0, retained)}\n${TRUNCATION_MARKER}`;
 }
+function hasRoutingValue(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
 
 export class CodexExecutor implements Executor {
   private child: ChildProcessWithoutNullStreams | undefined;
@@ -115,7 +119,8 @@ export class CodexExecutor implements Executor {
   constructor(private readonly workspaceRoot: string, private readonly startProcess: ProcessStarter = spawn,
     private readonly hostEnvironment: Readonly<NodeJS.ProcessEnv> = process.env,
     private readonly platform: NodeJS.Platform = process.platform,
-    private readonly timing: ExecutorTiming & { readonly rpcCallTimeoutMs?: number } = DEFAULT_EXECUTOR_TIMING) {}
+    private readonly timing: ExecutorTiming & { readonly rpcCallTimeoutMs?: number } = DEFAULT_EXECUTOR_TIMING,
+    private readonly routingPolicy: CodexRoutingPolicy = "inherit") {}
 
   async execute(request: ExecutorRequest): Promise<ExecutorResult> {
     const executorStartedAt = new Date().toISOString();
@@ -136,6 +141,11 @@ export class CodexExecutor implements Executor {
     this.threadId = undefined;
     this.turnId = undefined;
     this.startedTurnId = undefined;
+    if (this.routingPolicy === "explicit" &&
+      (!hasRoutingValue(request.model) || !hasRoutingValue(request.reasoning_effort))) {
+      this.reportDiagnostics = undefined;
+      return withDiagnostics(failure("CODEX_ROUTING_REQUIRED"));
+    }
     let child: ChildProcessWithoutNullStreams;
     try {
       const options: SpawnOptionsWithoutStdio = {

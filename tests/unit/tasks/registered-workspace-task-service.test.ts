@@ -8,6 +8,8 @@ import { CoreError } from "../../../src/core/errors.js";
 import type { SerializedError } from "../../../src/core/errors.js";
 import type { Id } from "../../../src/core/ids.js";
 import type { Executor, ExecutorRequest, ExecutorResult } from "../../../src/executors/executor.js";
+import { CodexExecutor } from "../../../src/executors/codex-executor.js";
+import type { ProcessStarter } from "../../../src/executors/codex-executor.js";
 import { DshExecutor } from "../../../src/executors/dsh-executor.js";
 import { RegisteredWorkspaceTaskService } from "../../../src/tasks/registered-workspace-task-service.js";
 import { RegisteredWorkspaceRegistry } from "../../../src/workspaces/registered-workspace-registry.js";
@@ -85,6 +87,17 @@ async function waitForInteractiveReady(service: RegisteredWorkspaceTaskService, 
   }
 }
 
+function explicitCodexService(starterCalls: { value: number }): RegisteredWorkspaceTaskService {
+  const starter: ProcessStarter = () => {
+    starterCalls.value += 1;
+    throw new Error("Codex starter must not run");
+  };
+  return new RegisteredWorkspaceTaskService(registry(), (executor, workspaceRoot) => {
+    assert.equal(executor, "codex");
+    return new CodexExecutor(workspaceRoot, starter, {}, process.platform, undefined, "explicit");
+  });
+}
+
 test("returns immediately and exposes queued/running without a result", async () => {
   const pending = deferred<ExecutorResult>();
   const calls: ExecutorRequest[] = [];
@@ -139,6 +152,48 @@ test("records completed output and preserves the instruction", async () => {
   assert.deepEqual(calls.map(({ onDiagnostics: _onDiagnostics, ...request }) => request), [{ taskId, instruction }]);
   assert.deepEqual(service.status(taskId), { taskId, state: "completed" });
   assert.deepEqual(service.result(taskId), { id: taskId, state: "completed", output: "exact output\n\n" });
+});
+
+test("runTask applies explicit Codex routing at the executor boundary", async () => {
+  const starterCalls = { value: 0 };
+  const service = explicitCodexService(starterCalls);
+  const { taskId } = service.runTask({
+    workspace_id: "known",
+    instruction: "inspect",
+    reasoning_effort: "high"
+  });
+
+  await waitForTerminal(service, taskId);
+
+  assert.deepEqual(service.result(taskId), {
+    id: taskId,
+    state: "failed",
+    error: {
+      code: "CODEX_ROUTING_REQUIRED",
+      message: "Explicit model and reasoning_effort are required for Codex execution."
+    }
+  });
+  assert.equal(starterCalls.value, 0);
+});
+
+test("startTask applies explicit Codex routing at the executor boundary", async () => {
+  const starterCalls = { value: 0 };
+  const service = explicitCodexService(starterCalls);
+  const { taskId } = service.startTask({
+    workspace_id: "known",
+    instruction: "inspect",
+    model: "gpt-5-codex"
+  });
+
+  await waitForInteractiveReady(service, taskId);
+
+  const view = service.taskView(taskId);
+  assert.equal(view?.state, "failed");
+  assert.deepEqual(view?.error, {
+    code: "CODEX_ROUTING_REQUIRED",
+    message: "Explicit model and reasoning_effort are required for Codex execution."
+  });
+  assert.equal(starterCalls.value, 0);
 });
 
 test("applies a completed-output transform exactly once before storing the result", async () => {
