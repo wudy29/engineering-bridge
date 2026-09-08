@@ -804,7 +804,7 @@ test("POSIX: a Windows-style dsh layout on PATH does not change the original res
   const invocations: Invocation[] = [];
   const executor = new DshExecutor(TRUSTED_CWD,
     fakeStarter({ stdout: "final answer\n" }, invocations),
-    { PATH: dir }); // default platform is the running (non-Windows) one
+    { PATH: dir }, "linux");
 
   await executor.execute({ taskId: TASK_ID, instruction: "inspect", sandbox: "read-only" });
 

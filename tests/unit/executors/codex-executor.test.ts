@@ -1213,7 +1213,7 @@ test("POSIX: a Windows-style codex.exe layout on PATH does not change the bare s
   const invocations: Invocation[] = [];
   const executor = new CodexExecutor(TRUSTED_CWD,
     fakeStarter({ appServerOutput: "final answer" }, invocations),
-    { PATH: dir }); // default platform is the running (non-Windows) one
+    { PATH: dir }, "linux");
 
   await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
 

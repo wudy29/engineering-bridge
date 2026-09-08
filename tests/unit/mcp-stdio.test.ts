@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { isolateGitLineEndings } from "../helpers/git-fixture.js";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -437,6 +439,7 @@ test("bind_project and create_project register workspaces inside approved projec
     assert.equal(createdBody.root, realpathSync(join(approved, "created-project")));
     assert.equal(createdBody.allow_write, false);
     assert.deepEqual(createdBody.git, { initialized: true, head: "unborn" });
+    isolateGitLineEndings(join(approved, "created-project"));
     assert.equal(readFileSync(join(approved, "created-project", ".git", "HEAD"), "utf8").includes("ref:"), true);
 
     // Wrong or missing confirmation is rejected by the schema without side effects.
@@ -724,6 +727,7 @@ test("generate_controlled_patch and refine_controlled_patch accept omitted/codex
 test("submit_controlled_patch registers a submitted proposal and task_result reports source submitted without an executor", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-submit-")));
   execFileSync("git", ["init", "-q"], { cwd: root });
+  isolateGitLineEndings(root);
   execFileSync("git", ["config", "user.name", "Test User"], { cwd: root });
   execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
   writeFileSync(join(root, "note.txt"), "before\n");
@@ -878,6 +882,7 @@ index 90be1f3..3b18e51 100644
 test("controlled patch validation tools enforce fixed schemas, confirmation, defaults, and fixed validation input", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-validation-mcp-")));
   execFileSync("git", ["init", "-q"], { cwd: root });
+  isolateGitLineEndings(root);
   execFileSync("git", ["config", "user.name", "Test User"], { cwd: root });
   execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
   writeFileSync(join(root, "note.txt"), "before\n");
