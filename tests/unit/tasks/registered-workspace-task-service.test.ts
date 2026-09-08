@@ -4,6 +4,8 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 
+import { workspaceFixture } from "../../helpers/workspace-fixture.js";
+
 import { CoreError } from "../../../src/core/errors.js";
 import type { SerializedError } from "../../../src/core/errors.js";
 import type { Id } from "../../../src/core/ids.js";
@@ -14,7 +16,7 @@ import { DshExecutor } from "../../../src/executors/dsh-executor.js";
 import { RegisteredWorkspaceTaskService } from "../../../src/tasks/registered-workspace-task-service.js";
 import { RegisteredWorkspaceRegistry } from "../../../src/workspaces/registered-workspace-registry.js";
 
-const ROOT = "/registered/root";
+const ROOT = workspaceFixture("registered", "root");
 
 function registry(): RegisteredWorkspaceRegistry {
   return new RegisteredWorkspaceRegistry([{ id: "known", root: ROOT }]);
