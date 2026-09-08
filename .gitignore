@@ -9,3 +9,7 @@ var/
 .DS_Store
 *.tsbuildinfo
 .worktrees/
+
+workspaces.json
+workspaces.json.controlled-patches.json
+workspaces.json.validation-profiles.json
