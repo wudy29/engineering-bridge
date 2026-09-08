@@ -3333,6 +3333,57 @@ index 9d1c2f3..3b18e51 100644
   }
 });
 
+test("serializes concurrent APPLY calls through a repository root and its symlink alias", async () => {
+  const root = repository();
+  const aliasParent = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-alias-")));
+  const alias = join(aliasParent, "workspace-alias");
+  symlinkSync(root, alias, "dir");
+  const enteredBase = join(aliasParent, "entered");
+  const releaseBase = join(aliasParent, "release");
+  const calls = { apply: 0 };
+  const registry = new RegisteredWorkspaceRegistry([
+    { id: "workspace", root, allow_write: true },
+    { id: "alias", root: alias, allow_write: true }
+  ]);
+  const tasks = new RegisteredWorkspaceTaskService(registry, () => ({
+    execute: async () => ({ kind: "completed", output: validPatch })
+  }));
+  const controlled = new ControlledPatchService(
+    registry, tasks, gatedGitStarter(enteredBase, releaseBase, calls)
+  );
+  const applies: Promise<unknown>[] = [];
+  try {
+    assert.notEqual(registry.resolve("workspace"), registry.resolve("alias"));
+    assert.equal(realpathSync(alias), root);
+    const baseHead = git(root, "rev-parse", "HEAD").trim();
+    const first = await controlled.submit({ workspace_id: "workspace", base_head: baseHead, diff: validPatch });
+    const second = await controlled.submit({ workspace_id: "alias", base_head: baseHead, diff: validPatch });
+
+    applies.push(controlled.apply({ patch_task_id: first.taskId, confirmation: "APPLY" }));
+    void applies[0]!.catch(() => {});
+    assert.equal(await waitForOptionalFile(`${enteredBase}.1`), true);
+    applies.push(controlled.apply({ patch_task_id: second.taskId, confirmation: "APPLY" }));
+    const resultsPromise = Promise.allSettled(applies);
+    const secondEnteredBeforeRelease = await waitForOptionalFile(`${enteredBase}.2`);
+
+    writeFileSync(`${releaseBase}.1`, "release\n");
+    writeFileSync(`${releaseBase}.2`, "release\n");
+    const results = await resultsPromise;
+    assert.equal(secondEnteredBeforeRelease, false);
+    assert.equal(calls.apply, 1);
+    assert.equal(results[0]!.status, "fulfilled");
+    assert.equal(results[1]!.status, "rejected");
+    assert.equal((results[1] as PromiseRejectedResult).reason.code, "WORKSPACE_PRECONDITION_FAILED");
+    assert.equal(readFileSync(join(root, "note.txt"), "utf8"), "after\n");
+  } finally {
+    writeFileSync(`${releaseBase}.1`, "release\n");
+    writeFileSync(`${releaseBase}.2`, "release\n");
+    await Promise.allSettled(applies);
+    rmSync(aliasParent, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("keeps the task retained while final applied persistence is pending", async () => {
   const root = repository();
   const stateFilePath = retainedStateFile();

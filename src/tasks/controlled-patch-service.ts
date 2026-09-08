@@ -338,7 +338,12 @@ export class ControlledPatchService {
     });
   }
 
-  private withApplyLock<T>(workspaceRoot: string, action: () => Promise<T>): Promise<T> {
+  private async withApplyLock<T>(workspaceRoot: string, action: () => Promise<T>): Promise<T> {
+    try {
+      workspaceRoot = await realpath(workspaceRoot);
+    } catch {
+      throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
+    }
     const previous = this.applyQueues.get(workspaceRoot) ?? Promise.resolve();
     const current = previous.then(action, action);
     const settled = current.then(() => undefined, () => undefined);
