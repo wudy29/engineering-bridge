@@ -441,6 +441,21 @@ test("a host requesting danger-full-access cannot override the read-only run_tas
   assert.equal(invocations[0]?.options.env?.DSH_PERMISSION_MODE, "read-only");
 });
 
+test("Codex routing policy does not constrain DSH", async () => {
+  const invocations: Invocation[] = [];
+  const executor = new DshExecutor(
+    TRUSTED_CWD,
+    fakeStarter({ stdout: "dsh result\n" }, invocations),
+    { ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY: "explicit" }
+  );
+
+  const result = await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+
+  assert.deepEqual(result, { kind: "completed", output: "dsh result" });
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0]?.options.env?.ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY, undefined);
+});
+
 test("treats exactly 1 MiB of output as within the cap", async () => {
   const result = await new DshExecutor(
     TRUSTED_CWD,

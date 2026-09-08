@@ -11,6 +11,7 @@ import { CodexExecutor } from "./executors/codex-executor.js";
 import { DshExecutor } from "./executors/dsh-executor.js";
 import { VERSION } from "./version.js";
 import { CoreError, serializeError } from "./core/errors.js";
+import { CODEX_ROUTING_POLICY_ENV, parseCodexRoutingPolicy } from "./core/codex-routing-policy.js";
 import { RegisteredWorkspaceTaskService } from "./tasks/registered-workspace-task-service.js";
 import { ControlledPatchService } from "./tasks/controlled-patch-service.js";
 import { ControlledPatchValidationService } from "./tasks/controlled-patch-validation-service.js";
@@ -100,6 +101,7 @@ async function main(): Promise<void> {
 
   const configPath = process.argv[2];
   if (configPath === undefined) throw new Error("Workspace configuration path is required.");
+  const codexRoutingPolicy = parseCodexRoutingPolicy(process.env[CODEX_ROUTING_POLICY_ENV]);
   const configSource = await readFile(configPath, "utf8");
   const parsed = WorkspaceConfigSchema.parse(JSON.parse(configSource.startsWith("\uFEFF") ? configSource.slice(1) : configSource));
   const workspaceEntries = parsed.filter((entry): entry is WorkspaceEntry => !isProjectRootEntry(entry));
@@ -130,7 +132,7 @@ async function main(): Promise<void> {
     registry,
     (executor, workspaceRoot) => {
       switch (executor) {
-        case "codex": return new CodexExecutor(workspaceRoot);
+        case "codex": return new CodexExecutor(workspaceRoot, undefined, undefined, undefined, undefined, codexRoutingPolicy);
         case "dsh": return new DshExecutor(workspaceRoot);
       }
     }

@@ -132,6 +132,14 @@ function timedExecutor(starter: ProcessStarter, platform: NodeJS.Platform = proc
   return new CodexExecutor(TRUSTED_CWD, starter, {}, platform, timing);
 }
 
+function executorWithRoutingPolicy(
+  starter: ProcessStarter,
+  routingPolicy: "inherit" | "explicit",
+  hostEnvironment: NodeJS.ProcessEnv = {}
+): CodexExecutor {
+  return new CodexExecutor(TRUSTED_CWD, starter, hostEnvironment, process.platform, SHORT_TIMING, routingPolicy);
+}
+
 async function settlesWithin<T>(promise: Promise<T>, milliseconds = 100): Promise<T> {
   return Promise.race([
     promise,
@@ -204,6 +212,115 @@ test("preserves the default Codex JSON-RPC flow when model selection is omitted"
   assert.ok(turnStart);
   assert.equal("model" in turnStart.params, false);
   assert.equal("effort" in turnStart.params, false);
+});
+
+test("explicit routing rejects a missing model before starting Codex", async () => {
+  const invocations: Invocation[] = [];
+  const executor = executorWithRoutingPolicy(
+    fakeStarter({ appServerOutput: "should not run" }, invocations),
+    "explicit"
+  );
+
+  const result = await executor.execute({
+    taskId: TASK_ID,
+    instruction: "inspect",
+    reasoning_effort: "high"
+  });
+
+  assert.deepEqual(withoutDiagnostics(result), {
+    kind: "failed",
+    error: {
+      code: "CODEX_ROUTING_REQUIRED",
+      message: "Explicit model and reasoning_effort are required for Codex execution."
+    }
+  });
+  assert.equal(invocations.length, 0);
+});
+
+test("explicit routing rejects a missing reasoning effort before starting Codex", async () => {
+  const invocations: Invocation[] = [];
+  const executor = executorWithRoutingPolicy(
+    fakeStarter({ appServerOutput: "should not run" }, invocations),
+    "explicit"
+  );
+
+  const result = await executor.execute({
+    taskId: TASK_ID,
+    instruction: "inspect",
+    model: "gpt-5-codex"
+  });
+
+  assert.equal(result.kind, "failed");
+  if (result.kind === "failed") assert.equal(result.error.code, "CODEX_ROUTING_REQUIRED");
+  assert.equal(invocations.length, 0);
+});
+
+test("explicit routing rejects both missing routing fields before starting Codex", async () => {
+  const invocations: Invocation[] = [];
+  const executor = executorWithRoutingPolicy(
+    fakeStarter({ appServerOutput: "should not run" }, invocations),
+    "explicit"
+  );
+
+  const result = await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+
+  assert.equal(result.kind, "failed");
+  if (result.kind === "failed") assert.equal(result.error.code, "CODEX_ROUTING_REQUIRED");
+  assert.equal(invocations.length, 0);
+});
+
+test("explicit routing rejects blank routing fields before starting Codex", async () => {
+  const invocations: Invocation[] = [];
+  const executor = executorWithRoutingPolicy(
+    fakeStarter({ appServerOutput: "should not run" }, invocations),
+    "explicit"
+  );
+
+  const result = await executor.execute({
+    taskId: TASK_ID,
+    instruction: "inspect",
+    model: "   ",
+    reasoning_effort: "high"
+  });
+
+  assert.equal(result.kind, "failed");
+  if (result.kind === "failed") assert.equal(result.error.code, "CODEX_ROUTING_REQUIRED");
+  assert.equal(invocations.length, 0);
+});
+
+test("explicit routing validates and propagates both routing fields", async () => {
+  const invocations: Invocation[] = [];
+  const executor = executorWithRoutingPolicy(
+    fakeStarter({
+      appServerOutput: "done",
+      modelList: [{
+        id: "catalog-id",
+        model: "gpt-5-codex",
+        supportedReasoningEfforts: [{ reasoningEffort: "high", description: "High" }]
+      }]
+    }, invocations),
+    "explicit",
+    { ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY: "explicit" }
+  );
+
+  const result = await executor.execute({
+    taskId: TASK_ID,
+    instruction: "inspect",
+    model: "gpt-5-codex",
+    reasoning_effort: "high"
+  });
+
+  assert.equal(result.kind, "completed");
+  assert.equal(invocations.length, 1);
+  const invocation = invocations[0]!;
+  assert.equal(invocation.options.env?.ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY, undefined);
+  const messages = invocation.stdin.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(messages.some((message: { method?: string }) => message.method === "model/list"), true);
+  const turnStart = messages.find((message: { method?: string }) => message.method === "turn/start");
+  assert.deepEqual({ model: turnStart.params.model, effort: turnStart.params.effort }, {
+    model: "gpt-5-codex",
+    effort: "high"
+  });
 });
 
 test("validates the requested model and effort before starting the normal Codex flow", async () => {
