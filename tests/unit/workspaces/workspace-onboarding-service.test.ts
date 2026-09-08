@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse, sep } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "node:child_process";
@@ -87,6 +87,39 @@ function service(
 function catalogStateFilePath(catalog: ManagedWorkspaceCatalog): string {
   return (catalog as unknown as { stateFilePath: string }).stateFilePath;
 }
+
+test("F1: bind accepts a child when the approved root is the native filesystem root", async () => {
+  const project = realpathSync(mkdtempSync(join(tmpdir(), "bridge-filesystem-root-")));
+  try {
+    const registry = new RegisteredWorkspaceRegistry([]);
+    const catalog = new ManagedWorkspaceCatalog();
+    const onboarding = new WorkspaceOnboardingService(registry, catalog, [parse(project).root]);
+
+    const result = await onboarding.bind({ project_path: project });
+
+    assert.equal(result.root, project);
+    assert.equal(registry.resolve(result.workspace_id), project);
+    assert.equal(result.allow_write, false);
+  } finally {
+    rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("F2: approved roots reject invalid lexical paths before canonicalization", () => {
+  const approved = join(tmpdir(), "bridge-approved-root");
+  const invalidRoots = ["", "relative/root", `${approved}${sep}..${sep}other`];
+  if (process.platform === "win32") invalidRoots.push("\\root", "\\workspace\\child", "C:relative");
+  for (const root of invalidRoots) {
+    let canonicalized = false;
+    expectCodeSync(() => new WorkspaceOnboardingService(
+      new RegisteredWorkspaceRegistry([]),
+      new ManagedWorkspaceCatalog(),
+      [root],
+      async () => { canonicalized = true; return approved; }
+    ), "WORKSPACE_BOUNDARY_VIOLATION");
+    assert.equal(canonicalized, false);
+  }
+});
 
 test("bind registers an existing directory inside an approved root and persists it", async () => {
   const { approved, catalogPath, registry, catalog, gitInvocations } = setup();

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { sep } from "node:path";
 import test from "node:test";
 
 import { workspaceFixture } from "../../helpers/workspace-fixture.js";
@@ -67,6 +68,21 @@ test("registers managed workspaces read-only and resolves them", () => {
   assert.deepEqual(registry.resolveExecution("managed-1"), { root: ROOT, allowWrite: false });
   expectCode(() => registry.resolveWritable("managed-1"), "WORKSPACE_PRECONDITION_FAILED");
   expectCode(() => registry.resolve("unknown-managed"), "UNKNOWN_WORKSPACE");
+});
+
+test("F2: manual and managed registrations reject invalid roots before canonicalization", () => {
+  const invalidRoots = ["", "relative/root", `${ROOT}${sep}..${sep}other`];
+  if (process.platform === "win32") invalidRoots.push("\\root", "\\workspace\\child", "C:relative");
+  for (const root of invalidRoots) {
+    let canonicalized = false;
+    const canonicalize = (value: string): string => { canonicalized = true; return value; };
+    expectCode(() => new RegisteredWorkspaceRegistry([{ id: "manual", root }], canonicalize),
+      "WORKSPACE_BOUNDARY_VIOLATION");
+    const registry = new RegisteredWorkspaceRegistry([], canonicalize);
+    expectCode(() => registry.registerManaged("managed", root, true), "WORKSPACE_BOUNDARY_VIOLATION");
+    expectCode(() => registry.resolve("managed"), "UNKNOWN_WORKSPACE");
+    assert.equal(canonicalized, false);
+  }
 });
 
 test("registerManaged is idempotent for the same id and root", () => {

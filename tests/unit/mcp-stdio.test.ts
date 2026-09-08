@@ -469,11 +469,14 @@ test("bind_project and create_project register workspaces inside approved projec
   }
 });
 
-test("startup rejects relative or non-normalized project_root entries and accepts a valid one", async () => {
-  for (const root of ["relative/root", "/registered/../root"]) {
+test("startup rejects invalid manual and project roots and accepts a valid project_root", async () => {
+  const invalidRoots = ["relative/root", "/registered/../root"];
+  if (process.platform === "win32") invalidRoots.push("\\root", "\\workspace\\child", "C:relative");
+  const invalidEntries = invalidRoots.flatMap((root) => [{ kind: "project_root", root }, { id: "manual", root }]);
+  for (const entry of invalidEntries) {
     const configDir = mkdtempSync(join(tmpdir(), "engineering-bridge-badroot-"));
     const configPath = join(configDir, "workspaces.json");
-    writeFileSync(configPath, `${JSON.stringify([{ kind: "project_root", root }], null, 2)}\n`);
+    writeFileSync(configPath, `${JSON.stringify([entry], null, 2)}\n`);
 
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const transport = new StdioClientTransport({

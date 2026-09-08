@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test from "node:test";
 
 import { workspaceFixture } from "../../helpers/workspace-fixture.js";
@@ -36,6 +36,53 @@ test("loads an absent catalog as empty and round-trips registrations through the
   ]);
   // Atomic writes leave no temporary files behind.
   assert.deepEqual(readdirSync(directory), ["managed-workspaces.json"]);
+});
+
+test("F2: catalog registration rejects invalid roots without persisting or poisoning the queue", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridge-invalid-managed-root-"));
+  try {
+    const stateFile = join(directory, "managed-workspaces.json");
+    const catalog = new ManagedWorkspaceCatalog(stateFile);
+    const validRoot = workspaceFixture("canonical", "valid");
+    const invalidRoots = ["", "relative/root", `${validRoot}${sep}..${sep}other`];
+    if (process.platform === "win32") invalidRoots.push("\\root", "\\workspace\\child", "C:relative");
+    for (const root of invalidRoots) {
+      await expectCode(() => catalog.registerOnce(root), "WORKSPACE_BOUNDARY_VIOLATION");
+      assert.deepEqual(catalog.entries(), []);
+      assert.deepEqual(readdirSync(directory), []);
+    }
+    const { id } = await catalog.registerOnce(validRoot);
+    const restored = new ManagedWorkspaceCatalog(stateFile);
+    await restored.load();
+    assert.deepEqual(restored.entries(), [{ id, root: validRoot, allowWrite: false }]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("F2: catalog restore skips invalid roots while retaining valid authorized records", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridge-restore-managed-root-"));
+  try {
+    const stateFile = join(directory, "managed-workspaces.json");
+    const validRoot = workspaceFixture("canonical", "restored");
+    const invalidRoots = ["", "relative/root", `${validRoot}${sep}..${sep}other`];
+    if (process.platform === "win32") invalidRoots.push("\\root", "\\workspace\\child", "C:relative");
+    const id = "00000000-0000-4000-8000-000000000099";
+    writeFileSync(stateFile, JSON.stringify({
+      version: 1,
+      workspaces: [
+        ...invalidRoots.map((root, index) => ({
+          id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`, root, allow_write: true
+        })),
+        { id, root: validRoot, allow_write: true }
+      ]
+    }));
+    const catalog = new ManagedWorkspaceCatalog(stateFile);
+    await catalog.load();
+    assert.deepEqual(catalog.entries(), [{ id, root: validRoot, allowWrite: true }]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("registerOnce returns the existing id for the same root without duplicating", async () => {
