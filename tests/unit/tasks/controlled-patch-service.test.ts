@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { constants, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { isolateGitLineEndings } from "../../helpers/git-fixture.js";
+
 import { CoreError } from "../../../src/core/errors.js";
 import type { Executor, ExecutorRequest, ExecutorResult } from "../../../src/executors/executor.js";
+import { CodexExecutor } from "../../../src/executors/codex-executor.js";
+import type { ProcessStarter } from "../../../src/executors/codex-executor.js";
 import { ControlledPatchService } from "../../../src/tasks/controlled-patch-service.js";
 import type { GitStarter } from "../../../src/tasks/controlled-patch-service.js";
 import { RegisteredWorkspaceTaskService } from "../../../src/tasks/registered-workspace-task-service.js";
@@ -14,6 +18,12 @@ import { ManagedWorkspaceCatalog } from "../../../src/workspaces/managed-workspa
 import { RegisteredWorkspaceRegistry } from "../../../src/workspaces/registered-workspace-registry.js";
 import { WorkspaceOnboardingService } from "../../../src/workspaces/workspace-onboarding-service.js";
 
+const noFollowRequiredSkip = typeof constants.O_NOFOLLOW === "number"
+  ? false
+  : "O_NOFOLLOW is required for ordinary untracked-file fingerprinting";
+const noFollowUnavailableSkip = typeof constants.O_NOFOLLOW === "number"
+  ? "O_NOFOLLOW is available on this platform"
+  : false;
 function git(root: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd: root, encoding: "utf8" });
 }
@@ -29,6 +39,7 @@ function currentHead(root: string): string | null {
 function repository(): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-patch-")));
   git(root, "init", "-q");
+  isolateGitLineEndings(root);
   git(root, "config", "user.name", "Test User");
   git(root, "config", "user.email", "test@example.invalid");
   writeFileSync(join(root, "note.txt"), "before\n");
@@ -40,6 +51,7 @@ function repository(): string {
 function unbornRepository(): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-root-commit-")));
   git(root, "init", "-q");
+  isolateGitLineEndings(root);
   git(root, "config", "user.name", "Test User");
   git(root, "config", "user.email", "test@example.invalid");
   return root;
@@ -503,6 +515,79 @@ test("generation records base metadata, binds the task, and keeps Codex instruct
   );
 });
 
+test("generate_controlled_patch reaches the explicit Codex gate before starting", async () => {
+  const root = repository();
+  const starterCalls = { value: 0 };
+  const starter: ProcessStarter = () => {
+    starterCalls.value += 1;
+    throw new Error("Codex starter must not run");
+  };
+  const registry = new RegisteredWorkspaceRegistry([{ id: "workspace", root, allow_write: true }]);
+  const tasks = new RegisteredWorkspaceTaskService(registry, (_executor, workspaceRoot) =>
+    new CodexExecutor(workspaceRoot, starter, {}, process.platform, undefined, "explicit")
+  );
+  const controlled = new ControlledPatchService(registry, tasks);
+
+  const generated = await controlled.generate({
+    workspace_id: "workspace",
+    change_request: "change note"
+  });
+  await terminal(tasks, generated.taskId);
+
+  assert.deepEqual(tasks.result(generated.taskId), {
+    id: generated.taskId,
+    state: "failed",
+    error: {
+      code: "CODEX_ROUTING_REQUIRED",
+      message: "Explicit model and reasoning_effort are required for Codex execution."
+    }
+  });
+  assert.equal(starterCalls.value, 0);
+});
+
+test("refine_controlled_patch requires fresh explicit Codex routing", async () => {
+  const root = repository();
+  const starterCalls = { value: 0 };
+  const starter: ProcessStarter = () => {
+    starterCalls.value += 1;
+    throw new Error("Codex starter must not run");
+  };
+  const registry = new RegisteredWorkspaceRegistry([{ id: "workspace", root, allow_write: true }]);
+  let factoryCalls = 0;
+  const tasks = new RegisteredWorkspaceTaskService(registry, (_executor, workspaceRoot) => {
+    factoryCalls += 1;
+    if (factoryCalls === 1) {
+      return { execute: async () => ({ kind: "completed", output: validPatch }) };
+    }
+    return new CodexExecutor(workspaceRoot, starter, {}, process.platform, undefined, "explicit");
+  });
+  const controlled = new ControlledPatchService(registry, tasks);
+
+  const source = await controlled.generate({
+    workspace_id: "workspace",
+    change_request: "original",
+    model: "gpt-5-codex",
+    reasoning_effort: "high"
+  });
+  await terminal(tasks, source.taskId);
+
+  const refined = await controlled.refine({
+    patch_task_id: source.taskId,
+    change_request: "refine without routing"
+  });
+  await terminal(tasks, refined.taskId);
+
+  assert.deepEqual(tasks.result(refined.taskId), {
+    id: refined.taskId,
+    state: "failed",
+    error: {
+      code: "CODEX_ROUTING_REQUIRED",
+      message: "Explicit model and reasoning_effort are required for Codex execution."
+    }
+  });
+  assert.equal(starterCalls.value, 0);
+});
+
 test("refines a complete multi-file proposal without changing its source and applies the complete replacement", async () => {
   const root = repository();
   const sourcePatch = `${validPatch}${additionPatch}`;
@@ -640,7 +725,40 @@ test("stores and applies a controlled patch normalized to one trailing LF", asyn
   assert.equal(readFileSync(join(root, "note.txt"), "utf8"), "after\n");
 });
 
-test("initial COMMIT creates a verified root commit from exactly the applied proposal targets", async () => {
+test("COMMIT fails closed before staging when ordinary untracked fingerprinting lacks O_NOFOLLOW", {
+  skip: noFollowUnavailableSkip
+}, async () => {
+  const root = repository();
+  const anchorPath = "recovery-anchor.md";
+  let cachedApplyCalls = 0;
+  let commitCalls = 0;
+  const starter: GitStarter = (executable, args, options) => {
+    if (executable === "git" && args[0] === "apply" && args.includes("--cached")) cachedApplyCalls += 1;
+    if (executable === "git" && args.includes("commit")) commitCalls += 1;
+    return spawn(executable, args, options);
+  };
+  try {
+    writeFileSync(join(root, anchorPath), "anchor\n");
+    const beforeHead = currentHead(root);
+    const { controlled, taskId } = await appliedFixture(root, validPatch, starter);
+
+    await expectCode(() => controlled.commit({
+      patch_task_id: taskId,
+      message: "must fail closed",
+      confirmation: "COMMIT"
+    }), "WORKSPACE_PRECONDITION_FAILED");
+
+    assert.equal(currentHead(root), beforeHead);
+    assert.equal(cachedApplyCalls, 0);
+    assert.equal(commitCalls, 0);
+    assert.equal(git(root, "diff", "--cached", "--name-only"), "");
+    assert.equal(readFileSync(join(root, anchorPath), "utf8"), "anchor\n");
+    assert.equal(readFileSync(join(root, "note.txt"), "utf8"), "after\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("initial COMMIT creates a verified root commit from exactly the applied proposal targets", { skip: noFollowRequiredSkip }, async () => {
   const root = unbornRepository();
   const anchorPath = "recovery-anchor.md";
   try {
@@ -801,7 +919,7 @@ test("initial COMMIT rechecks for inserted refs immediately before creating the 
   }
 });
 
-test("initial COMMIT failure cleans up only Bridge-staged proposal targets", async () => {
+test("initial COMMIT failure cleans up only Bridge-staged proposal targets", { skip: noFollowRequiredSkip }, async () => {
   const root = unbornRepository();
   const anchorPath = "recovery-anchor.md";
   let commitCalls = 0;
@@ -839,7 +957,7 @@ test("initial COMMIT failure cleans up only Bridge-staged proposal targets", asy
   }
 });
 
-test("initial COMMIT preserves a created root commit when exact-path post-verification fails", async () => {
+test("initial COMMIT preserves a created root commit when exact-path post-verification fails", { skip: noFollowRequiredSkip }, async () => {
   const root = unbornRepository();
   const anchorPath = "recovery-anchor.md";
   try {
@@ -1032,7 +1150,7 @@ test("COMMIT rejects unrelated tracked dirt", async () => {
   }
 });
 
-test("COMMIT preserves a pre-existing unrelated untracked file", async () => {
+test("COMMIT preserves a pre-existing unrelated untracked file", { skip: noFollowRequiredSkip }, async () => {
   const root = repository();
   const anchorPath = "docs/operations/recovery-anchor.md";
   try {
@@ -1063,7 +1181,7 @@ test("COMMIT preserves a pre-existing unrelated untracked file", async () => {
   }
 });
 
-test("COMMIT separates an untracked patch target from unrelated untracked files", async () => {
+test("COMMIT separates an untracked patch target from unrelated untracked files", { skip: noFollowRequiredSkip }, async () => {
   const root = repository();
   const anchorPath = "recovery-anchor.md";
   try {
@@ -1092,14 +1210,68 @@ test("COMMIT separates an untracked patch target from unrelated untracked files"
   }
 });
 
-test("COMMIT preserves NUL-enumerated unrelated files and symlinks", async () => {
+test("COMMIT preserves NUL-enumerated unrelated files with spaces and Unicode", { skip: noFollowRequiredSkip }, async () => {
+  const root = repository();
+  const fileNames = ["recovery anchor.md", "recovery-锚.md"];
+  try {
+    for (const name of fileNames) writeFileSync(join(root, name), "anchor\n");
+    const { controlled, taskId } = await appliedFixture(root);
+
+    const result = await controlled.commit({
+      patch_task_id: taskId,
+      message: "feat: commit patch",
+      confirmation: "COMMIT"
+    });
+
+    assert.equal(result.committed, true);
+    for (const name of fileNames) assert.equal(readFileSync(join(root, name), "utf8"), "anchor\n");
+    assert.deepEqual(
+      git(root, "ls-files", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean),
+      fileNames
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("COMMIT preserves an unchanged unrelated symlink without following its target", async (t) => {
+  const root = repository();
+  const link = join(root, "recovery-link");
+  try {
+    try {
+      symlinkSync("missing-target", link);
+    } catch (error) {
+      const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+      if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+        t.skip(`Windows symlink creation is unavailable (${code}); symlink capability or permission is required.`);
+        return;
+      }
+      throw error;
+    }
+    const { controlled, taskId } = await appliedFixture(root);
+    const result = await controlled.commit({
+      patch_task_id: taskId,
+      message: "feat: commit patch",
+      confirmation: "COMMIT"
+    });
+
+    assert.equal(result.committed, true);
+    assert.equal(readlinkSync(link), "missing-target");
+    assert.equal(git(root, "ls-files", "--others", "--exclude-standard", "-z"), "recovery-link\0");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("POSIX: COMMIT preserves a newline-named unrelated file", {
+  skip: process.platform === "win32" ? "Win32 filenames cannot contain newline" : false
+}, async () => {
   const root = repository();
   const directory = join(root, "anchors");
   const fileName = "recovery\nanchor.md";
   try {
     mkdirSync(directory);
     writeFileSync(join(directory, fileName), "anchor\n");
-    symlinkSync("missing-target", join(directory, "recovery-link"));
     const { controlled, taskId } = await appliedFixture(root);
 
     const result = await controlled.commit({
@@ -1110,10 +1282,9 @@ test("COMMIT preserves NUL-enumerated unrelated files and symlinks", async () =>
 
     assert.equal(result.committed, true);
     assert.equal(readFileSync(join(directory, fileName), "utf8"), "anchor\n");
-    assert.equal(readlinkSync(join(directory, "recovery-link")), "missing-target");
     assert.deepEqual(
       git(root, "ls-files", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean),
-      [`anchors/${fileName}`, "anchors/recovery-link"]
+      [`anchors/${fileName}`]
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1149,7 +1320,7 @@ test("COMMIT leaves ignored untracked state outside the recovery-anchor snapshot
   }
 });
 
-test("COMMIT reports post-commit verification failure without rolling back and retry is deterministic", async () => {
+test("COMMIT reports post-commit verification failure without rolling back and retry is deterministic", { skip: noFollowRequiredSkip }, async () => {
   const root = repository();
   const anchorPath = join(root, "recovery-anchor.md");
   try {
@@ -1227,7 +1398,7 @@ test("COMMIT fails closed when a pre-existing unrelated untracked file is delete
   }
 });
 
-test("COMMIT fails closed when a new unrelated untracked file appears", async () => {
+test("COMMIT fails closed when a new unrelated untracked file appears", { skip: noFollowRequiredSkip }, async () => {
   const root = repository();
   const anchorPath = join(root, "recovery-anchor.md");
   const newPath = join(root, "new-untracked.txt");
@@ -1877,6 +2048,7 @@ test("bounds applied proposal history without evicting live proposed or applying
 test("generates and refines proposals for an unborn repository with an explicit unborn instruction", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-unborn-")));
   git(root, "init", "-q");
+  isolateGitLineEndings(root);
   const instructions: string[] = [];
   const registry = new RegisteredWorkspaceRegistry([{ id: "workspace", root, allow_write: true }]);
   const tasks = new RegisteredWorkspaceTaskService(registry, () => ({
@@ -1913,6 +2085,7 @@ test("generates and refines proposals for an unborn repository with an explicit 
 test("applies an unborn proposal while the repository stays unborn and does not stage files", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-unborn-")));
   git(root, "init", "-q");
+  isolateGitLineEndings(root);
   const registry = new RegisteredWorkspaceRegistry([{ id: "workspace", root, allow_write: true }]);
   const tasks = new RegisteredWorkspaceTaskService(registry, () => ({
     execute: async () => ({ kind: "completed", output: additionPatch })
@@ -1933,6 +2106,7 @@ test("applies an unborn proposal while the repository stays unborn and does not 
 test("rejects an unborn proposal once the repository gains its first commit", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-unborn-")));
   git(root, "init", "-q");
+  isolateGitLineEndings(root);
   const registry = new RegisteredWorkspaceRegistry([{ id: "workspace", root, allow_write: true }]);
   const tasks = new RegisteredWorkspaceTaskService(registry, () => ({
     execute: async () => ({ kind: "completed", output: additionPatch })
@@ -1955,6 +2129,7 @@ test("rejects an unborn proposal once the repository gains its first commit", as
 test("rejects unborn modified targets and targets that already exist as untracked files", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-unborn-")));
   git(root, "init", "-q");
+  isolateGitLineEndings(root);
   const registry = new RegisteredWorkspaceRegistry([{ id: "workspace", root, allow_write: true }]);
   const tasks = new RegisteredWorkspaceTaskService(registry, () => ({
     execute: async () => ({ kind: "completed", output: validPatch })
@@ -2015,6 +2190,7 @@ test("retained-state loader accepts old and new commit bases and quarantines ill
 
   const unbornRoot = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-unborn-state-")));
   git(unbornRoot, "init", "-q");
+  isolateGitLineEndings(unbornRoot);
   const unbornStateFilePath = retainedStateFile();
   writeFileSync(unbornStateFilePath, `${JSON.stringify({
     version: 1,
@@ -2117,6 +2293,7 @@ test("generation needs no write authorization; APPLY does, and AUTHORIZE afterwa
 test("HEAD detection fails closed: a git helper spawn failure in a real unborn repo is not inferred as unborn", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-unborn-")));
   git(root, "init", "-q");
+  isolateGitLineEndings(root);
   const registry = new RegisteredWorkspaceRegistry([{ id: "workspace", root, allow_write: true }]);
   const tasks = new RegisteredWorkspaceTaskService(registry, () => ({
     execute: async () => ({ kind: "completed", output: additionPatch })
@@ -2184,6 +2361,7 @@ test("HEAD detection fails closed: a non-branch symbolic HEAD is not inferred as
   // reports no resolvable HEAD, but this is not an unborn branch state.
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-unborn-")));
   git(root, "init", "-q");
+  isolateGitLineEndings(root);
   writeFileSync(join(root, ".git", "HEAD"), "ref: refs/tags/nonexistent\n");
   const registry = new RegisteredWorkspaceRegistry([{ id: "workspace", root, allow_write: true }]);
   const tasks = new RegisteredWorkspaceTaskService(registry, () => ({
@@ -3603,6 +3781,7 @@ test("validation adapters expose a retained commit proposal without mutating sta
 test("validationProposal exposes a retained unborn proposal with a null base HEAD", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-unborn-")));
   git(root, "init", "-q");
+  isolateGitLineEndings(root);
   const stateFilePath = retainedStateFile();
   const taskId = retainedTaskId(1);
   writeRetainedState(stateFilePath, {

@@ -67,7 +67,7 @@ function fakeStarter(behavior: FakeBehavior, invocations: Invocation[]): Process
       close(code) {
         stdout.end();
         stderr.end();
-        child.emit("close", code, null);
+        setImmediate(() => child.emit("close", code, null));
       }
     };
     const stdin = new Writable({
@@ -92,7 +92,7 @@ function fakeStarter(behavior: FakeBehavior, invocations: Invocation[]): Process
                 stdout.write(`${JSON.stringify({
                   method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1", status: "inProgress" } }
                 })}\n`);
-                stdout.write(`${JSON.stringify({ method: "item/completed", params: { item: { id: "message-1", type: "agentMessage", text: behavior.appServerOutput } } })}\n`);
+                stdout.write(`${JSON.stringify({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "message-1", type: "agentMessage", text: behavior.appServerOutput } } })}\n`);
                 const status = behavior.turnError ? "failed" : "completed";
                 stdout.write(`${JSON.stringify({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status, error: behavior.turnError } } })}\n`);
               }
@@ -121,7 +121,7 @@ function fakeStarter(behavior: FakeBehavior, invocations: Invocation[]): Process
       }
       stdout.end(behavior.stdout ?? "");
       stderr.end(behavior.stderr ?? "");
-      child.emit("close", behavior.exitCode ?? 0, null);
+      setImmediate(() => child.emit("close", behavior.exitCode ?? 0, null));
     });
     return child as unknown as ChildProcessWithoutNullStreams;
   };
@@ -130,6 +130,14 @@ function fakeStarter(behavior: FakeBehavior, invocations: Invocation[]): Process
 function timedExecutor(starter: ProcessStarter, platform: NodeJS.Platform = process.platform,
   timing = SHORT_TIMING): CodexExecutor {
   return new CodexExecutor(TRUSTED_CWD, starter, {}, platform, timing);
+}
+
+function executorWithRoutingPolicy(
+  starter: ProcessStarter,
+  routingPolicy: "inherit" | "explicit",
+  hostEnvironment: NodeJS.ProcessEnv = {}
+): CodexExecutor {
+  return new CodexExecutor(TRUSTED_CWD, starter, hostEnvironment, process.platform, SHORT_TIMING, routingPolicy);
 }
 
 async function settlesWithin<T>(promise: Promise<T>, milliseconds = 100): Promise<T> {
@@ -204,6 +212,115 @@ test("preserves the default Codex JSON-RPC flow when model selection is omitted"
   assert.ok(turnStart);
   assert.equal("model" in turnStart.params, false);
   assert.equal("effort" in turnStart.params, false);
+});
+
+test("explicit routing rejects a missing model before starting Codex", async () => {
+  const invocations: Invocation[] = [];
+  const executor = executorWithRoutingPolicy(
+    fakeStarter({ appServerOutput: "should not run" }, invocations),
+    "explicit"
+  );
+
+  const result = await executor.execute({
+    taskId: TASK_ID,
+    instruction: "inspect",
+    reasoning_effort: "high"
+  });
+
+  assert.deepEqual(withoutDiagnostics(result), {
+    kind: "failed",
+    error: {
+      code: "CODEX_ROUTING_REQUIRED",
+      message: "Explicit model and reasoning_effort are required for Codex execution."
+    }
+  });
+  assert.equal(invocations.length, 0);
+});
+
+test("explicit routing rejects a missing reasoning effort before starting Codex", async () => {
+  const invocations: Invocation[] = [];
+  const executor = executorWithRoutingPolicy(
+    fakeStarter({ appServerOutput: "should not run" }, invocations),
+    "explicit"
+  );
+
+  const result = await executor.execute({
+    taskId: TASK_ID,
+    instruction: "inspect",
+    model: "gpt-5-codex"
+  });
+
+  assert.equal(result.kind, "failed");
+  if (result.kind === "failed") assert.equal(result.error.code, "CODEX_ROUTING_REQUIRED");
+  assert.equal(invocations.length, 0);
+});
+
+test("explicit routing rejects both missing routing fields before starting Codex", async () => {
+  const invocations: Invocation[] = [];
+  const executor = executorWithRoutingPolicy(
+    fakeStarter({ appServerOutput: "should not run" }, invocations),
+    "explicit"
+  );
+
+  const result = await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+
+  assert.equal(result.kind, "failed");
+  if (result.kind === "failed") assert.equal(result.error.code, "CODEX_ROUTING_REQUIRED");
+  assert.equal(invocations.length, 0);
+});
+
+test("explicit routing rejects blank routing fields before starting Codex", async () => {
+  const invocations: Invocation[] = [];
+  const executor = executorWithRoutingPolicy(
+    fakeStarter({ appServerOutput: "should not run" }, invocations),
+    "explicit"
+  );
+
+  const result = await executor.execute({
+    taskId: TASK_ID,
+    instruction: "inspect",
+    model: "   ",
+    reasoning_effort: "high"
+  });
+
+  assert.equal(result.kind, "failed");
+  if (result.kind === "failed") assert.equal(result.error.code, "CODEX_ROUTING_REQUIRED");
+  assert.equal(invocations.length, 0);
+});
+
+test("explicit routing validates and propagates both routing fields", async () => {
+  const invocations: Invocation[] = [];
+  const executor = executorWithRoutingPolicy(
+    fakeStarter({
+      appServerOutput: "done",
+      modelList: [{
+        id: "catalog-id",
+        model: "gpt-5-codex",
+        supportedReasoningEfforts: [{ reasoningEffort: "high", description: "High" }]
+      }]
+    }, invocations),
+    "explicit",
+    { ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY: "explicit" }
+  );
+
+  const result = await executor.execute({
+    taskId: TASK_ID,
+    instruction: "inspect",
+    model: "gpt-5-codex",
+    reasoning_effort: "high"
+  });
+
+  assert.equal(result.kind, "completed");
+  assert.equal(invocations.length, 1);
+  const invocation = invocations[0]!;
+  assert.equal(invocation.options.env?.ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY, undefined);
+  const messages = invocation.stdin.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(messages.some((message: { method?: string }) => message.method === "model/list"), true);
+  const turnStart = messages.find((message: { method?: string }) => message.method === "turn/start");
+  assert.deepEqual({ model: turnStart.params.model, effort: turnStart.params.effort }, {
+    model: "gpt-5-codex",
+    effort: "high"
+  });
 });
 
 test("validates the requested model and effort before starting the normal Codex flow", async () => {
@@ -436,7 +553,7 @@ test("initialize RPC times out before the whole execution deadline", async () =>
   try {
     assert.deepEqual(withoutDiagnostics(await settlesWithin(pending, 200)), {
       kind: "failed",
-      error: { code: "CODEX_PROTOCOL_ERROR", message: "Codex returned an invalid response." }
+      error: { code: "CODEX_EXECUTION_FAILED", message: "Codex execution failed." }
     });
   } finally {
     if (invocations[0]?.signals.length === 0) {
@@ -459,7 +576,7 @@ test("stalls after command items complete without turn/completed", async () => {
 
   await new Promise<void>((resolve) => setImmediate(resolve));
   invocations[0]?.send({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1", status: "inProgress" } } });
-  invocations[0]?.send({ method: "item/completed", params: { item: { id: "cmd-1", type: "commandExecution", status: "completed", command: "true" } } });
+  invocations[0]?.send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "cmd-1", type: "commandExecution", status: "completed", command: "true" } } });
 
   const result = await settlesWithin(pending, 200);
   assert.equal(result.kind, "failed");
@@ -660,7 +777,7 @@ test("direct child exit rejects initialize and clears every pending RPC even whe
 
   assert.deepEqual(withoutDiagnostics(await settlesWithin(pending)), {
     kind: "failed",
-    error: { code: "CODEX_PROTOCOL_ERROR", message: "Codex returned an invalid response." }
+    error: { code: "CODEX_EXECUTION_FAILED", message: "Codex execution failed." }
   });
   assert.equal((executor as unknown as { pending: Map<number, unknown> }).pending.size, 0);
 });
@@ -684,7 +801,7 @@ test("rejects malformed JSONL, missing messages, and malformed message structure
 
 test("nonzero exit discards partial output and stderr details", async () => {
   const result = await new CodexExecutor(TRUSTED_CWD, fakeStarter({
-    stdout: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "secret partial" } }),
+    stdout: JSON.stringify({ method: "future/notification", params: { text: "secret partial" } }),
     stderr: "secret stderr /private/path",
     exitCode: 7
   }, []), {}).execute({ taskId: TASK_ID, instruction: "x" });
@@ -732,7 +849,7 @@ test("an interrupted turn keeps the last completed agent text as real partial ou
   const invocation = invocations[0];
   assert.ok(invocation);
 
-  invocation.send({ method: "item/completed", params: { item: { id: "message-1", type: "agentMessage", text: "partial answer" } } });
+  invocation.send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "message-1", type: "agentMessage", text: "partial answer" } } });
   invocation.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "interrupted" } } });
 
   assert.deepEqual(withoutDiagnostics(await pending), {
@@ -751,8 +868,8 @@ test("marks oversized evidence strings with a visible truncation marker inside t
   const invocation = invocations[0];
   assert.ok(invocation);
 
-  invocation.send({ method: "item/completed", params: { item: { id: "cmd-1", type: "commandExecution", status: "completed", command: "c".repeat(20_000) } } });
-  invocation.send({ method: "item/completed", params: { item: { id: "change-1", type: "fileChange", status: "completed", changes: [{ path: "p".repeat(20_000), diff: "d".repeat(20_000) }] } } });
+  invocation.send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "cmd-1", type: "commandExecution", status: "completed", command: "c".repeat(20_000) } } });
+  invocation.send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "change-1", type: "fileChange", status: "completed", changes: [{ path: "p".repeat(20_000), diff: "d".repeat(20_000) }] } } });
   invocation.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
 
   const result = await pending;
@@ -780,7 +897,7 @@ test("marks an oversized changes list with an in-bound truncation entry and an a
   assert.ok(invocation);
 
   const changes = Array.from({ length: 55 }, (_, index) => ({ path: `file-${index}.txt`, diff: `diff ${index}` }));
-  invocation.send({ method: "item/completed", params: { item: { id: "change-1", type: "fileChange", status: "completed", changes } } });
+  invocation.send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "change-1", type: "fileChange", status: "completed", changes } } });
   invocation.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
 
   const result = await pending;
@@ -808,7 +925,7 @@ test("reports evidence evicted by the count limit through an in-budget synthetic
   assert.ok(invocation);
 
   for (let index = 1; index <= 55; index += 1) {
-    invocation.send({ method: "item/completed", params: { item: { id: `cmd-${index}`, type: "commandExecution", status: "completed", command: `command ${index}` } } });
+    invocation.send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: `cmd-${index}`, type: "commandExecution", status: "completed", command: `command ${index}` } } });
   }
   invocation.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
 
@@ -848,6 +965,7 @@ test("bounds Codex diagnostic evidence by aggregate serialized UTF-8 bytes and r
     invocation.send({
       method: "item/completed",
       params: {
+        threadId: "thread-1", turnId: "turn-1",
         item: {
           id: `cmd-${index}`,
           type: "commandExecution",
@@ -890,7 +1008,7 @@ test("fails promptly with bounded diagnostics for an overlong unterminated Codex
   assert.equal(JSON.stringify(result).includes(secret), false);
 });
 
-test("exposes only executor start/end timing metadata in structured diagnostics", async () => {
+test("exposes bounded structured diagnostics without instruction or output payloads", async () => {
   const invocations: Invocation[] = [];
   const executor = timedExecutor(fakeStarter({ appServerOutput: "done" }, invocations));
 
@@ -913,8 +1031,8 @@ test("passes untruncated evidence through unchanged", async () => {
   const invocation = invocations[0];
   assert.ok(invocation);
 
-  invocation.send({ method: "item/completed", params: { item: { id: "cmd-1", type: "commandExecution", status: "completed", command: "ls -la" } } });
-  invocation.send({ method: "item/completed", params: { item: { id: "change-1", type: "fileChange", status: "completed", changes: [{ path: "src/a.ts", diff: "+1 line" }] } } });
+  invocation.send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "cmd-1", type: "commandExecution", status: "completed", command: "ls -la" } } });
+  invocation.send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "change-1", type: "fileChange", status: "completed", changes: [{ path: "src/a.ts", diff: "+1 line" }] } } });
   invocation.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
 
   const result = await pending;
@@ -934,7 +1052,7 @@ test("does not cap agent message text or the final output", async () => {
   const invocation = invocations[0];
   assert.ok(invocation);
 
-  invocation.send({ method: "item/completed", params: { item: { id: "message-1", type: "agentMessage", text: longText } } });
+  invocation.send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "message-1", type: "agentMessage", text: longText } } });
   invocation.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
 
   const result = await pending;
@@ -1095,7 +1213,7 @@ test("POSIX: a Windows-style codex.exe layout on PATH does not change the bare s
   const invocations: Invocation[] = [];
   const executor = new CodexExecutor(TRUSTED_CWD,
     fakeStarter({ appServerOutput: "final answer" }, invocations),
-    { PATH: dir }); // default platform is the running (non-Windows) one
+    { PATH: dir }, "linux");
 
   await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
 

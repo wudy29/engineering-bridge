@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse, sep } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "node:child_process";
@@ -88,6 +88,39 @@ function catalogStateFilePath(catalog: ManagedWorkspaceCatalog): string {
   return (catalog as unknown as { stateFilePath: string }).stateFilePath;
 }
 
+test("F1: bind accepts a child when the approved root is the native filesystem root", async () => {
+  const project = realpathSync.native(mkdtempSync(join(tmpdir(), "bridge-filesystem-root-")));
+  try {
+    const registry = new RegisteredWorkspaceRegistry([]);
+    const catalog = new ManagedWorkspaceCatalog();
+    const onboarding = new WorkspaceOnboardingService(registry, catalog, [parse(project).root]);
+
+    const result = await onboarding.bind({ project_path: project });
+
+    assert.equal(result.root, project);
+    assert.equal(registry.resolve(result.workspace_id), project);
+    assert.equal(result.allow_write, false);
+  } finally {
+    rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test("F2: approved roots reject invalid lexical paths before canonicalization", () => {
+  const approved = join(tmpdir(), "bridge-approved-root");
+  const invalidRoots = ["", "relative/root", `${approved}${sep}..${sep}other`];
+  if (process.platform === "win32") invalidRoots.push("\\root", "\\workspace\\child", "C:relative");
+  for (const root of invalidRoots) {
+    let canonicalized = false;
+    expectCodeSync(() => new WorkspaceOnboardingService(
+      new RegisteredWorkspaceRegistry([]),
+      new ManagedWorkspaceCatalog(),
+      [root],
+      async () => { canonicalized = true; return approved; }
+    ), "WORKSPACE_BOUNDARY_VIOLATION");
+    assert.equal(canonicalized, false);
+  }
+});
+
 test("bind registers an existing directory inside an approved root and persists it", async () => {
   const { approved, catalogPath, registry, catalog, gitInvocations } = setup();
   const project = join(approved, "proj");
@@ -98,19 +131,19 @@ test("bind registers an existing directory inside an approved root and persists 
   const result = await onboarding.bind({ project_path: project });
 
   assert.equal(isId(result.workspace_id), true);
-  assert.equal(result.root, realpathSync(project));
+  assert.equal(result.root, realpathSync.native(project));
   assert.equal(result.allow_write, false);
   assert.equal(result.source, "managed");
-  assert.equal(registry.resolve(result.workspace_id), realpathSync(project));
+  assert.equal(registry.resolve(result.workspace_id), realpathSync.native(project));
   assert.deepEqual(gitInvocations, []);
 
   // Cross-restart persistence: a fresh catalog + registry resolves the same id.
   const reloadedCatalog = new ManagedWorkspaceCatalog(catalogPath);
   await reloadedCatalog.load();
-  assert.deepEqual(reloadedCatalog.entries(), [{ id: result.workspace_id, root: realpathSync(project), allowWrite: false }]);
+  assert.deepEqual(reloadedCatalog.entries(), [{ id: result.workspace_id, root: realpathSync.native(project), allowWrite: false }]);
   const reloadedRegistry = new RegisteredWorkspaceRegistry([]);
   for (const entry of reloadedCatalog.entries()) reloadedRegistry.registerManaged(entry.id, entry.root);
-  assert.equal(reloadedRegistry.resolve(result.workspace_id), realpathSync(project));
+  assert.equal(reloadedRegistry.resolve(result.workspace_id), realpathSync.native(project));
 });
 
 test("bind reuses an existing manual workspace with its real allow_write and source", async () => {
@@ -180,7 +213,7 @@ test("a failing approved root does not disable healthy roots; all-failed or non-
   const mixed = service(registry, catalog, [missingRoot, approved], gitInvocations);
   const result = await mixed.bind({ project_path: project });
   assert.equal(result.source, "managed");
-  assert.equal(result.root, realpathSync(project));
+  assert.equal(result.root, realpathSync.native(project));
 
   // A healthy root that does not contain the candidate still fails closed.
   await expectCode(() => mixed.bind({ project_path: otherApproved }), "WORKSPACE_BOUNDARY_VIOLATION");
@@ -195,7 +228,7 @@ test("a failing approved root does not disable healthy roots; all-failed or non-
   await expectCode(() => allBad.bind({ project_path: project }), "WORKSPACE_BOUNDARY_VIOLATION");
 
   // Only the successful bind left a record behind.
-  assert.deepEqual(catalog.entries(), [{ id: result.workspace_id, root: realpathSync(project), allowWrite: false }]);
+  assert.deepEqual(catalog.entries(), [{ id: result.workspace_id, root: realpathSync.native(project), allowWrite: false }]);
 });
 
 test("bind rejects nonexistent paths, non-directories, and missing approved roots", async () => {
@@ -220,7 +253,7 @@ test("create makes the directory, runs git init only, registers, and reports unb
   const result = await onboarding.create({ parent: approved, name: "newproj" });
 
   assert.equal(isId(result.workspace_id), true);
-  const expectedRoot = join(realpathSync(approved), "newproj");
+  const expectedRoot = join(realpathSync.native(approved), "newproj");
   assert.equal(result.root, expectedRoot);
   assert.equal(result.allow_write, false);
   assert.deepEqual(result.git, { initialized: true, head: "unborn" });
@@ -280,7 +313,7 @@ test("create with a catalog persist failure keeps the target, registers nothing,
     "INTERNAL_ERROR"
   );
 
-  const target = join(realpathSync(approved), "kept-proj");
+  const target = join(realpathSync.native(approved), "kept-proj");
   assert.equal(statSync(target).isDirectory(), true);
   assert.equal(registry.findByRoot(target), undefined);
   assert.deepEqual(catalog.entries(), []);
@@ -305,7 +338,7 @@ test("authorizeWrite persists controlled-write and enables resolveWritable after
 
   const authorized = await onboarding.authorizeWrite(workspace_id);
   assert.deepEqual(authorized, { workspace_id, allow_write: true });
-  assert.equal(registry.resolveWritable(workspace_id), realpathSync(project));
+  assert.equal(registry.resolveWritable(workspace_id), realpathSync.native(project));
 
   // Restart recovery: a fresh catalog + registry restores the authorization.
   const reloadedCatalog = new ManagedWorkspaceCatalog(catalogStateFilePath(catalog));
@@ -315,7 +348,7 @@ test("authorizeWrite persists controlled-write and enables resolveWritable after
   for (const entry of reloadedCatalog.entries()) {
     reloadedRegistry.registerManaged(entry.id, entry.root, entry.allowWrite);
   }
-  assert.equal(reloadedRegistry.resolveWritable(workspace_id), realpathSync(project));
+  assert.equal(reloadedRegistry.resolveWritable(workspace_id), realpathSync.native(project));
 });
 
 test("authorizeWrite is idempotent and persists once", async () => {
@@ -328,7 +361,7 @@ test("authorizeWrite is idempotent and persists once", async () => {
 
   await onboarding.authorizeWrite(workspace_id);
   await onboarding.authorizeWrite(workspace_id);
-  assert.deepEqual(catalog.entries(), [{ id: workspace_id, root: realpathSync(project), allowWrite: true }]);
+  assert.deepEqual(catalog.entries(), [{ id: workspace_id, root: realpathSync.native(project), allowWrite: true }]);
 });
 
 test("authorizeWrite rejects manual workspaces without touching the catalog", async () => {

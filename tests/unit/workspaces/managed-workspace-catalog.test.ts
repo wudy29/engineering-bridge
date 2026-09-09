@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test from "node:test";
+
+import { workspaceFixture } from "../../helpers/workspace-fixture.js";
 
 import { CoreError } from "../../../src/core/errors.js";
 import { ManagedWorkspaceCatalog } from "../../../src/workspaces/managed-workspace-catalog.js";
@@ -22,28 +24,75 @@ test("loads an absent catalog as empty and round-trips registrations through the
   await catalog.load();
   assert.deepEqual(catalog.entries(), []);
 
-  const first = await catalog.registerOnce("/canonical/a");
+  const first = await catalog.registerOnce(workspaceFixture("canonical", "a"));
   assert.equal(first.created, true);
-  const second = await catalog.registerOnce("/canonical/b");
+  const second = await catalog.registerOnce(workspaceFixture("canonical", "b"));
 
   const reloaded = new ManagedWorkspaceCatalog(path);
   await reloaded.load();
   assert.deepEqual(reloaded.entries(), [
-    { id: first.id, root: "/canonical/a", allowWrite: false },
-    { id: second.id, root: "/canonical/b", allowWrite: false }
+    { id: first.id, root: workspaceFixture("canonical", "a"), allowWrite: false },
+    { id: second.id, root: workspaceFixture("canonical", "b"), allowWrite: false }
   ]);
   // Atomic writes leave no temporary files behind.
   assert.deepEqual(readdirSync(directory), ["managed-workspaces.json"]);
 });
 
+test("F2: catalog registration rejects invalid roots without persisting or poisoning the queue", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridge-invalid-managed-root-"));
+  try {
+    const stateFile = join(directory, "managed-workspaces.json");
+    const catalog = new ManagedWorkspaceCatalog(stateFile);
+    const validRoot = workspaceFixture("canonical", "valid");
+    const invalidRoots = ["", "relative/root", `${validRoot}${sep}..${sep}other`];
+    if (process.platform === "win32") invalidRoots.push("\\root", "\\workspace\\child", "C:relative");
+    for (const root of invalidRoots) {
+      await expectCode(() => catalog.registerOnce(root), "WORKSPACE_BOUNDARY_VIOLATION");
+      assert.deepEqual(catalog.entries(), []);
+      assert.deepEqual(readdirSync(directory), []);
+    }
+    const { id } = await catalog.registerOnce(validRoot);
+    const restored = new ManagedWorkspaceCatalog(stateFile);
+    await restored.load();
+    assert.deepEqual(restored.entries(), [{ id, root: validRoot, allowWrite: false }]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("F2: catalog restore skips invalid roots while retaining valid authorized records", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "bridge-restore-managed-root-"));
+  try {
+    const stateFile = join(directory, "managed-workspaces.json");
+    const validRoot = workspaceFixture("canonical", "restored");
+    const invalidRoots = ["", "relative/root", `${validRoot}${sep}..${sep}other`];
+    if (process.platform === "win32") invalidRoots.push("\\root", "\\workspace\\child", "C:relative");
+    const id = "00000000-0000-4000-8000-000000000099";
+    writeFileSync(stateFile, JSON.stringify({
+      version: 1,
+      workspaces: [
+        ...invalidRoots.map((root, index) => ({
+          id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`, root, allow_write: true
+        })),
+        { id, root: validRoot, allow_write: true }
+      ]
+    }));
+    const catalog = new ManagedWorkspaceCatalog(stateFile);
+    await catalog.load();
+    assert.deepEqual(catalog.entries(), [{ id, root: validRoot, allowWrite: true }]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("registerOnce returns the existing id for the same root without duplicating", async () => {
   const catalog = new ManagedWorkspaceCatalog(undefined);
-  const first = await catalog.registerOnce("/canonical/a");
-  const second = await catalog.registerOnce("/canonical/a");
+  const first = await catalog.registerOnce(workspaceFixture("canonical", "a"));
+  const second = await catalog.registerOnce(workspaceFixture("canonical", "a"));
 
   assert.equal(second.id, first.id);
   assert.equal(second.created, false);
-  assert.deepEqual(catalog.entries(), [{ id: first.id, root: "/canonical/a", allowWrite: false }]);
+  assert.deepEqual(catalog.entries(), [{ id: first.id, root: workspaceFixture("canonical", "a"), allowWrite: false }]);
 });
 
 test("concurrent registerOnce calls for the same root converge on one id and one record", async () => {
@@ -52,8 +101,8 @@ test("concurrent registerOnce calls for the same root converge on one id and one
   await catalog.load();
 
   const [first, second] = await Promise.all([
-    catalog.registerOnce("/canonical/same"),
-    catalog.registerOnce("/canonical/same")
+    catalog.registerOnce(workspaceFixture("canonical", "same")),
+    catalog.registerOnce(workspaceFixture("canonical", "same"))
   ]);
 
   assert.equal(first.id, second.id);
@@ -61,7 +110,7 @@ test("concurrent registerOnce calls for the same root converge on one id and one
 
   const reloaded = new ManagedWorkspaceCatalog(path);
   await reloaded.load();
-  assert.deepEqual(reloaded.entries(), [{ id: first.id, root: "/canonical/same", allowWrite: false }]);
+  assert.deepEqual(reloaded.entries(), [{ id: first.id, root: workspaceFixture("canonical", "same"), allowWrite: false }]);
 });
 
 test("a persist failure rolls back the in-memory record and allows a later retry", async () => {
@@ -71,15 +120,15 @@ test("a persist failure rolls back the in-memory record and allows a later retry
 
   // Block the state file path with a directory so the atomic rename fails.
   mkdirSync(path);
-  await expectCode(() => catalog.registerOnce("/canonical/x"), "INTERNAL_ERROR");
+  await expectCode(() => catalog.registerOnce(workspaceFixture("canonical", "x")), "INTERNAL_ERROR");
   assert.deepEqual(catalog.entries(), []);
 
   rmSync(path, { recursive: true, force: true });
-  const retried = await catalog.registerOnce("/canonical/x");
+  const retried = await catalog.registerOnce(workspaceFixture("canonical", "x"));
   assert.equal(retried.created, true);
   const reloaded = new ManagedWorkspaceCatalog(path);
   await reloaded.load();
-  assert.deepEqual(reloaded.entries(), [{ id: retried.id, root: "/canonical/x", allowWrite: false }]);
+  assert.deepEqual(reloaded.entries(), [{ id: retried.id, root: workspaceFixture("canonical", "x"), allowWrite: false }]);
 });
 
 test("skips individually invalid records and rejects a corrupt whole file", async () => {
@@ -87,18 +136,18 @@ test("skips individually invalid records and rejects a corrupt whole file", asyn
   writeFileSync(path, `${JSON.stringify({
     version: 1,
     workspaces: [
-      { id: "not-a-uuid", root: "/canonical/bad-id" },
+      { id: "not-a-uuid", root: workspaceFixture("canonical", "bad-id") },
       { id: "00000000-0000-4000-8000-000000000001", root: "relative/root" },
-      { id: "00000000-0000-4000-8000-000000000002", root: "/canonical/ok" },
-      { id: "00000000-0000-4000-8000-000000000002", root: "/canonical/dup-id" },
-      { id: "00000000-0000-4000-8000-000000000003", root: "/canonical/ok" }
+      { id: "00000000-0000-4000-8000-000000000002", root: workspaceFixture("canonical", "ok") },
+      { id: "00000000-0000-4000-8000-000000000002", root: workspaceFixture("canonical", "dup-id") },
+      { id: "00000000-0000-4000-8000-000000000003", root: workspaceFixture("canonical", "ok") }
     ]
   }, null, 2)}\n`);
 
   const catalog = new ManagedWorkspaceCatalog(path);
   await catalog.load();
   assert.deepEqual(catalog.entries(), [
-    { id: "00000000-0000-4000-8000-000000000002", root: "/canonical/ok", allowWrite: false }
+    { id: "00000000-0000-4000-8000-000000000002", root: workspaceFixture("canonical", "ok"), allowWrite: false }
   ]);
 
   writeFileSync(path, "not json at all");
@@ -111,8 +160,8 @@ test("skips individually invalid records and rejects a corrupt whole file", asyn
 test("a catalog without a state file path stays process-local", async () => {
   const catalog = new ManagedWorkspaceCatalog(undefined);
   await catalog.load();
-  const { id } = await catalog.registerOnce("/canonical/local");
-  assert.deepEqual(catalog.entries(), [{ id, root: "/canonical/local", allowWrite: false }]);
+  const { id } = await catalog.registerOnce(workspaceFixture("canonical", "local"));
+  assert.deepEqual(catalog.entries(), [{ id, root: workspaceFixture("canonical", "local"), allowWrite: false }]);
 });
 
 test("loads pre-authorization v1 records as read-only and round-trips authorized records", async () => {
@@ -120,16 +169,16 @@ test("loads pre-authorization v1 records as read-only and round-trips authorized
   writeFileSync(path, `${JSON.stringify({
     version: 1,
     workspaces: [
-      { id: "00000000-0000-4000-8000-000000000001", root: "/canonical/old" },
-      { id: "00000000-0000-4000-8000-000000000002", root: "/canonical/authorized", allow_write: true }
+      { id: "00000000-0000-4000-8000-000000000001", root: workspaceFixture("canonical", "old") },
+      { id: "00000000-0000-4000-8000-000000000002", root: workspaceFixture("canonical", "authorized"), allow_write: true }
     ]
   }, null, 2)}\n`);
 
   const catalog = new ManagedWorkspaceCatalog(path);
   await catalog.load();
   assert.deepEqual(catalog.entries(), [
-    { id: "00000000-0000-4000-8000-000000000001", root: "/canonical/old", allowWrite: false },
-    { id: "00000000-0000-4000-8000-000000000002", root: "/canonical/authorized", allowWrite: true }
+    { id: "00000000-0000-4000-8000-000000000001", root: workspaceFixture("canonical", "old"), allowWrite: false },
+    { id: "00000000-0000-4000-8000-000000000002", root: workspaceFixture("canonical", "authorized"), allowWrite: true }
   ]);
 
   const reloaded = new ManagedWorkspaceCatalog(path);
@@ -142,15 +191,15 @@ test("registerOnce records stay read-only until authorize flips the record persi
   const path = join(directory, "managed-workspaces.json");
   const catalog = new ManagedWorkspaceCatalog(path);
   await catalog.load();
-  const { id } = await catalog.registerOnce("/canonical/auth");
+  const { id } = await catalog.registerOnce(workspaceFixture("canonical", "auth"));
   assert.equal(catalog.entries()[0]?.allowWrite, false);
 
-  await catalog.authorize("/canonical/auth");
+  await catalog.authorize(workspaceFixture("canonical", "auth"));
   assert.equal(catalog.entries()[0]?.allowWrite, true);
 
   const reloaded = new ManagedWorkspaceCatalog(path);
   await reloaded.load();
-  assert.deepEqual(reloaded.entries(), [{ id, root: "/canonical/auth", allowWrite: true }]);
+  assert.deepEqual(reloaded.entries(), [{ id, root: workspaceFixture("canonical", "auth"), allowWrite: true }]);
 });
 
 test("authorize is idempotent and unknown roots fail closed", async () => {
@@ -158,12 +207,12 @@ test("authorize is idempotent and unknown roots fail closed", async () => {
   const path = join(directory, "managed-workspaces.json");
   const catalog = new ManagedWorkspaceCatalog(path);
   await catalog.load();
-  await catalog.registerOnce("/canonical/idem");
+  await catalog.registerOnce(workspaceFixture("canonical", "idem"));
 
-  await catalog.authorize("/canonical/idem");
-  await catalog.authorize("/canonical/idem");
+  await catalog.authorize(workspaceFixture("canonical", "idem"));
+  await catalog.authorize(workspaceFixture("canonical", "idem"));
   assert.equal(catalog.entries()[0]?.allowWrite, true);
-  await expectCode(() => catalog.authorize("/canonical/unknown"), "INTERNAL_ERROR");
+  await expectCode(() => catalog.authorize(workspaceFixture("canonical", "unknown")), "INTERNAL_ERROR");
   assert.equal(readdirSync(directory).length, 1); // no extra temporary files
 });
 
@@ -172,11 +221,11 @@ test("concurrent authorize calls converge and a persist failure rolls back the i
   const path = join(directory, "managed-workspaces.json");
   const catalog = new ManagedWorkspaceCatalog(path);
   await catalog.load();
-  await catalog.registerOnce("/canonical/concurrent");
+  await catalog.registerOnce(workspaceFixture("canonical", "concurrent"));
 
   await Promise.all([
-    catalog.authorize("/canonical/concurrent"),
-    catalog.authorize("/canonical/concurrent")
+    catalog.authorize(workspaceFixture("canonical", "concurrent")),
+    catalog.authorize(workspaceFixture("canonical", "concurrent"))
   ]);
   assert.equal(catalog.entries()[0]?.allowWrite, true);
 
@@ -184,14 +233,14 @@ test("concurrent authorize calls converge and a persist failure rolls back the i
   const blockedPath = join(directory, "blocked.json");
   const blocked = new ManagedWorkspaceCatalog(blockedPath);
   await blocked.load();
-  await blocked.registerOnce("/canonical/blocked");
+  await blocked.registerOnce(workspaceFixture("canonical", "blocked"));
   rmSync(blockedPath);
   mkdirSync(blockedPath);
-  await expectCode(() => blocked.authorize("/canonical/blocked"), "INTERNAL_ERROR");
+  await expectCode(() => blocked.authorize(workspaceFixture("canonical", "blocked")), "INTERNAL_ERROR");
   assert.equal(blocked.entries()[0]?.allowWrite, false);
 
   // The same catalog can authorize once the blocker is gone.
   rmSync(blockedPath, { recursive: true, force: true });
-  await blocked.authorize("/canonical/blocked");
+  await blocked.authorize(workspaceFixture("canonical", "blocked"));
   assert.equal(blocked.entries()[0]?.allowWrite, true);
 });

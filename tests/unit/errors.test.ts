@@ -14,6 +14,7 @@ test("exposes the executor error codes", () => {
     "CODEX_UNAVAILABLE",
     "CODEX_PROTOCOL_ERROR",
     "CODEX_EXECUTION_FAILED",
+    "CODEX_ROUTING_REQUIRED",
     "EXECUTOR_STALLED",
     "DSH_UNAVAILABLE",
     "DSH_PROTOCOL_ERROR",
@@ -29,6 +30,9 @@ test("exposes the executor error codes", () => {
   });
   assert.deepEqual(serializeError(new CoreError("CODEX_EXECUTION_FAILED")), {
     code: "CODEX_EXECUTION_FAILED", message: "Codex execution failed."
+  });
+  assert.deepEqual(serializeError(new CoreError("CODEX_ROUTING_REQUIRED")), {
+    code: "CODEX_ROUTING_REQUIRED", message: "Explicit model and reasoning_effort are required for Codex execution."
   });
   assert.deepEqual(serializeError(new CoreError("DSH_UNAVAILABLE")), {
     code: "DSH_UNAVAILABLE", message: "DSH is unavailable."

@@ -162,6 +162,8 @@ npm run build
 
 使用 DSH 时，若 `DEEPSEEK_API_KEY` 已设置在 Bridge 进程运行时的环境变量中（例如 shell 或启动器环境），Bridge 会将其转发给 DSH——这是 Bridge 转发的唯一凭据环境变量。不要把它写进这里的 `env` 覆盖或任何配置文件——密钥不应落入配置。
 
+**Codex routing policy（可选）：** `ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY` 未设置时默认为 `inherit`，保持 v1.4.x 的兼容行为：`model` 或 `reasoning_effort` 缺省时允许 Codex 使用其既有配置。需要 fail closed 的部署可将它严格设置为 `explicit`；此时 `run_task`、`generate_controlled_patch` 和 `refine_controlled_patch` 的每次 Codex 调用都必须同时提供非空 `model` 与 `reasoning_effort`，否则在启动 Codex 进程前返回 `CODEX_ROUTING_REQUIRED`。通过 gate 后仍会执行现有 `model/list` / reasoning validation，并把选择传入 `turn/start`。非法值（包括空字符串、大小写变体或其他别名）会使 Bridge 启动失败，不会回退到 `inherit`；DSH 行为不受此策略约束。
+
 重新连接集成，并确认能看到以下十三个当前 V1 工具：
 
 - `run_task`

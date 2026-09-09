@@ -1,9 +1,9 @@
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { isAbsolute, normalize } from "node:path";
 
 import { CoreError } from "../core/errors.js";
 import { isId, newId } from "../core/ids.js";
 import type { Id } from "../core/ids.js";
+import { isWorkspaceRoot } from "./workspace-paths.js";
 
 export interface ManagedWorkspaceRecord {
   readonly id: Id;
@@ -46,8 +46,7 @@ export class ManagedWorkspaceCatalog {
       if (!isObject(item)) continue;
       const { id, root, allow_write } = item;
       if (typeof id !== "string" || !isId(id) ||
-          typeof root !== "string" || root.length === 0 ||
-          !isAbsolute(root) || normalize(root) !== root ||
+          !isWorkspaceRoot(root) ||
           (allow_write !== undefined && typeof allow_write !== "boolean")) {
         continue; // Skip individually invalid records.
       }
@@ -66,6 +65,7 @@ export class ManagedWorkspaceCatalog {
 
   registerOnce(root: string): Promise<{ id: Id; created: boolean }> {
     const mutation = this.mutationQueue.then(async (): Promise<{ id: Id; created: boolean }> => {
+      if (!isWorkspaceRoot(root)) throw new CoreError("WORKSPACE_BOUNDARY_VIOLATION");
       const existing = this.records.get(root);
       if (existing !== undefined) return { id: existing.id, created: false };
       const id = newId();

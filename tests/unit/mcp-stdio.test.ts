@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+
+import { isolateGitLineEndings } from "../helpers/git-fixture.js";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -47,6 +49,80 @@ test("workspace configuration strips exactly one leading UTF-8 BOM", async () =>
         rmSync(configRoot, { recursive: true, force: true });
       }
     }
+  }
+});
+
+test("startup fails closed for an invalid Codex routing policy", async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), "engineering-bridge-routing-policy-startup-"));
+  const configPath = join(configRoot, "workspaces.json");
+  writeFileSync(configPath, "[]\n");
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(process.cwd(), "dist/src/mcp-stdio.js"), configPath],
+    cwd: process.cwd(),
+    env: { ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY: "STRICT" },
+    stderr: "pipe"
+  });
+
+  try {
+    await assert.rejects(client.connect(transport));
+  } finally {
+    await client.close();
+    rmSync(configRoot, { recursive: true, force: true });
+  }
+});
+
+test("explicit Codex routing from the environment reaches run_task before Codex spawn", async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), "engineering-bridge-routing-policy-mcp-"));
+  const workspaceRoot = join(configRoot, "workspace");
+  mkdirSync(workspaceRoot);
+  const markerPath = join(configRoot, "codex-started");
+  const codexPath = join(configRoot, "codex");
+  writeFileSync(codexPath, `#!${process.execPath}\nrequire("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "started");\n`);
+  chmodSync(codexPath, 0o755);
+  const configPath = join(configRoot, "workspaces.json");
+  writeFileSync(configPath, `${JSON.stringify([{ id: "workspace", root: workspaceRoot }])}\n`);
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(process.cwd(), "dist/src/mcp-stdio.js"), configPath],
+    cwd: process.cwd(),
+    env: {
+      PATH: configRoot,
+      ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY: "explicit"
+    },
+    stderr: "pipe"
+  });
+
+  const call = async (name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const result = await client.callTool({ name, arguments: args });
+    const content = result.content as Array<{ type?: string; text?: string }>;
+    return JSON.parse(content[0]?.text ?? "{}");
+  };
+
+  try {
+    await client.connect(transport);
+    const started = await call("run_task", {
+      workspace_id: "workspace",
+      instruction: "inspect"
+    });
+    const taskId = started.task_id;
+    assert.equal(typeof taskId, "string");
+    let terminal: Record<string, unknown> = {};
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      terminal = await call("task_result", { task_id: taskId });
+      if (terminal.state !== "queued" && terminal.state !== "running") break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.deepEqual(terminal.error, {
+      code: "CODEX_ROUTING_REQUIRED",
+      message: "Explicit model and reasoning_effort are required for Codex execution."
+    });
+    assert.equal(existsSync(markerPath), false);
+  } finally {
+    await client.close();
+    rmSync(configRoot, { recursive: true, force: true });
   }
 });
 
@@ -332,7 +408,7 @@ test("bind_project and create_project register workspaces inside approved projec
     assert.equal(firstBind.isError, false);
     const firstBody = firstBind.body as { workspace_id?: unknown; root?: unknown; allow_write?: unknown; source?: unknown };
     assert.equal(typeof firstBody.workspace_id, "string");
-    assert.equal(firstBody.root, realpathSync(otherProject));
+    assert.equal(firstBody.root, realpathSync.native(otherProject));
     assert.equal(firstBody.allow_write, false);
     assert.equal(firstBody.source, "managed");
 
@@ -360,9 +436,10 @@ test("bind_project and create_project register workspaces inside approved projec
     assert.equal(created.isError, false);
     const createdBody = created.body as { workspace_id?: unknown; root?: unknown; allow_write?: unknown; git?: unknown };
     assert.equal(typeof createdBody.workspace_id, "string");
-    assert.equal(createdBody.root, realpathSync(join(approved, "created-project")));
+    assert.equal(createdBody.root, realpathSync.native(join(approved, "created-project")));
     assert.equal(createdBody.allow_write, false);
     assert.deepEqual(createdBody.git, { initialized: true, head: "unborn" });
+    isolateGitLineEndings(join(approved, "created-project"));
     assert.equal(readFileSync(join(approved, "created-project", ".git", "HEAD"), "utf8").includes("ref:"), true);
 
     // Wrong or missing confirmation is rejected by the schema without side effects.
@@ -392,11 +469,14 @@ test("bind_project and create_project register workspaces inside approved projec
   }
 });
 
-test("startup rejects relative or non-normalized project_root entries and accepts a valid one", async () => {
-  for (const root of ["relative/root", "/registered/../root"]) {
+test("startup rejects invalid manual and project roots and accepts a valid project_root", async () => {
+  const invalidRoots = ["relative/root", "/registered/../root"];
+  if (process.platform === "win32") invalidRoots.push("\\root", "\\workspace\\child", "C:relative");
+  const invalidEntries = invalidRoots.flatMap((root) => [{ kind: "project_root", root }, { id: "manual", root }]);
+  for (const entry of invalidEntries) {
     const configDir = mkdtempSync(join(tmpdir(), "engineering-bridge-badroot-"));
     const configPath = join(configDir, "workspaces.json");
-    writeFileSync(configPath, `${JSON.stringify([{ kind: "project_root", root }], null, 2)}\n`);
+    writeFileSync(configPath, `${JSON.stringify([entry], null, 2)}\n`);
 
     const client = new Client({ name: "test-client", version: "1.0.0" });
     const transport = new StdioClientTransport({
@@ -650,6 +730,7 @@ test("generate_controlled_patch and refine_controlled_patch accept omitted/codex
 test("submit_controlled_patch registers a submitted proposal and task_result reports source submitted without an executor", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-submit-")));
   execFileSync("git", ["init", "-q"], { cwd: root });
+  isolateGitLineEndings(root);
   execFileSync("git", ["config", "user.name", "Test User"], { cwd: root });
   execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
   writeFileSync(join(root, "note.txt"), "before\n");
@@ -804,6 +885,7 @@ index 90be1f3..3b18e51 100644
 test("controlled patch validation tools enforce fixed schemas, confirmation, defaults, and fixed validation input", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "engineering-bridge-validation-mcp-")));
   execFileSync("git", ["init", "-q"], { cwd: root });
+  isolateGitLineEndings(root);
   execFileSync("git", ["config", "user.name", "Test User"], { cwd: root });
   execFileSync("git", ["config", "user.email", "test@example.invalid"], { cwd: root });
   writeFileSync(join(root, "note.txt"), "before\n");

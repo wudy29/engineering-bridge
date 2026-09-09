@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { readFile } from "node:fs/promises";
-import { isAbsolute, normalize } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -11,6 +10,7 @@ import { CodexExecutor } from "./executors/codex-executor.js";
 import { DshExecutor } from "./executors/dsh-executor.js";
 import { VERSION } from "./version.js";
 import { CoreError, serializeError } from "./core/errors.js";
+import { CODEX_ROUTING_POLICY_ENV, parseCodexRoutingPolicy } from "./core/codex-routing-policy.js";
 import { RegisteredWorkspaceTaskService } from "./tasks/registered-workspace-task-service.js";
 import { ControlledPatchService } from "./tasks/controlled-patch-service.js";
 import { ControlledPatchValidationService } from "./tasks/controlled-patch-validation-service.js";
@@ -100,17 +100,11 @@ async function main(): Promise<void> {
 
   const configPath = process.argv[2];
   if (configPath === undefined) throw new Error("Workspace configuration path is required.");
+  const codexRoutingPolicy = parseCodexRoutingPolicy(process.env[CODEX_ROUTING_POLICY_ENV]);
   const configSource = await readFile(configPath, "utf8");
   const parsed = WorkspaceConfigSchema.parse(JSON.parse(configSource.startsWith("\uFEFF") ? configSource.slice(1) : configSource));
   const workspaceEntries = parsed.filter((entry): entry is WorkspaceEntry => !isProjectRootEntry(entry));
   const projectRootEntries = parsed.filter(isProjectRootEntry);
-  for (const entry of projectRootEntries) {
-    // project_root entries share the manual workspace root semantics: absolute
-    // and already normalized, rejected at startup otherwise.
-    if (!isAbsolute(entry.root) || normalize(entry.root) !== entry.root) {
-      throw new CoreError("WORKSPACE_BOUNDARY_VIOLATION");
-    }
-  }
   const registry = new RegisteredWorkspaceRegistry(workspaceEntries);
   const catalog = new ManagedWorkspaceCatalog(`${configPath}.managed-workspaces.json`);
   await catalog.load();
@@ -130,7 +124,7 @@ async function main(): Promise<void> {
     registry,
     (executor, workspaceRoot) => {
       switch (executor) {
-        case "codex": return new CodexExecutor(workspaceRoot);
+        case "codex": return new CodexExecutor(workspaceRoot, undefined, undefined, undefined, undefined, codexRoutingPolicy);
         case "dsh": return new DshExecutor(workspaceRoot);
       }
     }

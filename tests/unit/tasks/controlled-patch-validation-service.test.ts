@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { isolateGitLineEndings } from "../../helpers/git-fixture.js";
+
 import { CoreError } from "../../../src/core/errors.js";
 import {
   ControlledPatchService,
@@ -244,6 +246,7 @@ function repository(): string {
     mkdtempSync(join(tmpdir(), "engineering-bridge-validation-repo-"))
   );
   git(root, "init", "-q");
+  isolateGitLineEndings(root);
   git(root, "config", "user.name", "Test User");
   git(root, "config", "user.email", "test@example.invalid");
   writeFileSync(join(root, "note.txt"), "before\n");

@@ -3,7 +3,7 @@ import { serializeError } from "../core/errors.js";
 import type { Id } from "../core/ids.js";
 import type { SerializedError } from "../core/errors.js";
 import { CoreError } from "../core/errors.js";
-import type { Executor, ExecutorDiagnostics, ExecutorEvidence } from "../executors/executor.js";
+import type { Executor, ExecutorDiagnostics, ExecutorProgressDiagnostics, ExecutorEvidence } from "../executors/executor.js";
 import { RegisteredWorkspaceRegistry } from "../workspaces/registered-workspace-registry.js";
 
 export type ExecutorName = "codex" | "dsh";
@@ -48,9 +48,10 @@ export type RegisteredWorkspaceTaskState = "queued" | "running" | "completed" | 
 
 export type ControlledTaskState = RegisteredWorkspaceTaskState | "waiting_for_supervisor_review";
 export type ControlledTaskDiagnostics =
-  | (ExecutorDiagnostics & {
-    readonly finalization_started_at?: never;
-    readonly finalization_ended_at?: never;
+  | (ExecutorProgressDiagnostics & {
+    readonly executor_ended_at?: string;
+    readonly finalization_started_at?: string;
+    readonly finalization_ended_at?: string;
   })
   | {
     readonly finalization_started_at: string;
@@ -85,7 +86,7 @@ export interface ControlledTaskView {
 // executor so control_task can reach the existing interrupt/steer seam; the
 // terminal record stores the result instead.
 type TaskRecord =
-  | { state: "queued" | "running"; executor: ExecutorName; active?: Executor }
+  | { state: "queued" | "running"; executor: ExecutorName; active?: Executor; diagnostics?: ExecutorProgressDiagnostics }
   | { state: "completed" | "failed"; executor: ExecutorName | undefined; source?: "submitted"; result: RegisteredWorkspaceTaskResult; diagnostics?: ControlledTaskDiagnostics };
 
 type NonTerminalTaskRecord = Extract<TaskRecord, { state: "queued" | "running" }>;
@@ -93,7 +94,7 @@ type NonTerminalTaskRecord = Extract<TaskRecord, { state: "queued" | "running" }
 type InteractiveRecord = {
   state: ControlledTaskState; request: NormalizedRegisteredWorkspaceTaskRequest; evidence: readonly ExecutorEvidence[];
   executor?: Executor | undefined; threadId?: string | undefined; output?: string | undefined;
-  partialOutput?: string | undefined; diagnostics?: ExecutorDiagnostics | undefined; error?: SerializedError | undefined;
+  partialOutput?: string | undefined; diagnostics?: ExecutorDiagnostics | ExecutorProgressDiagnostics | undefined; error?: SerializedError | undefined;
 };
 
 const MAX_TERMINAL_TASK_HISTORY = 100;
@@ -227,7 +228,8 @@ export class RegisteredWorkspaceTaskService {
       const legacy = this.tasks.get(taskId);
       if (!legacy) return undefined;
       if (!("result" in legacy)) {
-        return { taskId, state: legacy.state, executor: legacy.executor, ready: false };
+        return { taskId, state: legacy.state, executor: legacy.executor, ready: false,
+          ...(legacy.diagnostics === undefined ? {} : { diagnostics: legacy.diagnostics }) };
       }
       const common = {
         taskId,
@@ -345,10 +347,12 @@ export class RegisteredWorkspaceTaskService {
         ...(record.threadId !== undefined ? { threadId: record.threadId } : {}),
         ...(record.request.model !== undefined ? { model: record.request.model } : {}),
         ...(record.request.reasoning_effort !== undefined ? { reasoning_effort: record.request.reasoning_effort } : {}),
-        onEvidence: (items) => { record.evidence = items; } });
+        onEvidence: (items) => { record.evidence = items; },
+        onDiagnostics: (diagnostics) => { record.diagnostics = diagnostics; } });
       record.executor = undefined;
       record.threadId = result.threadId ?? record.threadId;
       record.evidence = result.evidence ?? record.evidence;
+      record.diagnostics = result.diagnostics ?? record.diagnostics;
       if (result.kind === "failed") { record.state = "failed"; record.error = result.error; }
       else if (result.kind === "interrupted") {
         // The failed terminal state and its safe error are unchanged; the
@@ -359,7 +363,6 @@ export class RegisteredWorkspaceTaskService {
         record.state = "failed";
         record.error = interruptedError();
       } else {
-        record.diagnostics = result.diagnostics;
         record.state = "waiting_for_supervisor_review";
         record.output = result.output;
       }
@@ -385,8 +388,10 @@ export class RegisteredWorkspaceTaskService {
       // Temporarily retain the active executor on the running record so
       // control_task can reach the existing interrupt/steer seam; the terminal
       // record below replaces it once the run settles.
-      this.tasks.set(taskId, { state: "running", executor: request.executor, active: executor });
+      const running: NonTerminalTaskRecord = { state: "running", executor: request.executor, active: executor };
+      this.tasks.set(taskId, running);
       const result = await executor.execute({ taskId, instruction: request.instruction,
+        onDiagnostics: (diagnostics) => { running.diagnostics = diagnostics; },
         ...(request.model !== undefined ? { model: request.model } : {}),
         ...(request.reasoning_effort !== undefined ? { reasoning_effort: request.reasoning_effort } : {}) });
       const taskResult: RegisteredWorkspaceTaskResult = result.kind === "completed"
@@ -400,7 +405,7 @@ export class RegisteredWorkspaceTaskService {
         : result.kind === "failed"
           ? { id: taskId, state: "failed", error: result.error }
           : interruptedTaskResult(taskId, result.output);
-      await this.recordLegacyTerminalTask(taskId, taskResult, terminalTaskHandler);
+      await this.recordLegacyTerminalTask(taskId, taskResult, terminalTaskHandler, result.diagnostics);
     } catch (error) {
       const result: RegisteredWorkspaceTaskResult = {
         id: taskId,
@@ -414,7 +419,8 @@ export class RegisteredWorkspaceTaskService {
   private async recordLegacyTerminalTask(
     taskId: Id,
     result: RegisteredWorkspaceTaskResult,
-    terminalTaskHandler?: TerminalTaskHandler
+    terminalTaskHandler?: TerminalTaskHandler,
+    executorDiagnostics?: ExecutorDiagnostics
   ): Promise<void> {
     const finalizationStartedAt = new Date().toISOString();
     let terminalResult: RegisteredWorkspaceTaskResult = result;
@@ -428,6 +434,8 @@ export class RegisteredWorkspaceTaskService {
       };
     }
     const diagnostics: ControlledTaskDiagnostics = {
+      ...this.tasks.get(taskId)?.diagnostics,
+      ...executorDiagnostics,
       finalization_started_at: finalizationStartedAt,
       finalization_ended_at: new Date().toISOString()
     };
