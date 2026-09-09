@@ -1,5 +1,7 @@
 # Engineering Bridge
 
+<!-- 在 Chat 与本机 Codex 或 DSH 之间提供受控的工程桥接。 -->
+
 **打通 Chat 与本地 Codex 与 Deepseek harness：不再搬提示词，Chat 直接调度、监督并验收 Codex 与 Deepseek harness。**
 
 [![v1.4.2](https://img.shields.io/badge/release-v1.4.2-blue)](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.2)
