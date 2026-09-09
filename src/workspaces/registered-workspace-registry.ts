@@ -116,7 +116,7 @@ export class RegisteredWorkspaceRegistry {
 
 function bestEffortCanonicalRoot(root: string): string {
   try {
-    return realpathSync(root);
+    return realpathSync.native(root);
   } catch {
     return root;
   }
