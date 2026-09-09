@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { constants, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,6 +18,12 @@ import { ManagedWorkspaceCatalog } from "../../../src/workspaces/managed-workspa
 import { RegisteredWorkspaceRegistry } from "../../../src/workspaces/registered-workspace-registry.js";
 import { WorkspaceOnboardingService } from "../../../src/workspaces/workspace-onboarding-service.js";
 
+const noFollowRequiredSkip = typeof constants.O_NOFOLLOW === "number"
+  ? false
+  : "O_NOFOLLOW is required for ordinary untracked-file fingerprinting";
+const noFollowUnavailableSkip = typeof constants.O_NOFOLLOW === "number"
+  ? "O_NOFOLLOW is available on this platform"
+  : false;
 function git(root: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd: root, encoding: "utf8" });
 }
@@ -719,7 +725,40 @@ test("stores and applies a controlled patch normalized to one trailing LF", asyn
   assert.equal(readFileSync(join(root, "note.txt"), "utf8"), "after\n");
 });
 
-test("initial COMMIT creates a verified root commit from exactly the applied proposal targets", async () => {
+test("COMMIT fails closed before staging when ordinary untracked fingerprinting lacks O_NOFOLLOW", {
+  skip: noFollowUnavailableSkip
+}, async () => {
+  const root = repository();
+  const anchorPath = "recovery-anchor.md";
+  let cachedApplyCalls = 0;
+  let commitCalls = 0;
+  const starter: GitStarter = (executable, args, options) => {
+    if (executable === "git" && args[0] === "apply" && args.includes("--cached")) cachedApplyCalls += 1;
+    if (executable === "git" && args.includes("commit")) commitCalls += 1;
+    return spawn(executable, args, options);
+  };
+  try {
+    writeFileSync(join(root, anchorPath), "anchor\n");
+    const beforeHead = currentHead(root);
+    const { controlled, taskId } = await appliedFixture(root, validPatch, starter);
+
+    await expectCode(() => controlled.commit({
+      patch_task_id: taskId,
+      message: "must fail closed",
+      confirmation: "COMMIT"
+    }), "WORKSPACE_PRECONDITION_FAILED");
+
+    assert.equal(currentHead(root), beforeHead);
+    assert.equal(cachedApplyCalls, 0);
+    assert.equal(commitCalls, 0);
+    assert.equal(git(root, "diff", "--cached", "--name-only"), "");
+    assert.equal(readFileSync(join(root, anchorPath), "utf8"), "anchor\n");
+    assert.equal(readFileSync(join(root, "note.txt"), "utf8"), "after\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+test("initial COMMIT creates a verified root commit from exactly the applied proposal targets", { skip: noFollowRequiredSkip }, async () => {
   const root = unbornRepository();
   const anchorPath = "recovery-anchor.md";
   try {
@@ -880,7 +919,7 @@ test("initial COMMIT rechecks for inserted refs immediately before creating the 
   }
 });
 
-test("initial COMMIT failure cleans up only Bridge-staged proposal targets", async () => {
+test("initial COMMIT failure cleans up only Bridge-staged proposal targets", { skip: noFollowRequiredSkip }, async () => {
   const root = unbornRepository();
   const anchorPath = "recovery-anchor.md";
   let commitCalls = 0;
@@ -918,7 +957,7 @@ test("initial COMMIT failure cleans up only Bridge-staged proposal targets", asy
   }
 });
 
-test("initial COMMIT preserves a created root commit when exact-path post-verification fails", async () => {
+test("initial COMMIT preserves a created root commit when exact-path post-verification fails", { skip: noFollowRequiredSkip }, async () => {
   const root = unbornRepository();
   const anchorPath = "recovery-anchor.md";
   try {
@@ -1111,7 +1150,7 @@ test("COMMIT rejects unrelated tracked dirt", async () => {
   }
 });
 
-test("COMMIT preserves a pre-existing unrelated untracked file", async () => {
+test("COMMIT preserves a pre-existing unrelated untracked file", { skip: noFollowRequiredSkip }, async () => {
   const root = repository();
   const anchorPath = "docs/operations/recovery-anchor.md";
   try {
@@ -1142,7 +1181,7 @@ test("COMMIT preserves a pre-existing unrelated untracked file", async () => {
   }
 });
 
-test("COMMIT separates an untracked patch target from unrelated untracked files", async () => {
+test("COMMIT separates an untracked patch target from unrelated untracked files", { skip: noFollowRequiredSkip }, async () => {
   const root = repository();
   const anchorPath = "recovery-anchor.md";
   try {
@@ -1171,7 +1210,7 @@ test("COMMIT separates an untracked patch target from unrelated untracked files"
   }
 });
 
-test("COMMIT preserves NUL-enumerated unrelated files with spaces and Unicode", async () => {
+test("COMMIT preserves NUL-enumerated unrelated files with spaces and Unicode", { skip: noFollowRequiredSkip }, async () => {
   const root = repository();
   const fileNames = ["recovery anchor.md", "recovery-锚.md"];
   try {
@@ -1281,7 +1320,7 @@ test("COMMIT leaves ignored untracked state outside the recovery-anchor snapshot
   }
 });
 
-test("COMMIT reports post-commit verification failure without rolling back and retry is deterministic", async () => {
+test("COMMIT reports post-commit verification failure without rolling back and retry is deterministic", { skip: noFollowRequiredSkip }, async () => {
   const root = repository();
   const anchorPath = join(root, "recovery-anchor.md");
   try {
@@ -1359,7 +1398,7 @@ test("COMMIT fails closed when a pre-existing unrelated untracked file is delete
   }
 });
 
-test("COMMIT fails closed when a new unrelated untracked file appears", async () => {
+test("COMMIT fails closed when a new unrelated untracked file appears", { skip: noFollowRequiredSkip }, async () => {
   const root = repository();
   const anchorPath = join(root, "recovery-anchor.md");
   const newPath = join(root, "new-untracked.txt");
