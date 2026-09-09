@@ -403,25 +403,6 @@ export class CodexExecutor implements Executor {
     try {
       await this.call("initialize", { clientInfo: { name: "engineering-bridge", version: VERSION } });
       this.notify("initialized", {});
-      if (request.model !== undefined || request.reasoning_effort !== undefined) {
-        const modelResult = await this.call("model/list", {});
-        if (!object(modelResult) || !Array.isArray(modelResult.data)) throw new Error();
-        const models = modelResult.data.filter((entry): entry is Record<string, unknown> =>
-          object(entry) && typeof entry.model === "string"
-        );
-        const selected = request.model !== undefined
-          ? models.find((entry) => entry.model === request.model)
-          : models.find((entry) => entry.isDefault === true);
-        if (!selected) throw new CoreError("UNSUPPORTED_ACTION");
-        if (request.reasoning_effort !== undefined) {
-          const efforts = Array.isArray(selected.supportedReasoningEfforts)
-            ? selected.supportedReasoningEfforts
-            : [];
-          if (!efforts.some((effort) => object(effort) && effort.reasoningEffort === request.reasoning_effort)) {
-            throw new CoreError("UNSUPPORTED_ACTION");
-          }
-        }
-      }
       const sandbox = request.sandbox ?? "read-only";
       const threadParams: Record<string, unknown> = { cwd: this.workspaceRoot, approvalPolicy: "never", sandbox };
       if (request.threadId) threadParams.threadId = request.threadId;

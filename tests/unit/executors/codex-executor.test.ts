@@ -206,121 +206,72 @@ test("preserves the default Codex JSON-RPC flow when model selection is omitted"
   assert.equal("effort" in turnStart.params, false);
 });
 
-test("validates the requested model and effort before starting the normal Codex flow", async () => {
+test("sends a requested model directly to turn/start", async () => {
   const invocations: Invocation[] = [];
-  const executor = timedExecutor(fakeStarter({
-    appServerOutput: "done",
-    modelList: [{
-      id: "catalog-id",
-      model: "gpt-5-codex",
-      isDefault: true,
-      supportedReasoningEfforts: [
-        { reasoningEffort: "low", description: "Low" },
-        { reasoningEffort: "high", description: "High" }
-      ]
-    }]
-  }, invocations));
+  const executor = timedExecutor(fakeStarter({ appServerOutput: "done" }, invocations));
 
   const result = await executor.execute({
     taskId: TASK_ID,
     instruction: "inspect",
-    model: "gpt-5-codex",
-    reasoning_effort: "high"
-  } as Parameters<typeof executor.execute>[0] & { model: string; reasoning_effort: string });
+    model: "gpt-5-codex"
+  });
 
   assert.equal(result.kind, "completed");
   const messages = invocations[0]!.stdin.trim().split("\n").map((line) => JSON.parse(line));
-  const modelListIndex = messages.findIndex((message: { method?: string }) => message.method === "model/list");
-  const threadStartIndex = messages.findIndex((message: { method?: string }) => message.method === "thread/start");
-  const turnStartIndex = messages.findIndex((message: { method?: string }) => message.method === "turn/start");
-  assert.equal(modelListIndex >= 0, true);
-  assert.equal(modelListIndex < threadStartIndex, true);
-  assert.equal(threadStartIndex < turnStartIndex, true);
-  const turnStart = messages[turnStartIndex]!;
+  assert.equal(messages.some((message: { method?: string }) => message.method === "model/list"), false);
+  const turnStart = messages.find((message: { method?: string }) => message.method === "turn/start");
+  assert.ok(turnStart);
+  assert.equal(turnStart.params.model, "gpt-5-codex");
+  assert.equal("effort" in turnStart.params, false);
+});
+
+test("sends a requested reasoning effort directly to turn/start", async () => {
+  const invocations: Invocation[] = [];
+  const executor = timedExecutor(fakeStarter({ appServerOutput: "done" }, invocations));
+
+  const result = await executor.execute({
+    taskId: TASK_ID,
+    instruction: "inspect",
+    reasoning_effort: "high"
+  });
+
+  assert.equal(result.kind, "completed");
+  const messages = invocations[0]!.stdin.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(messages.some((message: { method?: string }) => message.method === "model/list"), false);
+  const turnStart = messages.find((message: { method?: string }) => message.method === "turn/start");
+  assert.ok(turnStart);
+  assert.equal("model" in turnStart.params, false);
+  assert.equal(turnStart.params.effort, "high");
+  assert.equal("reasoning_effort" in turnStart.params, false);
+});
+
+test("does not wait for model/list when the app-server would not respond", async () => {
+  const invocations: Invocation[] = [];
+  const executor = timedExecutor(fakeStarter({
+    appServerOutput: "done",
+    ignoredMethods: ["model/list"]
+  }, invocations));
+
+  const result = await settlesWithin(executor.execute({
+    taskId: TASK_ID,
+    instruction: "inspect",
+    model: "gpt-5-codex",
+    reasoning_effort: "high"
+  }));
+
+  assert.equal(result.kind, "completed");
+  const messages = invocations[0]!.stdin.trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(messages.some((message: { method?: string }) => message.method === "model/list"), false);
+  const methods = messages
+    .filter((message: { id?: number }) => message.id !== undefined)
+    .map((message: { method: string }) => message.method);
+  assert.deepEqual(methods, ["initialize", "thread/start", "turn/start"]);
+  const turnStart = messages.find((message: { method?: string }) => message.method === "turn/start");
+  assert.ok(turnStart);
   assert.deepEqual(
     { model: turnStart.params.model, effort: turnStart.params.effort },
     { model: "gpt-5-codex", effort: "high" }
   );
-});
-
-test("rejects an unknown requested model before thread/start and turn/start", async () => {
-  const invocations: Invocation[] = [];
-  const executor = timedExecutor(fakeStarter({
-    appServerOutput: "done",
-    modelList: [{
-      id: "catalog-id",
-      model: "gpt-5-codex",
-      isDefault: true,
-      supportedReasoningEfforts: [{ reasoningEffort: "low", description: "Low" }]
-    }]
-  }, invocations));
-
-  const result = await executor.execute({
-    taskId: TASK_ID,
-    instruction: "inspect",
-    model: "unknown-model"
-  } as Parameters<typeof executor.execute>[0] & { model: string });
-
-  assert.deepEqual(withoutDiagnostics(result), {
-    kind: "failed",
-    error: { code: "UNSUPPORTED_ACTION", message: "The requested action is not supported." }
-  });
-  assert.equal(invocations[0]!.stdin.includes('"method":"thread/start"'), false);
-  assert.equal(invocations[0]!.stdin.includes('"method":"turn/start"'), false);
-});
-
-test("rejects an unsupported reasoning effort before thread/start and turn/start", async () => {
-  const invocations: Invocation[] = [];
-  const executor = timedExecutor(fakeStarter({
-    appServerOutput: "done",
-    modelList: [{
-      id: "catalog-id",
-      model: "gpt-5-codex",
-      isDefault: true,
-      supportedReasoningEfforts: [{ reasoningEffort: "low", description: "Low" }]
-    }]
-  }, invocations));
-
-  const result = await executor.execute({
-    taskId: TASK_ID,
-    instruction: "inspect",
-    model: "gpt-5-codex",
-    reasoning_effort: "high"
-  } as Parameters<typeof executor.execute>[0] & { model: string; reasoning_effort: string });
-
-  assert.deepEqual(withoutDiagnostics(result), {
-    kind: "failed",
-    error: { code: "UNSUPPORTED_ACTION", message: "The requested action is not supported." }
-  });
-  assert.equal(invocations[0]!.stdin.includes('"method":"thread/start"'), false);
-  assert.equal(invocations[0]!.stdin.includes('"method":"turn/start"'), false);
-});
-
-test("uses the default model for effort-only selection and sends only the effort override", async () => {
-  const invocations: Invocation[] = [];
-  const executor = timedExecutor(fakeStarter({
-    appServerOutput: "done",
-    modelList: [{
-      id: "catalog-id",
-      model: "default-model",
-      isDefault: true,
-      defaultReasoningEffort: "medium",
-      supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "Medium" }]
-    }]
-  }, invocations));
-
-  const result = await executor.execute({
-    taskId: TASK_ID,
-    instruction: "inspect",
-    reasoning_effort: "medium"
-  } as Parameters<typeof executor.execute>[0] & { reasoning_effort: string });
-
-  assert.equal(result.kind, "completed");
-  const messages = invocations[0]!.stdin.trim().split("\n").map((line) => JSON.parse(line));
-  const turnStart = messages.find((message: { method?: string }) => message.method === "turn/start");
-  assert.equal("model" in turnStart.params, false);
-  assert.equal(turnStart.params.effort, "medium");
-  assert.equal("reasoning_effort" in turnStart.params, false);
 });
 
 test("steer requires turn/started readiness and controls reset between turns", async () => {
