@@ -2,11 +2,11 @@
 
 **Connect Chat directly to local Codex or DSH: no more shuttling prompts and results—Chat dispatches, supervises, and accepts the executor's work.**
 
-[![v1.4.2](https://img.shields.io/badge/release-v1.4.2-blue)](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.2)
+[![v1.4.3](https://img.shields.io/badge/release-v1.4.3-blue)](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.3)
 [![CI](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[简体中文](README.md) · **[v1.4.2](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.2) · V1 · Local · Continuously maintainer-tested on macOS.** Tag, GitHub Release, and npm publication remain separate release actions. Windows currently has smoke verification of the Codex and DSH npm CLI launch path on GitHub Actions `windows-latest` (Node 22 with actual npm-installed `@openai/codex` and `@deepseek-ai/dsh`); broader Windows environments and client combinations are not claimed fully certified.
+[简体中文](README.md) · **[v1.4.3](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.3) · V1 · Local · Continuously maintainer-tested on macOS.** Tag, GitHub Release, and npm publication remain separate release actions. Windows currently has smoke verification of the Codex and DSH npm CLI launch path on GitHub Actions `windows-2025` (Node 22 with actual npm-installed `@openai/codex` and `@deepseek-ai/dsh`); broader Windows environments and client combinations are not claimed fully certified.
 
 ## Before / now
 
@@ -116,7 +116,7 @@ npm install
 npm run build
 ```
 
-The current v1.4.2 release has no one-click installer.
+The current v1.4.3 release has no one-click installer.
 
 ### 3. Register a workspace
 

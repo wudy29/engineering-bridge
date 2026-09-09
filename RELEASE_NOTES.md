@@ -1,14 +1,30 @@
 # Release notes
 
-## Unreleased
+## v1.4.3
+
+v1.4.3 hardens Codex app-server handling and Windows path portability while preserving v1.4.x routing compatibility and controlled-write safety.
 
 ### Added
 
 - Add `ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY=explicit` as a Bridge-owned Codex routing hard gate. Each Codex invocation must provide both `model` and `reasoning_effort` before executable resolution or process start; missing or blank values return `CODEX_ROUTING_REQUIRED`. The default remains `inherit` for v1.4.x compatibility, and DSH behavior is unchanged.
+- Add Windows Server 2025 CI coverage alongside Ubuntu.
+
+### Fixed
+
+- Harden Codex app-server JSONL and UTF-8 handling, RPC message validation, unsupported server-request rejection, and bounded, sanitized diagnostics and error classification.
+- Preserve and correlate Codex thread and turn identity from app-server protocol events, and carry bounded in-progress and terminal executor diagnostics through task results.
+- Isolate Windows-specific host assumptions in tests with local Git line-ending policy and explicit platform and path fixtures.
+- Harden Windows workspace-root validation, path containment, and filesystem identity handling, including drive-root and ordinary UNC semantics and native realpath alignment.
+- Update MCP onboarding assertions to compare native realpaths where required.
 
 ### Compatibility
 
 - Invalid routing policy values fail Bridge startup. Explicit routing values continue through the existing Codex `model/list` and reasoning validation and are propagated to `turn/start`.
+- Windows Server 2025 CI broadens automated coverage but is not comprehensive Windows certification; broader Windows environments and client combinations remain unclaimed.
+
+### Safety
+
+- On Windows environments where Node does not expose `fs.constants.O_NOFOLLOW`, affected ordinary-untracked-file controlled `COMMIT` fingerprinting remains fail-closed; v1.4.3 does not substitute a weaker open path or weaken existing security guarantees.
 
 ## v1.4.2
 
