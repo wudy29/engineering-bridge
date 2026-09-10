@@ -73,6 +73,7 @@ export class RegisteredWorkspaceRegistry {
   }
 
   findByRoot(canonicalRoot: string): WorkspaceLookup | undefined {
+    this.refreshManualCanonicalRoots();
     const id = this.canonicalRoots.get(canonicalRoot);
     if (id === undefined) return undefined;
     const registration = this.registrations.get(id);
@@ -93,9 +94,20 @@ export class RegisteredWorkspaceRegistry {
       throw new CoreError("WORKSPACE_BOUNDARY_VIOLATION");
     }
     const canonicalRoot = this.canonicalize(root);
+    this.refreshManualCanonicalRoots();
     if (this.canonicalRoots.has(canonicalRoot)) throw new CoreError("WORKSPACE_BOUNDARY_VIOLATION");
     this.registrations.set(id, { root, canonicalRoot, allowWrite, source: "managed" });
     this.canonicalRoots.set(canonicalRoot, id);
+  }
+
+  private refreshManualCanonicalRoots(): void {
+    this.canonicalRoots.clear();
+    for (const [id, registration] of this.registrations) {
+      const canonicalRoot = registration.source === "manual"
+        ? this.canonicalize(registration.root)
+        : registration.canonicalRoot;
+      if (!this.canonicalRoots.has(canonicalRoot)) this.canonicalRoots.set(canonicalRoot, id);
+    }
   }
 
   sourceOf(workspaceId: string): "manual" | "managed" {
