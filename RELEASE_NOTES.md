@@ -1,5 +1,29 @@
 # Release notes
 
+## v1.4.4
+
+v1.4.4 is a correctness release for validation process lifecycle, Codex app-server JSONL frame compatibility, DSH interruption preservation, and workspace canonical identity handling.
+
+### Fixed
+
+- Contain asynchronous validation stdin write failures and use bounded process-tree termination with SIGTERM followed by SIGKILL grace periods on timeout or stdin failure.
+- Accept legal newline-terminated Codex app-server JSONL frames above 64 KiB up to a Bridge-owned 8 MiB raw-frame hard cap, while keeping the 64 KiB pre-response notification budget unchanged.
+- Preserve an already-established DSH interruption result if the direct child exits while its POSIX process group is still alive.
+- Refresh manual workspace canonical identities before root lookup and managed registration so a root that becomes canonicalizable cannot be registered under a second identity.
+- Update the overlong unterminated JSONL regression fixture to exercise the new 8 MiB hard cap.
+
+### Compatibility
+
+- The 8 MiB raw-frame limit is a Bridge compatibility bound, not a Codex protocol specification maximum. Existing routing and controlled-write semantics are unchanged.
+
+### Safety
+
+- Frames above the 8 MiB hard cap still fail closed; existing JSONL/UTF-8 validation and bounded diagnostic/evidence handling remain in place.
+
+### Verification
+
+- The merged correctness candidate and post-merge `main` both passed GitHub Actions on Ubuntu and Windows Server 2025.
+
 ## v1.4.3
 
 v1.4.3 hardens Codex app-server handling and Windows path portability while preserving v1.4.x routing compatibility and controlled-write safety.
