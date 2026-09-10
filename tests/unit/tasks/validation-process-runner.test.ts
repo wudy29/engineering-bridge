@@ -84,7 +84,7 @@ function fakeChild(): FakeChild {
     stdin,
     stdout,
     stderr,
-    pid: 1234,
+    pid: undefined,
     kill(signal?: NodeJS.Signals | number) {
       killSignals.push(signal);
       return true;
@@ -121,6 +121,35 @@ function starterFor(child: FakeChild, invocations: Invocation[]): ValidationProc
   };
 }
 
+interface ExecutionSignalCall {
+  readonly platform: NodeJS.Platform;
+  readonly signal: NodeJS.Signals;
+}
+
+function runnerWithExecutionSignaler(
+  child: FakeChild,
+  timers: ValidationTimer,
+  invocations: Invocation[],
+  platform: NodeJS.Platform,
+  calls: ExecutionSignalCall[]
+): ValidationProcessRunner {
+  const signaler = (
+    _child: ChildProcessWithoutNullStreams,
+    actualPlatform: NodeJS.Platform,
+    signal: NodeJS.Signals
+  ): boolean => {
+    calls.push({ platform: actualPlatform, signal });
+    return true;
+  };
+
+  return Reflect.construct(ValidationProcessRunner, [
+    starterFor(child, invocations),
+    timers,
+    platform,
+    signaler
+  ]) as ValidationProcessRunner;
+}
+
 function request(argv: readonly [string, ...string[]]): ValidationProcessRequest {
   return {
     argv,
@@ -146,6 +175,7 @@ test("passes executable, arguments, cwd, and no-shell pipe options exactly", asy
     args: ["test", "--", "focused"],
     options: {
       cwd: "/trusted/workspace",
+      detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"]
     }
@@ -185,6 +215,142 @@ test("forwards optional stdin input and ends stdin", async () => {
 
   child.close(0);
   await result;
+});
+
+test("contains asynchronous stdin write errors until the validation child closes", async () => {
+  const child = fakeChild();
+  const timers = new ManualTimer();
+  timers.currentMs = 20;
+  const calls: ExecutionSignalCall[] = [];
+  const runner = runnerWithExecutionSignaler(child, timers, [], "linux", calls);
+
+  const result = runner.run({
+    ...request(["validator"]),
+    input: "candidate patch\n"
+  });
+  let settled = false;
+  void result.then(() => {
+    settled = true;
+  });
+
+  const pipeError = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+  let thrownError: unknown;
+  try {
+    child.process.stdin.emit("error", pipeError);
+  } catch (error) {
+    thrownError = error;
+  }
+
+  await Promise.resolve();
+  assert.equal(thrownError, undefined);
+  assert.equal(settled, false);
+  assert.deepEqual(calls, [{ platform: "linux", signal: "SIGTERM" }]);
+
+  child.close(null, "SIGTERM");
+  assert.deepEqual(await result, {
+    kind: "spawn_error",
+    durationMs: 0,
+    outputTail: ""
+  });
+});
+
+test("bounds termination after an asynchronous stdin write error when the child never closes", async () => {
+  const child = fakeChild();
+  const timers = new ManualTimer();
+  timers.currentMs = 20;
+  const calls: ExecutionSignalCall[] = [];
+  const runner = runnerWithExecutionSignaler(child, timers, [], "linux", calls);
+
+  const result = runner.run({
+    ...request(["validator"]),
+    input: "candidate patch\n"
+  });
+  let settled = false;
+  void result.then(() => {
+    settled = true;
+  });
+
+  const pipeError = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+  let thrownError: unknown;
+  try {
+    child.process.stdin.emit("error", pipeError);
+  } catch (error) {
+    thrownError = error;
+  }
+
+  await Promise.resolve();
+  assert.equal(thrownError, undefined);
+  assert.equal(settled, false);
+  assert.deepEqual(calls, [{ platform: "linux", signal: "SIGTERM" }]);
+  assert.equal(timers.pending.size, 1);
+
+  timers.currentMs = 1_020;
+  assert.equal(timers.fireNext(), 1_000);
+  await Promise.resolve();
+  assert.equal(settled, false);
+  assert.deepEqual(calls, [
+    { platform: "linux", signal: "SIGTERM" },
+    { platform: "linux", signal: "SIGKILL" }
+  ]);
+  assert.equal(timers.pending.size, 1);
+
+  timers.currentMs = 2_020;
+  assert.equal(timers.fireNext(), 1_000);
+  assert.deepEqual(await result, {
+    kind: "termination_error",
+    durationMs: 2_000,
+    outputTail: ""
+  });
+});
+
+test("uses execution-tree signaling and two bounded grace periods after timeout", async () => {
+  const child = fakeChild();
+  const timers = new ManualTimer();
+  timers.currentMs = 10;
+  const invocations: Invocation[] = [];
+  const calls: ExecutionSignalCall[] = [];
+  const runner = runnerWithExecutionSignaler(
+    child,
+    timers,
+    invocations,
+    "linux",
+    calls
+  );
+
+  const result = runner.run({
+    ...request(["validator"]),
+    timeoutMs: 50
+  });
+  let settled = false;
+  void result.then(() => {
+    settled = true;
+  });
+
+  timers.currentMs = 60;
+  assert.equal(timers.fireNext(), 50);
+  await Promise.resolve();
+  assert.equal(invocations[0]?.options.detached, true);
+  assert.deepEqual(calls, [{ platform: "linux", signal: "SIGTERM" }]);
+  assert.equal(settled, false);
+  assert.equal(timers.pending.size, 1);
+
+  timers.currentMs = 1_060;
+  assert.equal(timers.fireNext(), 1_000);
+  await Promise.resolve();
+  assert.deepEqual(calls, [
+    { platform: "linux", signal: "SIGTERM" },
+    { platform: "linux", signal: "SIGKILL" }
+  ]);
+  assert.equal(settled, false);
+  assert.equal(timers.pending.size, 1);
+
+  timers.currentMs = 2_060;
+  assert.equal(timers.fireNext(), 1_000);
+  assert.deepEqual(await result, {
+    kind: "termination_error",
+    durationMs: 2_050,
+    outputTail: ""
+  });
 });
 
 test("preserves zero and nonzero numeric exit codes", async () => {
@@ -423,10 +589,20 @@ for (const killBehavior of [
       assert.equal(timers.pending.size, 1);
 
       timers.currentMs = 1_060;
-      timers.fireNext();
+      assert.doesNotThrow(() => timers.fireNext());
+      await Promise.resolve();
+      assert.equal(settled, false);
+      assert.deepEqual(
+        child.killSignals.map((signal) => signal ?? "SIGTERM"),
+        ["SIGTERM", "SIGKILL"]
+      );
+      assert.equal(timers.pending.size, 1);
+
+      timers.currentMs = 2_060;
+      assert.equal(timers.fireNext(), 1_000);
       assert.deepEqual(await result, {
         kind: "termination_error",
-        durationMs: 1_050,
+        durationMs: 2_050,
         outputTail: "before stalled termination"
       });
     }
