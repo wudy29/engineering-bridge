@@ -997,8 +997,8 @@ test("fails promptly with bounded diagnostics for an overlong unterminated Codex
   const invocation = invocations[0];
   assert.ok(invocation);
 
-  invocation.writeStdout("x".repeat(40_000));
-  invocation.writeStdout(`${"y".repeat(40_000)}${secret}`);
+  invocation.writeStdout("x".repeat(4 * 1024 * 1024));
+  invocation.writeStdout(`${"y".repeat(4 * 1024 * 1024)}${secret}`);
 
   const result = await pending;
   assert.equal(result.kind, "failed");

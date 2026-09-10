@@ -4,6 +4,8 @@ import {
   type SpawnOptionsWithoutStdio
 } from "node:child_process";
 
+import { signalExecution } from "../executors/executor.js";
+
 const MAX_OUTPUT_TAIL_BYTES = 65_536;
 
 export type ValidationProcessOutcome =
@@ -103,7 +105,9 @@ type Completion =
 export class ValidationProcessRunner {
   constructor(
     private readonly start: ValidationProcessStarter = startProcess,
-    private readonly timer: ValidationTimer = systemTimer
+    private readonly timer: ValidationTimer = systemTimer,
+    private readonly platform: NodeJS.Platform = process.platform,
+    private readonly signaler: typeof signalExecution = signalExecution
   ) {}
 
   run(request: ValidationProcessRequest): Promise<ValidationProcessOutcome> {
@@ -112,9 +116,9 @@ export class ValidationProcessRunner {
     return new Promise((resolve) => {
       let completed = false;
       let outputTail = Buffer.alloc(0);
-      let timedOut = false;
+      let terminationOutcome: "timeout" | "spawn_error" | undefined;
       let timeoutHandle: NodeJS.Timeout | undefined;
-      let dispositionGraceHandle: NodeJS.Timeout | undefined;
+      let terminationGraceHandle: NodeJS.Timeout | undefined;
 
       const complete = (completion: Completion): void => {
         if (completed) {
@@ -127,9 +131,9 @@ export class ValidationProcessRunner {
           timeoutHandle = undefined;
         }
 
-        if (dispositionGraceHandle !== undefined) {
-          this.timer.clear(dispositionGraceHandle);
-          dispositionGraceHandle = undefined;
+        if (terminationGraceHandle !== undefined) {
+          this.timer.clear(terminationGraceHandle);
+          terminationGraceHandle = undefined;
         }
 
         const durationMs = this.timer.now() - startedAt;
@@ -158,6 +162,7 @@ export class ValidationProcessRunner {
       try {
         child = this.start(executable, args, {
           cwd: request.cwd,
+          detached: this.platform !== "win32",
           shell: false,
           stdio: ["pipe", "pipe", "pipe"]
         });
@@ -172,16 +177,48 @@ export class ValidationProcessRunner {
         }
       };
 
+      const signalChild = (signal: NodeJS.Signals): void => {
+        try {
+          this.signaler(child, this.platform, signal);
+        } catch {
+          // The grace periods bound termination even when signaling throws.
+        }
+      };
+
+      const beginTermination = (
+        outcome: "timeout" | "spawn_error"
+      ): void => {
+        if (completed || terminationOutcome !== undefined) {
+          return;
+        }
+        terminationOutcome = outcome;
+
+        if (timeoutHandle !== undefined) {
+          this.timer.clear(timeoutHandle);
+          timeoutHandle = undefined;
+        }
+
+        terminationGraceHandle = this.timer.set(() => {
+          terminationGraceHandle = undefined;
+          terminationGraceHandle = this.timer.set(() => {
+            terminationGraceHandle = undefined;
+            complete({ kind: "termination_error" });
+          }, 1_000);
+          signalChild("SIGKILL");
+        }, 1_000);
+        signalChild("SIGTERM");
+      };
+
       child.stdout.on("data", capture);
       child.stderr.on("data", capture);
       child.on("error", () => {
-        if (!timedOut) {
+        if (terminationOutcome === undefined) {
           complete({ kind: "spawn_error" });
         }
       });
       child.on("close", (exitCode) => {
-        if (timedOut) {
-          complete({ kind: "timeout" });
+        if (terminationOutcome !== undefined) {
+          complete({ kind: terminationOutcome });
           return;
         }
 
@@ -191,26 +228,23 @@ export class ValidationProcessRunner {
             : { kind: "signal" }
         );
       });
+      child.stdin.on("error", () => {
+        beginTermination("spawn_error");
+      });
 
       timeoutHandle = this.timer.set(() => {
         timeoutHandle = undefined;
-        timedOut = true;
-        dispositionGraceHandle = this.timer.set(() => {
-          dispositionGraceHandle = undefined;
-          complete({ kind: "termination_error" });
-        }, 1_000);
-
-        try {
-          child.kill();
-        } catch {
-          // The disposition grace bounds termination even when kill throws.
-        }
+        beginTermination("timeout");
       }, request.timeoutMs);
 
-      if (request.input !== undefined) {
-        child.stdin.write(request.input);
+      try {
+        if (request.input !== undefined) {
+          child.stdin.write(request.input);
+        }
+        child.stdin.end();
+      } catch {
+        beginTermination("spawn_error");
       }
-      child.stdin.end();
     });
   }
 }

@@ -646,6 +646,37 @@ test("interrupt with a zero exit code still reports interrupted", async () => {
   assert.deepEqual(await pending, { kind: "interrupted", output: "" });
 });
 
+test("interrupt result survives direct exit while the POSIX process group remains alive", async () => {
+  const invocations: Invocation[] = [];
+  const originalKill = process.kill;
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (pid !== -424242) throw new Error(`unexpected pid ${pid}`);
+    if (signal === "SIGTERM" || signal === "SIGKILL") return true;
+    throw new Error(`unexpected signal ${String(signal)}`);
+  }) as typeof process.kill;
+  try {
+    const executor = timedExecutor(
+      fakeStarter({ hold: true, pid: 424242 }, invocations),
+      "darwin"
+    );
+    const pending = executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const invocation = invocations[0];
+    assert.ok(invocation);
+    invocation.write("partial answer");
+    await executor.interrupt();
+    invocation.exit(0);
+
+    assert.deepEqual(await settlesWithin(pending), {
+      kind: "interrupted",
+      output: "partial answer"
+    });
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
 test("interrupt without an active child is an invalid state transition", async () => {
   const idle = new DshExecutor(TRUSTED_CWD, fakeStarter({}, []), {});
   await assert.rejects(idle.interrupt(), (error) =>

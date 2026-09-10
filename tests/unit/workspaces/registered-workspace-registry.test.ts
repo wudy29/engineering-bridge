@@ -101,6 +101,24 @@ test("registerManaged rejects conflicting ids and occupied canonical roots", () 
   expectCode(() => registry.registerManaged("managed-2", workspaceFixture("managed", "root")), "WORKSPACE_BOUNDARY_VIOLATION");
 });
 
+test("F4: managed registration rejects a manual root whose canonical identity becomes available", () => {
+  const manualRoot = workspaceFixture("manual", "late-root");
+  const canonicalRoot = workspaceFixture("canonical", "late-root");
+  let canonicalAvailable = false;
+  const canonicalize = (root: string): string =>
+    root === manualRoot && canonicalAvailable ? canonicalRoot : root;
+  const registry = new RegisteredWorkspaceRegistry([
+    { id: "manual", root: manualRoot }
+  ], canonicalize);
+
+  canonicalAvailable = true;
+
+  expectCode(
+    () => registry.registerManaged("managed", canonicalRoot),
+    "WORKSPACE_BOUNDARY_VIOLATION"
+  );
+});
+
 test("findByRoot returns the manual registration with its real write access", () => {
   const registry = new RegisteredWorkspaceRegistry([
     { id: "manual", root: ROOT, allow_write: true }

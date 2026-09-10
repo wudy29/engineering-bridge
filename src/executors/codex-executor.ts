@@ -21,7 +21,8 @@ const ENVIRONMENT_ALLOWLIST = ["PATH", "HOME", "CODEX_HOME", "TMPDIR", "LANG", "
 const MAX_EVIDENCE = 50;
 const MAX_TEXT = 16_384;
 const MAX_EVIDENCE_BYTES = 65_536;
-const MAX_JSONL_LINE_BYTES = 65_536;
+const MAX_PRE_RESPONSE_NOTIFICATION_BYTES = 65_536;
+const MAX_RAW_JSONL_FRAME_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RPC_CALL_TIMEOUT_MS = 30_000;
 // Official npm target of the Codex CLI, derived from a codex.cmd shim's
 // location so a Windows npm install can be launched through Node directly
@@ -359,7 +360,7 @@ export class CodexExecutor implements Executor {
     const stdoutDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
     const handleLine = (rawLine: string): void => {
       if (settled) return;
-      if (Buffer.byteLength(rawLine, "utf8") > MAX_JSONL_LINE_BYTES) { protocolError("jsonl_line_too_large"); return; }
+      if (Buffer.byteLength(rawLine, "utf8") > MAX_RAW_JSONL_FRAME_BYTES) { protocolError("jsonl_line_too_large"); return; }
       const line = rawLine.trim();
       if (!line) return;
       let message: unknown;
@@ -442,7 +443,7 @@ export class CodexExecutor implements Executor {
       if (known && this.turnId === undefined && message.params.threadId === this.threadId &&
         [...this.pending.values()].some((waiter) => waiter.method === "turn/start")) {
         earlyTurnBytes += Buffer.byteLength(rawLine, "utf8");
-        if (earlyTurnBytes > MAX_JSONL_LINE_BYTES) { protocolError("pre_response_events_limit"); return; }
+        if (earlyTurnBytes > MAX_PRE_RESPONSE_NOTIFICATION_BYTES) { protocolError("pre_response_events_limit"); return; }
         earlyTurnNotifications.push(rawLine);
         return;
       }
@@ -527,7 +528,7 @@ export class CodexExecutor implements Executor {
         buffer = buffer.slice(newline + 1);
         handleLine(line);
       }
-      if (!settled && Buffer.byteLength(buffer, "utf8") > MAX_JSONL_LINE_BYTES) protocolError("jsonl_line_too_large");
+      if (!settled && Buffer.byteLength(buffer, "utf8") > MAX_RAW_JSONL_FRAME_BYTES) protocolError("jsonl_line_too_large");
     });
     const flushFinalLine = (): void => {
       if (settled) return;
