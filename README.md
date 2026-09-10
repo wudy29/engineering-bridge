@@ -2,11 +2,11 @@
 
 **打通 Chat 与本地 Codex 与 Deepseek harness：不再搬提示词，Chat 直接调度、监督并验收 Codex 与 Deepseek harness。**
 
-[![v1.4.3](https://img.shields.io/badge/release-v1.4.3-blue)](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.3)
+[![v1.4.4](https://img.shields.io/badge/release-v1.4.4-blue)](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.4)
 [![CI](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[English](README.en.md) · **[v1.4.3](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.3) · V1 · 本地运行 · macOS 由维护者持续实测。** tag、GitHub Release 与 npm 发布仍是彼此独立的 release 操作。Windows 侧目前已有 GitHub Actions `windows-2025` 上的 Codex 与 DSH npm CLI 启动路径 smoke 验证（Node 22 + 实际 npm 安装的 `@openai/codex` 与 `@deepseek-ai/dsh`）；更广的 Windows 环境与客户端组合不做全面认证。
+[English](README.en.md) · **[v1.4.4](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.4) · V1 · 本地运行 · macOS 由维护者持续实测。** tag、GitHub Release 与 npm 发布仍是彼此独立的 release 操作。Windows 侧目前已有 GitHub Actions `windows-2025` 上的 Codex 与 DSH npm CLI 启动路径 smoke 验证（Node 22 + 实际 npm 安装的 `@openai/codex` 与 `@deepseek-ai/dsh`）；更广的 Windows 环境与客户端组合不做全面认证。
 
 ## 以前 / 现在
 
@@ -117,7 +117,7 @@ npm install
 npm run build
 ```
 
-当前 v1.4.3 没有一键安装器。
+当前 v1.4.4 没有一键安装器。
 
 ### 3. 登记工作区
 
