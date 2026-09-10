@@ -182,6 +182,7 @@ test("partial UTF-8 chunks and coalesced CRLF messages preserve agent output", a
 });
 
 for (const raw of ["broken-json\n", "[]\n", "null\n", "7\n", '{"method":', "x".repeat(65_537),
+  "oversized-malformed-json".repeat(4_000) + "\n",
   '{"id":1,"result":{},"error":{"code":-1,"message":"bad"}}\n',
   '{"id":1.5,"result":{}}\n', '{"id":null,"result":{}}\n',
   '{"id":1,"error":{"code":"bad","message":"bad"}}\n']) {
@@ -266,10 +267,41 @@ test("an oversized line is explicitly diagnosed without returning any of it", as
   const peer = server();
   const pending = peer.executor.execute(request);
   await tick();
-  peer.raw("private-line".repeat(6_000));
+  peer.raw("private-line" + "x".repeat(8 * 1024 * 1024));
   failed(await pending, "protocol_error", "CODEX_PROTOCOL_ERROR");
   assert.equal(diagnostics(await pending).protocol_error_kind, "jsonl_line_too_large");
   assert.doesNotMatch(JSON.stringify(await pending), /private-line/);
+});
+
+test("newline-terminated command completion over 64 KiB retains evidence without aggregated output", async () => {
+  const frame = { method: "item/completed", params: {
+    threadId: "thread-1", turnId: "turn-1",
+    item: { id: "large-command", type: "commandExecution", status: "completed",
+      command: "cat output.txt", aggregatedOutput: "" }
+  } };
+  assert.ok(Buffer.byteLength(JSON.stringify(frame), "utf8") < 65_536);
+  frame.params.item.aggregatedOutput = "start\n" + "F5_AGGREGATED_OUTPUT_SENTINEL\n".repeat(4_096);
+  const line = JSON.stringify(frame);
+  assert.ok(Buffer.byteLength(line, "utf8") > 65_536);
+
+  const peer = server();
+  const pending = peer.executor.execute(request);
+  await tick();
+  peer.send({ method: "item/commandExecution/outputDelta", params: {
+    threadId: "thread-1", turnId: "turn-1", itemId: "large-command", delta: "start\n"
+  } });
+  peer.raw(`${line}\n`);
+  peer.terminal();
+  const result = await pending;
+  assert.equal(result.kind, "completed", JSON.stringify(diagnostics(result)));
+  assert.equal(diagnostics(result).protocol_error_kind, undefined);
+  if (result.kind === "completed") {
+    assert.equal(result.output, "");
+    assert.deepEqual(result.evidence, [
+      { id: "large-command", type: "commandExecution", status: "completed", command: "cat output.txt" }
+    ]);
+  }
+  assert.doesNotMatch(JSON.stringify(result), /aggregatedOutput|F5_AGGREGATED_OUTPUT_SENTINEL/);
 });
 
 test("uncorrelated item notifications cannot become output or evidence", async () => {
