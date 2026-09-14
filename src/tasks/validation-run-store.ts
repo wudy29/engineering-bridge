@@ -14,7 +14,11 @@ const MAX_RECORD_BYTES = 4 * 1024 * 1024;
 const MAX_STORE_BYTES = 256 * 1024 * 1024;
 const MAX_ENTRIES = 4096;
 type Identity = { dev: number; ino: number };
-type StoreOptions = { maxStoreBytes?: number; protectedRoots?: readonly string[] };
+type StoreOptions = {
+  maxStoreBytes?: number;
+  protectedRoots?: readonly string[];
+  onPersistenceFailure?: (error: ValidationRunStoreError) => void;
+};
 
 export class ValidationRunStoreError extends Error {
   constructor(readonly code: string) { super(code); this.name = "ValidationRunStoreError"; }
@@ -40,6 +44,7 @@ export class ValidationRunStore {
   private readonly uncertain = new Set<string>();
   private readonly maxStoreBytes: number;
   private readonly protectedRoots: readonly string[];
+  private readonly onPersistenceFailure: StoreOptions["onPersistenceFailure"];
   private identity: Identity | undefined;
   private loaded: Promise<void> | undefined;
   private mutation: Promise<unknown> = Promise.resolve();
@@ -50,6 +55,7 @@ export class ValidationRunStore {
   constructor(private readonly directory: string, options: StoreOptions = {}) {
     this.maxStoreBytes = options.maxStoreBytes ?? MAX_STORE_BYTES;
     this.protectedRoots = [...options.protectedRoots ?? []];
+    this.onPersistenceFailure = options.onPersistenceFailure;
   }
 
   async get(id: string): Promise<ValidationRun | undefined> {
@@ -60,6 +66,14 @@ export class ValidationRunStore {
     const error = this.errors.get(id);
     if (error) throw error;
     return this.records.get(id);
+  }
+
+  /** Startup recovery only; no mutation or execution is triggered by this read. */
+  async retainedRuns(): Promise<readonly ValidationRun[]> {
+    await this.load();
+    await this.checkDirectory();
+    if (this.indexIncomplete || this.errors.size || this.uncertain.size) throw failure();
+    return [...this.records.values()].sort((a, b) => a.admission_sequence - b.admission_sequence);
   }
 
   async latest(patchId: string): Promise<ValidationRun | undefined> {
@@ -288,11 +302,13 @@ export class ValidationRunStore {
     } finally { await handle.close(); }
   }
 
-  private async syncDirectory(directory: string): Promise<void> {
+  private async syncDirectory(directory: string, onFailure?: () => void): Promise<void> {
     // Windows does not expose a portable directory fsync; file sync + rename still apply.
     if (process.platform === "win32") return;
     const handle = await fs.open(directory, "r");
-    try { await handle.sync(); } finally { await handle.close(); }
+    try { await handle.sync(); }
+    catch (error) { onFailure?.(); throw error; }
+    finally { await handle.close(); }
   }
   private async persist(run: ValidationRun): Promise<void> {
     const contents = JSON.stringify(run);
@@ -300,24 +316,36 @@ export class ValidationRunStore {
     const temporary = join(this.directory, `.${run.validation_run_id}.${newId()}.tmp`);
     let created = false;
     let renameAttempted = false;
+    let writeFailure: ValidationRunStoreError | undefined;
+    const reportFailure = (): ValidationRunStoreError => {
+      if (!writeFailure) {
+        this.writesBlocked = true;
+        if (renameAttempted) this.uncertain.add(run.validation_run_id);
+        writeFailure = failure();
+        // Stop live execution before any error-path close or temporary cleanup.
+        // The original persistence promise still owns and awaits all that I/O.
+        this.onPersistenceFailure?.(writeFailure);
+      }
+      return writeFailure;
+    };
     try {
       await this.checkDirectory();
       const handle = await fs.open(temporary, "wx", 0o600);
       created = true;
       try { await handle.writeFile(contents, "utf8"); await handle.sync(); }
+      catch { throw reportFailure(); }
       finally { await handle.close(); }
       await this.checkDirectory();
       renameAttempted = true;
       await fs.rename(temporary, join(this.directory, `${run.validation_run_id}.json`));
-      await this.syncDirectory(this.directory);
+      await this.syncDirectory(this.directory, reportFailure);
     } catch {
-      this.writesBlocked = true;
-      if (renameAttempted) this.uncertain.add(run.validation_run_id);
+      const error = reportFailure();
       if (created) {
         // A replaced directory is not ours to clean, even when its name is unchanged.
         await this.checkDirectory().then(() => fs.unlink(temporary)).catch(() => undefined);
       }
-      throw failure();
+      throw error;
     }
   }
 }

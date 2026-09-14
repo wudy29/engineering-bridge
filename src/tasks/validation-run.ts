@@ -97,13 +97,24 @@ const cleanupSchema = z.object({
   reason: reason.nullable(),
   recovery_required: z.boolean(),
 }).strict();
+const filesystemIdentity = z.object({ dev: z.string().regex(/^\d+$/), ino: z.string().regex(/^\d+$/) }).strict();
 const ownedWorktreeSchema = z.object({
   expected_temp_root: absolutePath,
   parent_path: absolutePath,
   worktree_path: absolutePath,
-  parent_identity: z.object({ dev: z.string().regex(/^\d+$/), ino: z.string().regex(/^\d+$/) }).strict().nullable(),
+  parent_identity: filesystemIdentity.nullable(),
   common_git_dir: absolutePath.nullable(),
   run_marker: z.string().uuid(),
+  // Optional in Slice 1 records; absence never establishes filesystem ownership.
+  temp_root_identity: filesystemIdentity.nullable().optional(),
+  marker_identity: filesystemIdentity.nullable().optional(),
+  workspace_identity: filesystemIdentity.nullable().optional(),
+  common_git_dir_identity: filesystemIdentity.nullable().optional(),
+  worktree_identity: filesystemIdentity.nullable().optional(),
+  git_pointer_identity: filesystemIdentity.nullable().optional(),
+  admin_path: absolutePath.nullable().optional(),
+  admin_identity: filesystemIdentity.nullable().optional(),
+  admin_gitdir_identity: filesystemIdentity.nullable().optional(),
 }).strict();
 const runSchema = z.object({
   schema_version: z.literal(1),
@@ -144,6 +155,7 @@ const eventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("start"), at: timestamp, owner_instance_id: identifier }).strict(),
   z.object({ type: z.literal("phase"), at: timestamp, phase: z.enum(["preflight", "worktree", "candidate_apply"]) }).strict(),
   z.object({ type: z.literal("worktree_owned"), at: timestamp, owned_worktree: ownedWorktreeSchema }).strict(),
+  z.object({ type: z.literal("worktree_receipt"), at: timestamp, owned_worktree: ownedWorktreeSchema }).strict(),
   z.object({ type: z.literal("step_started"), at: timestamp, phase: stepPhaseSchema, index: natural }).strict(),
   z.object({ type: z.literal("progress"), at: timestamp, total_duration_ms: natural, step_duration_ms: natural.optional(), output_tail: z.string().optional() }).strict(),
   z.object({ type: z.literal("step_completed"), at: timestamp, outcome: z.discriminatedUnion("kind", [
@@ -358,6 +370,16 @@ export function transitionValidationRun(run: ValidationRun, event: ValidationRun
       next.phase = "worktree";
       next.cleanup = { state: "pending", reason: null, recovery_required: true };
       break;
+    case "worktree_receipt": {
+      const previous = run.owned_worktree;
+      requireCondition(previous !== null && run.phase === "worktree");
+      for (const [key, value] of Object.entries(previous)) {
+        if (value !== null && value !== undefined) requireCondition(JSON.stringify(value) === JSON.stringify(update.owned_worktree[key as keyof typeof previous]));
+      }
+      next.owned_worktree = update.owned_worktree;
+      requireCondition(worktreeMatches(next));
+      break;
+    }
     case "step_started": {
       const expected = configuredSteps(run)[run.steps.length];
       requireCondition(run.started_at !== null && run.base_head !== null && run.current_step === null && expected !== undefined);
