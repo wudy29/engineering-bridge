@@ -161,8 +161,10 @@ test("MCP and Codex client metadata use the shared package VERSION, and stdio re
       "control_task",
       "create_project",
       "generate_controlled_patch",
+      "get_controlled_patch_validation",
       "refine_controlled_patch",
       "run_task",
+      "start_controlled_patch_validation",
       "submit_controlled_patch",
       "task_result",
       "validate_controlled_patch"

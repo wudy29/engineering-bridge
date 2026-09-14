@@ -1,6 +1,6 @@
 # MCP tool reference
 
-This is the tool surface of Engineering Bridge V1 (1.4.2). The local STDIO MCP server exposes thirteen tools.
+This is the tool surface of Engineering Bridge 1.5.0. The local STDIO MCP server exposes fifteen tools. The two async validation tools are additive; the original thirteen contracts remain supported.
 
 ## Codex routing policy
 
@@ -101,3 +101,72 @@ Replaces the fixed validation profile for one registered workspace. A profile co
 Input: `patch_task_id`.
 
 Runs the retained proposal against the workspace validation profile in a temporary detached worktree after the normal controlled-patch preflight. Results are `PASS`, `FAIL`, or `INCOMPLETE`. Validation is optional and on-demand: it neither changes proposal state nor grants write permission, and the detached worktree protects the registered workspace from candidate build artifacts but is not a host-level sandbox. Unborn-base proposals return `INCOMPLETE` with `reason: "unsupported_unborn_base"`.
+
+This original API is synchronous: the RPC waits for the complete report and does not create an async run. Its input and report shape are unchanged. Use it for short validations or existing callers; use the following pair when execution might outlast a caller's request window.
+
+## `start_controlled_patch_validation`
+
+Strict input object (all fields required; no additional properties):
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "patch_task_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "idempotency_key": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"}
+  },
+  "required": ["patch_task_id", "idempotency_key"],
+  "additionalProperties": false
+}
+```
+
+For example, call with `{"patch_task_id":"retained-proposal-task-id","idempotency_key":"review-1"}`. The service resolves the retained proposal and trusted configured profile, freezes their identities, and atomically persists admission **before** scheduling any execution. The short response contains:
+
+```json
+{
+  "validation_run_id": "a-returned-UUID-v4",
+  "patch_task_id": "retained-proposal-task-id",
+  "workspace_id": "registered-workspace",
+  "base_head": "the-proposal-base-HEAD",
+  "state": "running",
+  "status": null,
+  "phase": "admitted",
+  "admitted_at": "2026-09-14T00:00:00.000Z"
+}
+```
+
+The UUID and HEAD above are placeholders. `base_head` can be null for an unborn proposal. A replay returns the retained run's current state/phase/status rather than promising `admitted`. Success proves durable admission, not PASS. Missing profile and unsupported unborn base are admitted and settle to retained `INCOMPLETE` without configured execution. Unknown or ineligible proposals return the existing safe proposal error (for example `INVALID_STATE_TRANSITION`) without admission.
+
+Idempotency is scoped to this Bridge store. The same key and patch replay the **first** admission, before reading any newly configured profile or current proposal state. The same key with a different patch returns `VALIDATION_IDEMPOTENCY_CONFLICT`. A new key requests explicit revalidation and captures current identities; it never overwrites an earlier result. Another active run for that patch returns `VALIDATION_ALREADY_RUNNING`; unresolved recovery evidence returns `VALIDATION_RECOVERY_REQUIRED`. There is a four-active-run limit (`VALIDATION_CAPACITY_BUSY`); no queue or automatic retry exists. Preserve both the key and returned run id, including across network errors.
+
+Only the Bridge-owned service holds execution promises, AbortControllers, children and process groups. Request cancellation or caller EOF does not cancel an admitted run while Bridge stays alive. A launcher that kills Bridge on disconnect invokes the shutdown/restart semantics below. Start accepts no argv, shell, timeout, profile, environment, workspace root, temporary path, or process options. It never invokes APPLY/COMMIT/push.
+
+## `get_controlled_patch_validation`
+
+Strict input object: `{"validation_run_id":"returned-UUID-v4"}`. The JSON schema is an object with the single required `validation_run_id` string property (`format: "uuid"`) and `additionalProperties: false`; the store further requires a UUID v4 run identity.
+
+Query returns the retained `ValidationRun` record, without a validation wait, spawn, cleanup, retry, resume, or state update:
+
+| Fields | Meaning |
+| --- | --- |
+| `schema_version`, `validation_run_id`, `patch_task_id`, `workspace_id`, `workspace_root`, `base_head` | Versioned run and candidate identity |
+| `idempotency_key`, `admission_sequence`, `operation_sequence` | Admission identity and durable update version; no process journal |
+| `proposal_fingerprint`, `patch_sha256`, `profile_sha256`, `profile_snapshot` | Frozen identity and the resolved immutable profile, or null profile if missing |
+| `state`, `phase`, `status` | `running` with null status, initially phase `admitted`; `terminal` with `PASS`, `FAIL`, or `INCOMPLETE` |
+| `current_step`, `steps` | Current phase/index/name; ordered completed results with status, exit code, duration, bounded output tail and reason; never-started steps are absent |
+| `admitted_at`, `started_at`, `updated_at`, `ended_at`, `recovered_at`, `total_duration_ms`, `duration_basis` | Retained timing; null where not yet applicable; recovery reports the last checkpoint as a duration lower bound |
+| `cleanup`, `reason`, `owned_worktree`, `owner_instance_id` | Cleanup disposition/recovery fence, result reason and forensic ownership; no durable validation child PID |
+
+Progress is a checkpoint observation, not live elapsed time or stdout streaming. `PASS` requires successful required cleanup. Infrastructure or cleanup failure yields `INCOMPLETE`, preserving earlier definite step results. A terminal result does not authorize or alter a proposal and cannot be used as APPLY confirmation.
+
+Unknown valid UUIDs return `isError: true` with `{error:{code:"VALIDATION_RUN_UNKNOWN",message:...}}`. Corrupt/incompatible retained records return `VALIDATION_RUN_CORRUPT` / `VALIDATION_RUN_INCOMPATIBLE`, never fabricated success or raw file content. Storage/boundary/owner failures use `VALIDATION_STORE_UNAVAILABLE`, `VALIDATION_STORE_BOUNDARY`, or `VALIDATION_OWNER_UNAVAILABLE`; invalid schema is rejected at MCP input validation. Errors contain fixed safe messages. Query itself does not perform startup recovery; the service is opened before the MCP session is served.
+
+## Async storage, restart and migration
+
+Use a trusted, canonical configuration directory outside every repository, registered workspace and approved `project_root`. Existing configurations inside those boundaries remain usable for the legacy tools, but async admission/query fail closed. No automatic migration or fallback storage exists; moving a deployment's config and sidecars is an explicit operator action.
+
+For configuration `<config>`, async uses private `<config>.validation-runs/`, sibling `<config>.validation-runs.owner.json` / `.owner-guard`, and `<config>.validation-worktrees/`. Records are atomic write/fsync/rename replacements with bounded 64 KiB per-step tails, a 4 MiB record cap and 256 MiB/4096-entry store limits. Capacity fails closed rather than evicting history. Snapshots retain configured argv; keep credentials out of profiles and output. Only one Bridge can own a store at a time; another instance returns safe async ownership errors while legacy tools remain available. Async v1 requires POSIX; Windows returns `VALIDATION_PLATFORM_UNSUPPORTED` without disabling the old tools.
+
+Normal SIGTERM/SIGINT or service shutdown aborts supervised children/process groups within existing bounds and attempts bounded, ownership-verified cleanup. Caller EOF lets active work finish before natural process exit. A hard Bridge crash cannot guarantee child termination; startup never signals an old child, resumes, retries, attaches, visits an old worktree, or deletes a stale scene. Instead it durably converts leftover non-terminal records to `INCOMPLETE` (`supervisor_lost`) with the existing cleanup disposition and recovery fence. Uncertain persistence/ownership fails closed. The fence is not cleared by manually deleting paths; a later explicit controlled recovery is required and no cleanup tool is exposed in v1.5.0.
+
+Completed records remain queryable after restart. Refresh the connector catalog after installing the new version (13 → 15). No existing tool is renamed or made asynchronous; no list/history, cleanup, subscription, or streaming tool is added.

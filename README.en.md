@@ -2,11 +2,11 @@
 
 **Connect Chat directly to local Codex or DSH: no more shuttling prompts and results—Chat dispatches, supervises, and accepts the executor's work.**
 
-[![v1.4.4](https://img.shields.io/badge/release-v1.4.4-blue)](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.4)
+[![v1.5.0](https://img.shields.io/badge/version-v1.5.0-blue)](RELEASE_NOTES.md)
 [![CI](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[简体中文](README.md) · **[v1.4.4](https://github.com/wudy29/engineering-bridge/releases/tag/v1.4.4) · V1 · Local · Continuously maintainer-tested on macOS.** Tag, GitHub Release, and npm publication remain separate release actions. Windows currently has smoke verification of the Codex and DSH npm CLI launch path on GitHub Actions `windows-2025` (Node 22 with actual npm-installed `@openai/codex` and `@deepseek-ai/dsh`); broader Windows environments and client combinations are not claimed fully certified.
+[简体中文](README.md) · **v1.5.0 · V1 · Local · Continuously maintainer-tested on macOS.** The version does not imply a tag, GitHub Release, or npm publication; these remain separate actions. Windows has Codex and DSH npm CLI launch smoke coverage. Async validation requires POSIX process-group supervision and returns `VALIDATION_PLATFORM_UNSUPPORTED` on Windows; the old synchronous and other tools keep their existing behavior.
 
 ## Before / now
 
@@ -91,8 +91,9 @@ This repository used Bridge to generate its CI workflow, Bug Report template, an
 | Generate a complete Git patch before any write; controlled writes for managed workspaces after exact `AUTHORIZE` | No HTTP, UI, account system, caller authentication, or remote transport | DSH native headless session resume |
 | Apply only after exact `APPLY`, with base-HEAD and repository-state revalidation; unborn repositories support added 100644 text files | Does not persist task/thread/evidence supervision history; no resource quota | Persistent task/audit history |
 | Commit an already-`APPLY`ed controlled patch only after exact `COMMIT`; Bridge never pushes | Does not automatically publish or create a Release | — |
-| Controlled-patch proposals/applied history and the managed workspace catalog survive restarts | — | Carefully explore multi-agent orchestration |
-| Thirteen local MCP tools over STDIO | — | — |
+| Fixed validation profiles; synchronous validation plus async start/query with retained PASS/FAIL/INCOMPLETE | Not a host sandbox; no restart resume or automatic stale-worktree cleanup | — |
+| Controlled-patch proposals/applied history, workspace catalog, profiles and independent validation runs survive restarts | Validation records are not executor session history | Carefully explore multi-agent orchestration |
+| Fifteen local MCP tools over STDIO | — | — |
 
 ## Quick start
 
@@ -116,7 +117,7 @@ npm install
 npm run build
 ```
 
-The current v1.4.4 release has no one-click installer.
+The current v1.5.0 version has no one-click installer.
 
 ### 3. Register a workspace
 
@@ -149,7 +150,7 @@ Client schemas and configuration locations differ; translate these generic field
   "command": "node",
   "args": [
     "/absolute/path/to/engineering-bridge/dist/src/mcp-stdio.js",
-    "/absolute/path/to/engineering-bridge/workspaces.json"
+    "/absolute/path/to/bridge-state/workspaces.json"
   ],
   "env": {
     "PATH": "/path/that/includes-node-and-your-executor"
@@ -163,7 +164,7 @@ If you use DSH and `DEEPSEEK_API_KEY` is set in the environment Bridge runs unde
 
 **Codex routing policy (optional):** when `ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY` is unset, it defaults to `inherit`, preserving v1.4.x compatibility: Codex may use its existing configuration when `model` or `reasoning_effort` is omitted. Deployments that must fail closed can set it exactly to `explicit`; then every Codex call through `run_task`, `generate_controlled_patch`, or `refine_controlled_patch` must provide both non-blank `model` and `reasoning_effort`, or Bridge returns `CODEX_ROUTING_REQUIRED` before starting a Codex process. After the gate, the existing `model/list` and reasoning validation still run, and the selections are sent through `turn/start`. Invalid values—including an empty string, case variants, or aliases—fail Bridge startup rather than falling back to `inherit`; DSH is not constrained by this policy.
 
-Reconnect the integration and confirm these ten current V1 tools are visible:
+Reconnect the integration and refresh the connector catalog to see these fifteen tools. Existing callers can keep the synchronous API:
 
 - `run_task`
 - `task_result`
@@ -175,6 +176,11 @@ Reconnect the integration and confirm these ten current V1 tools are visible:
 - `refine_controlled_patch`
 - `submit_controlled_patch`
 - `apply_controlled_patch`
+- `commit_controlled_patch`
+- `configure_validation_profile`
+- `validate_controlled_patch`
+- `start_controlled_patch_validation`
+- `get_controlled_patch_validation`
 
 ### 5. Run the first read-only task
 
@@ -228,6 +234,38 @@ npm run mcp:stdio -- /absolute/path/to/workspaces.json
 
 The process waits for MCP messages on standard input. It is not an interactive shell and does not connect itself to a chat client.
 
+### 7. Validate a controlled proposal (optional)
+
+Configure one trusted fixed profile per workspace through `configure_validation_profile` with exact `CONFIGURE`. Commands are non-empty argv arrays, never shell strings or repository-discovered configuration. For example:
+
+```json
+{"workspace_id":"my-project","confirmation":"CONFIGURE","profile":{"preparation":[],"validation":[{"name":"test","argv":["npm","test"]}]}}
+```
+
+Omitted timeouts default to 600 seconds per step and 1200 seconds total. A configured step may set `timeout_seconds`; validation callers cannot supply commands, paths or timeouts. The original `validate_controlled_patch({patch_task_id})` still waits for its original report and creates no async run. Use it for short checks or old callers.
+
+For long validation, call `start_controlled_patch_validation`:
+
+```json
+{"patch_task_id":"retained-proposal-task-id","idempotency_key":"review-1"}
+```
+
+Success means admission is already durable. It returns `validation_run_id`, `state`, `status`, `phase`, `patch_task_id`, `workspace_id`, `base_head`, and `admitted_at` without waiting for execution. Save the run id and call `get_controlled_patch_validation` independently:
+
+```json
+{"validation_run_id":"returned-validation-run-uuid"}
+```
+
+While `state` is `running` (initially `phase: "admitted"`), query again later. Terminal records have `state: "terminal"` and `status: "PASS" | "FAIL" | "INCOMPLETE"`, ordered step results, cleanup/reason/timing, and frozen proposal/profile identities. Query never waits for validation, runs commands, cleans up, or changes state. This is bounded retained evidence, not streaming progress.
+
+Retry with the same key to replay the first admission even after profile replacement. The same key with a different patch conflicts; a new key explicitly requests revalidation. Keys contain 1–128 ASCII letters, digits, `_ . : -`. Only one run per patch can be active; different proposals may run independently. A configured nonzero exit gives `FAIL`; timeout, signal, missing profile, preflight or cleanup failure gives `INCOMPLETE`. `PASS` requires all steps and required cleanup to succeed. Unborn-base proposals return `INCOMPLETE` with `unsupported_unborn_base`.
+
+Caller disconnect does not cancel a service-owned run while Bridge remains alive. A client/wrapper that also terminates Bridge invokes shutdown/crash semantics: normal shutdown terminates the supervised child/process group within bounds. Startup converts leftover non-terminal records to `INCOMPLETE`, never resumes/retries/attaches, and never accesses or deletes the old worktree. A `cleanup.recovery_required` fence blocks new admission for that patch until a later explicit controlled recovery; manually removing a directory does not clear the fence. Completed results survive restart without execution. One Bridge at a time owns each retained store.
+
+Keep trusted configuration and sidecars outside repositories, registered workspaces, and approved `project_root` trees. Async state lives beside the canonical configuration path in `<config>.validation-runs/` (private directory, one atomic JSON record per run), with `<config>.validation-worktrees/` and service-owner metadata/guard beside it. Snapshot commands and output can contain local information; do not include credentials. Unsafe storage or unavailable ownership returns safe async errors while old tools remain available; no configuration is moved automatically.
+
+Validation applies the candidate only in a temporary detached worktree. This protects the registered workspace from candidate files and build artifacts, but configured programs still have the Bridge user's host permissions: only configure trusted commands. Validation does not change proposal state, authorize APPLY, or automatically APPLY/COMMIT/push. See the [tool reference](docs/tools.md) and [architecture](docs/architecture.md).
+
 ## Safety boundary
 
 - Workspaces are read-only by default; controlled writing is enabled per source: manual workspaces set `allow_write: true`, managed workspaces authorize through `authorize_workspace_write` with exact `AUTHORIZE`.
@@ -236,7 +274,7 @@ The process waits for MCP messages on standard input. It is not an interactive s
 - Bridge rejects delete, rename, copy, binary, mode-change, executable, symlink, submodule, unsafe-path, and other unsupported patches, including additions whose targets already exist.
 - Bridge never automatically tests, stages, commits, pushes, or creates a Release.
 - The Codex backend is `codex app-server --stdio`, with no shell, approval `never`, and network disabled; DSH runs through the official headless interface with a per-process `DSH_PERMISSION_MODE=read-only` pin, an explicit environment allowlist (including `DEEPSEEK_API_KEY` and `DSH_TOOLS_MODE`), and proxy variables excluded. Ordinary/supervisor tasks and proposal generation remain read-only; only exact reviewed `APPLY` is a filesystem write path.
-- Task supervision state (task/thread/evidence/review) is process-local; controlled-patch proposals/applied history, the managed workspace catalog, and validation profiles survive restarts (three local state files, mode 0600). Each executor run has a 15-minute hard deadline; an active Codex turn fails with `EXECUTOR_STALLED` after two minutes without a notification whose `threadId` and `turnId` exactly match that turn, and short Codex RPC calls have a separate 30-second bound. A running task can also be explicitly interrupted through `control_task(action: "interrupt")`; genuine partial output from an interactive interruption is returned as `partial_output`, while ordinary failures never re-expose stderr or partial stdout.
+- Task supervision remains process-local. Proposals/applied history, the workspace catalog and profiles keep their three 0600 sidecars; async validation has a separate private durable store and 64 KiB per-step output tails. Persistence failure fails closed and promptly notifies the active service to abort. Executor deadlines, Codex's two-minute matching-activity watchdog, short RPC bounds and `control_task` interruption semantics remain unchanged.
 - Workspaces are registered in two ways: manually in `workspaces.json` (authoritative) or through managed onboarding inside `project_root` with exact `BIND`/`CREATE`; calls still require `workspace_id`.
 - Codex evidence truncated/evicted by its existing bounds carries explicit markers (`[truncated]`, changes-omitted counts, evidence-drop)—they mean the diagnostic information is incomplete, not that it is a complete transcript.
 - Read-only execution is not OS-level filesystem isolation. A same-user process may read other files the operating system permits.
@@ -246,7 +284,7 @@ Read [Security design](docs/security.md), [Threat model](docs/threat-model.md), 
 
 ## Troubleshooting
 
-- **The thirteen tools are missing:** reconnect the client and confirm its local STDIO MCP configuration launches `dist/src/mcp-stdio.js`.
+- **The fifteen tools are missing:** reconnect and refresh the catalog; confirm the configuration launches the updated `dist/src/mcp-stdio.js`.
 - **The client cannot find `node`, `codex`, or `dsh`:** client-launched processes may receive a different `PATH` from your terminal. Supply one containing these executables.
 - **Codex Desktop is installed but Bridge cannot find `codex`:** the desktop app does not guarantee that the Codex CLI is installed or present on the `PATH` inherited by the process that launches Bridge. Verify `codex` from that same launch environment.
 - **A Windows tunnel stops when PowerShell closes:** `tunnel-client run` is a foreground process. Keep its PowerShell window open or run it under an explicitly configured process manager.

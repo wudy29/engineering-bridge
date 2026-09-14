@@ -1,5 +1,28 @@
 # Release notes
 
+## v1.5.0 (prepared; not published)
+
+Add retained async controlled-patch validation without changing the original synchronous API. A potentially long validation no longer requires one MCP call to remain open until all steps finish.
+
+### Added
+
+- `start_controlled_patch_validation(patch_task_id, idempotency_key)` durably admits a run before execution and returns its identity promptly.
+- `get_controlled_patch_validation(validation_run_id)` independently queries bounded retained progress and PASS/FAIL/INCOMPLETE results, with safe unknown/corrupt/incompatible errors. Catalog: 13 → 15 tools.
+- Independent immutable proposal/profile identities, caller-key replay, a private atomic run store, single service ownership, supervised process-group termination and ownership-verified normal worktree cleanup.
+- Startup converts interrupted non-terminal runs to INCOMPLETE; terminal results survive new MCP sessions and Bridge restart without execution. Stale worktree identity and recovery fences are preserved.
+
+### Compatibility and safety
+
+- `validate_controlled_patch` keeps its original input, synchronous report and service; old callers need no schema migration. Long validation should use start/query, saving the key and run id. Refresh the connector catalog after installing the updated build.
+- Async v1 requires POSIX process-group supervision. Windows and unsafe/unavailable async storage/ownership return safe async errors while legacy tools remain available. Config/state must be outside repositories, registered workspaces and approved onboarding roots; there is no automatic config migration.
+- Caller disconnect does not cancel a run while Bridge remains alive. A launcher that kills Bridge invokes shutdown/crash semantics. Restart does not resume/retry/attach, signal old children or visit/delete stale worktrees. Hard crashes can leave children or forensic state requiring later explicit controlled recovery; deleting paths does not clear `recovery_required`.
+- No command injection surface, process journal, background queue, cleanup/history tool, automatic APPLY/COMMIT/push, or repository-controlled executable profile is added. Existing timeouts, bounded output, persistence fail-closed and controlled-write gates remain in place.
+
+### Verification
+
+- Disposable real MCP stdio tests cover short admission/query, caller EOF continuation, retained results across restart, SIGTERM/SIGKILL disposition, no duplicate execution, stale-site preservation, strict schemas and old synchronous compatibility, alongside domain/store/lifecycle regression.
+- This prepared version does not claim a production deployment, cloud/tunnel acceptance, tag, GitHub Release or npm publication.
+
 ## v1.4.4
 
 v1.4.4 is a correctness release for validation process lifecycle, Codex app-server JSONL frame compatibility, DSH interruption preservation, and workspace canonical identity handling.
