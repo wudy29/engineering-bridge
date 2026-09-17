@@ -31,6 +31,15 @@ const git: Git = (cwd, args, input) => new Promise((resolve, reject) => {
   const child = execFile("git", [...args], { cwd, timeout: 10_000, maxBuffer: 1_048_576 }, (error, stdout) => error ? reject(error) : resolve(stdout));
   child.stdin?.end(input);
 });
+async function overwriteExistingFile(path: string, content: string): Promise<void> {
+  const file = await fs.open(path, "r+");
+  try {
+    await file.truncate(0);
+    await file.writeFile(content);
+  } finally {
+    await file.close();
+  }
+}
 function receipt(run: ValidationRun, owned: Owned): ValidationRun {
   return transitionValidationRun(run, { type: "worktree_receipt", at: AT, owned_worktree: owned });
 }
@@ -41,6 +50,7 @@ async function fixture(t: TestContext, registered = false) {
   const workspace = join(directory, "project");
   await fs.mkdir(workspace);
   await git(workspace, ["init", "--quiet"]);
+  await git(workspace, ["config", "--local", "core.autocrlf", "false"]);
   await git(workspace, ["config", "user.name", "Fixture"]);
   await git(workspace, ["config", "user.email", "fixture@example.invalid"]);
   await fs.writeFile(join(workspace, "file.txt"), "before\n");
@@ -165,7 +175,7 @@ for (const scenario of ["marker", "marker_inode", "parent_inode", "parent_symlin
       await fs.rename(owned.worktree_path, moved);
       await fs.symlink(moved, owned.worktree_path, "dir");
     }
-    if (scenario === "git_pointer") await fs.writeFile(pointer, "gitdir: " + join(f.directory, "wrong") + "\n");
+    if (scenario === "git_pointer") await overwriteExistingFile(pointer, "gitdir: " + join(f.directory, "wrong") + "\n");
     if (scenario === "admin_backref") await fs.writeFile(join(admin, "gitdir"), join(f.workspace, ".git") + "\n");
     if (scenario === "common_git") await fs.writeFile(join(admin, "commondir"), f.directory + "\n");
     if (scenario === "workspace_inode") {

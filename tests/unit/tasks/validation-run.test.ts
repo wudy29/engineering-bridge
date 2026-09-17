@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import test from "node:test";
 
 import type { ValidationProfile } from "../../../src/tasks/validation-profile-store.js";
@@ -183,8 +184,9 @@ function passed(): ValidationRun {
   });
 }
 function worktree(run: ValidationRun): NonNullable<ValidationRun["owned_worktree"]> {
-  const parent_path = `/private/validation/engineering-bridge-validation-${run.validation_run_id}`;
-  return { expected_temp_root: "/private/validation", parent_path, worktree_path: `${parent_path}/worktree`,
+  const root = "/private/validation";
+  const parent_path = join(root, `engineering-bridge-validation-${run.validation_run_id}`);
+  return { expected_temp_root: root, parent_path, worktree_path: join(parent_path, "worktree"),
     parent_identity: { dev: "1", ino: "20" }, common_git_dir: "/example/workspace/.git", run_marker: run.validation_run_id };
 }
 
