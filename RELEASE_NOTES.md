@@ -1,6 +1,6 @@
 # Release notes
 
-## v1.5.0 (prepared; not published)
+## Engineering Bridge v1.5.0
 
 Add retained async controlled-patch validation without changing the original synchronous API. A potentially long validation no longer requires one MCP call to remain open until all steps finish.
 
@@ -21,7 +21,7 @@ Add retained async controlled-patch validation without changing the original syn
 ### Verification
 
 - Disposable real MCP stdio tests cover short admission/query, caller EOF continuation, retained results across restart, SIGTERM/SIGKILL disposition, no duplicate execution, stale-site preservation, strict schemas and old synchronous compatibility, alongside domain/store/lifecycle regression.
-- This prepared version does not claim a production deployment, cloud/tunnel acceptance, tag, GitHub Release or npm publication.
+- This release does not claim a production deployment, cloud/tunnel acceptance, tag, GitHub Release or npm publication.
 
 ## v1.4.4
 
