@@ -2,7 +2,7 @@
 
 ## Design Status
 
-This document records the approved first-version architecture for on-demand controlled-patch validation. It is an architecture contract, not an implementation plan. The design is intentionally thin: it adds one trusted, fixed validation profile per workspace and one isolated, synchronous validation path, without changing existing task, proposal, or apply behavior.
+Sections 1–11 record the original synchronous validation contract, which remains supported unchanged. References there to “v1” scope (including no retained results or background execution) describe that original path. Section 12 defines the additive v1.5.0 async extension; it supersedes those scope limits only for the new start/query path. Neither path changes executor task, controlled-proposal or APPLY behavior.
 
 ## 1. Scope and Invariants
 
@@ -112,7 +112,7 @@ No preparation or validation command runs until proposal resolution, profile loo
 
 ## 5. Timeouts, Failure, and Cleanup
 
-Commands run sequentially. A command receives no more than its fixed per-step timeout or the remaining total validation budget, whichever is smaller. The initial defaults are 600 seconds per step and 1200 seconds total, keeping the main validation budget comfortably below the observed approximately 25-minute Chat/tool-call window.
+Commands run sequentially. A command receives no more than its fixed per-step timeout or the remaining total validation budget, whichever is smaller. Defaults are 600 seconds per step and 1200 seconds total. These execution limits do not prove any Chat/cloud request window; the synchronous RPC still depends on its caller connection surviving the full run. The async extension removes that dependency from admission and result retrieval.
 
 A per-step or total timeout terminates the active child, stops all later steps, and produces `INCOMPLETE`. After the main budget expires, cleanup is still attempted immediately under a small fixed Bridge-owned cleanup bound so the whole call remains bounded. There are no retries.
 
@@ -191,3 +191,21 @@ Implementation starts with failing behavior tests and proceeds TDD. Tests use de
 v1 does not include dynamic command selection, focused-test inference, conditional rules, retries, matrices, parallelism, background execution, workers, queues, an event bus, executor pools, session management, persistent full logs, Docker or VM sandboxing, automatic remediation, validation-triggered APPLY, or new proposal/task states.
 
 It also does not add repository-controlled validation configuration, a profile language, profile inheritance, multiple named profiles per workspace, validation history, caching, artifact retention, or implementation-specific project presets.
+
+## 12. v1.5.0 async extension
+
+The existing `validate_controlled_patch(patch_task_id)` input, synchronous report and coordinator remain unchanged. Two tools expose the committed minimal async service: `start_controlled_patch_validation(patch_task_id, idempotency_key)` and `get_controlled_patch_validation(validation_run_id)`. The total catalog is fifteen. Both inputs are strict, with no command/path/profile/timeout/process injection; [tools.md](../../tools.md) specifies the exact public schemas and output fields.
+
+Start first replays an existing key, or captures proposal/profile identities and durably admits a new record. Only then does the Bridge-owned service schedule execution; start returns a small receipt without waiting for validation. Same key/patch always means the first admission, including after CONFIGURE or proposal changes; same key/different patch conflicts, and a new key explicitly requests revalidation. One active run per patch, a four-run service capacity and a retained recovery fence constrain admission without a worker queue.
+
+The record stores a UUID, patch/workspace/base identity, proposal and patch hashes, immutable resolved profile snapshot/hash, idempotency key, admission/update sequences, timestamps, state/phase/current step, ordered bounded step results, cleanup disposition and worktree ownership. `operation_sequence` is a durable update version, not a process journal. States are `running` and `terminal`, with terminal PASS/FAIL/INCOMPLETE retaining section 6 meanings. Current-step and completed-step checkpoints are observations rather than streamed stdout. No validation child PID or per-process intent/receipt/settled state is persisted.
+
+The service opens once before MCP connect; query never performs lazy recovery. It reads retained state immediately, distinguishes unknown/corrupt/incompatible records safely, and never waits for validation, executes, cleans up or mutates state. Private Bridge-managed storage beside the canonical config path is outside all repositories, registered workspaces and approved onboarding roots; writes are atomic/fsynced and bounded. Each command tail is at most 64 KiB; records at most 4 MiB; store capacity is bounded without automatic eviction. Uncertain persistence fails closed and promptly aborts active execution, independently of best-effort error cleanup I/O. An unavailable async service does not break the original tools.
+
+Execution belongs to the service, not the MCP handler, connection or request AbortSignal. Caller EOF/cancellation does not cancel it while Bridge remains alive. Normal shutdown uses the existing bounded abort/process-group termination and normal worktree cleanup; a wrapper that kills Bridge is a shutdown/crash event. Runtime cleanup revalidates run/path/marker/inode/repository/registration/detached-base/Git-pointer ownership and process quiescence before targeted deletion, never prune or prefix guessing.
+
+Restart only converts leftover non-terminal records to INCOMPLETE through the approved owner-loss transition, retaining owned-worktree identity and recovery disposition. It does not resume, retry, attach, operate on old child PIDs, inspect old worktrees or automatically delete stale scenes. `recovery_required` blocks new admission for that patch; deleting a directory does not clear it. A hard-killed Bridge cannot guarantee termination of old children. Ambiguous ownership or a handoff guard remains fail closed for explicit controlled recovery. No cleanup tool or recovery scheduler is added. Completed results survive new sessions/restarts unchanged.
+
+The first async implementation requires POSIX process-group supervision; Windows returns a safe unsupported error for the two new tools while retaining legacy behavior. Profile commands still execute with host-user permissions, not an OS sandbox. Validation never modifies the registered workspace with candidate files, mutates proposal lifecycle, or authorizes/invokes APPLY/COMMIT/push.
+
+Verification combines existing domain/store/process/recovery tests with real disposable MCP stdio tests: short durable start, independent running queries, caller EOF followed by completion, terminal PASS/FAIL/INCOMPLETE, idempotent replay after profile replacement, corrupt/incompatible query errors, unchanged sync contract, exact fifteen-tool catalog, fresh-session retained query and SIGTERM/SIGKILL restart without duplicate execution or stale-site deletion. These local tests do not claim a cloud transport acceptance window.

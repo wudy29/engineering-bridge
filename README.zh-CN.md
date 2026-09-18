@@ -6,4 +6,6 @@ English README: [English](README.en.md)
 
 ## 受控补丁验证（可选）
 
-校验是可选、按需的：使用 `configure_validation_profile` 为每个已登记工作区配置最多一个固定校验 profile，并要求精确 `CONFIGURE`（不复用 `AUTHORIZE`）；只有显式调用 `validate_controlled_patch` 才会运行校验，且该调用只接受 `patch_task_id`，不能携带命令、argv、shell 文本或超时。`apply_controlled_patch` 不会自动运行校验或测试，普通 Bridge 路径不变，也没有后台校验 worker/queue。命令是非空 argv 数组、不用 shell 字符串，省略超时时默认每步 600 秒、总预算 1200 秒。结果只有 `PASS`、`FAIL`、`INCOMPLETE`；unborn 仓库提案返回 `INCOMPLETE` 且 `reason: "unsupported_unborn_base"`。validation profile 与现有持久状态一起保存在三个本地 0600 sidecar 中，其中包括 `<config>.validation-profiles.json`。校验在临时 detached worktree 中进行，只保护已登记工作区整洁，不是主机级沙箱；只应为可信工作区配置完全信任的命令。详见 [简体中文 README](README.md)。
+v1.5.0 保留同步 `validate_controlled_patch(patch_task_id)`；长校验推荐 `start_controlled_patch_validation(patch_task_id, idempotency_key)` 后通过 `get_controlled_patch_validation(validation_run_id)` 独立查询 retained PASS/FAIL/INCOMPLETE。start 成功前 admission 已持久化；caller 断开不取消仍由 Bridge 持有的 run。重启不续跑、不重试、不 attach、不自动删除旧现场；遗留 non-terminal run 变为 INCOMPLETE，保留 recovery fence。
+
+命令仍只来自精确 `CONFIGURE` 的可信固定 profile，采用直接 argv、既有 step/total timeout 与 bounded output。validation 不授权 APPLY，不自动 APPLY/COMMIT/push。私有状态必须在仓库与可登记工作区边界之外；async v1 依赖 POSIX process-group supervision。临时 worktree 不是主机级沙箱。完整配置、幂等规则与迁移说明见 [简体中文 README](README.md)。

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -14,6 +15,8 @@ import { CODEX_ROUTING_POLICY_ENV, parseCodexRoutingPolicy } from "./core/codex-
 import { RegisteredWorkspaceTaskService } from "./tasks/registered-workspace-task-service.js";
 import { ControlledPatchService } from "./tasks/controlled-patch-service.js";
 import { ControlledPatchValidationService } from "./tasks/controlled-patch-validation-service.js";
+import { ControlledPatchValidationRunService } from "./tasks/controlled-patch-validation-run-service.js";
+import { ValidationRunError } from "./tasks/validation-run.js";
 import {
   type ValidationProfile,
   type ValidationStep,
@@ -93,6 +96,33 @@ function unknownTask() {
   };
 }
 
+const VALIDATION_ERROR_MESSAGES: Record<string, string> = {
+  VALIDATION_RUN_UNKNOWN: "The validation run is unknown.",
+  VALIDATION_RUN_INVALID_INPUT: "The validation input is invalid.",
+  VALIDATION_RUN_CORRUPT: "The retained validation record is corrupt.",
+  VALIDATION_RUN_INCOMPATIBLE: "The retained validation schema is unsupported.",
+  VALIDATION_RUN_INVALID_TRANSITION: "The validation state transition is invalid.",
+  VALIDATION_STALE_UPDATE: "The validation update is stale.",
+  VALIDATION_IDEMPOTENCY_CONFLICT: "The idempotency key belongs to a different patch.",
+  VALIDATION_ALREADY_RUNNING: "This patch already has an active validation run.",
+  VALIDATION_RECOVERY_REQUIRED: "This patch has unresolved validation recovery evidence.",
+  VALIDATION_CAPACITY_BUSY: "The validation service is at capacity.",
+  VALIDATION_STORE_FULL: "The retained validation store is at capacity.",
+  VALIDATION_STORE_BOUNDARY: "The validation storage boundary could not be verified.",
+  VALIDATION_STORE_UNAVAILABLE: "The retained validation store is unavailable.",
+  VALIDATION_OWNER_UNAVAILABLE: "Exclusive validation service ownership could not be acquired.",
+  VALIDATION_PLATFORM_UNSUPPORTED: "Async validation requires POSIX process-group supervision.",
+  VALIDATION_SERVICE_STOPPING: "The validation service is stopping.",
+  VALIDATION_SHUTDOWN_INCOMPLETE: "Validation shutdown could not be confirmed.",
+};
+
+function validationError(error: unknown) {
+  const code = error instanceof Error ? (error as Error & { code?: unknown }).code : undefined;
+  return typeof code === "string" && Object.hasOwn(VALIDATION_ERROR_MESSAGES, code)
+    ? { code, message: VALIDATION_ERROR_MESSAGES[code]! }
+    : serializeError(error);
+}
+
 async function main(): Promise<void> {
   if (process.argv.length !== 3) {
     throw new Error("Usage: node dist/src/mcp-stdio.js /absolute/path/to/workspaces.json");
@@ -146,6 +176,51 @@ async function main(): Promise<void> {
     validationProfiles,
     validationRunner
   );
+  let validationRuns: ControlledPatchValidationRunService | undefined;
+  let validationStartupError: unknown;
+  try {
+    // Startup owns recovery. Query never lazily opens or recovers the store.
+    // Include approved onboarding roots so a later BIND cannot enclose storage.
+    const storagePrefix = join(await realpath(dirname(resolve(configPath))), basename(configPath));
+    const protectedRoots = await Promise.all(
+      [...workspaceEntries, ...catalog.entries(), ...projectRootEntries].map(async ({ root }) => {
+        try { return await realpath(root); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return root;
+          throw error;
+        }
+      })
+    );
+    validationRuns = await ControlledPatchValidationRunService.open({
+      registry, controlledPatches, profiles: validationProfiles,
+      directory: storagePrefix + ".validation-runs",
+      tempRoot: storagePrefix + ".validation-worktrees",
+      protectedRoots,
+    });
+  } catch (error) {
+    // Async availability must not change the existing thirteen tool contracts.
+    validationStartupError = error;
+  }
+  const runs = () => {
+    if (!validationRuns) throw validationStartupError;
+    return validationRuns;
+  };
+
+  // Transport EOF/caller cancellation does not own the validation lifecycle.
+  // Natural exit releases the owner after active work drains; OS shutdown aborts it.
+  const stop = async (reason: "bridge_shutdown" | "bridge_sigterm") => {
+    try { await validationRuns?.shutdown(reason); }
+    catch (error) {
+      process.stderr.write(JSON.stringify(validationError(error)) + "\n");
+      process.exitCode = 1;
+    }
+  };
+  process.once("beforeExit", () => { void stop("bridge_shutdown"); });
+  for (const [signal, reason, exitCode] of [
+    ["SIGTERM", "bridge_sigterm", 143], ["SIGINT", "bridge_shutdown", 130],
+  ] as const) process.once(signal, () => {
+    void stop(reason).then(() => process.exit(process.exitCode || exitCode));
+  });
   const server = new McpServer({ name: "engineering-bridge", version: VERSION });
 
   server.registerTool("run_task", {
@@ -371,6 +446,38 @@ async function main(): Promise<void> {
       return jsonContent(await validation.validate(patch_task_id));
     } catch (error) {
       return { isError: true, ...jsonContent({ error: serializeError(error) }) };
+    }
+  });
+
+  server.registerTool("start_controlled_patch_validation", {
+    description: "Durably admit validation and return a run id without waiting for execution. Reuse the same idempotency_key on retry; use a new key for explicit revalidation. Uses only the trusted configured profile in a temporary worktree. Does not APPLY, commit, or push; PASS grants no write authorization.",
+    inputSchema: z.object({
+      patch_task_id: z.string().min(1).max(256),
+      idempotency_key: z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/),
+    }).strict()
+  }, async request => {
+    try {
+      const run = await runs().start(request);
+      return jsonContent({
+        validation_run_id: run.validation_run_id, patch_task_id: run.patch_task_id,
+        workspace_id: run.workspace_id, base_head: run.base_head,
+        state: run.state, status: run.status, phase: run.phase, admitted_at: run.admitted_at,
+      });
+    } catch (error) {
+      return { isError: true, ...jsonContent({ error: validationError(error) }) };
+    }
+  });
+
+  server.registerTool("get_controlled_patch_validation", {
+    description: "Read the retained validation run and ordered bounded results. Returns immediately with running or terminal PASS/FAIL/INCOMPLETE; never executes, waits for validation, changes state, or cleans up. PASS does not authorize APPLY.",
+    inputSchema: z.object({ validation_run_id: z.string().uuid() }).strict()
+  }, async ({ validation_run_id }) => {
+    try {
+      const run = await runs().get(validation_run_id);
+      if (!run) throw new ValidationRunError("VALIDATION_RUN_UNKNOWN");
+      return jsonContent(run);
+    } catch (error) {
+      return { isError: true, ...jsonContent({ error: validationError(error) }) };
     }
   });
 

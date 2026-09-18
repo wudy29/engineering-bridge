@@ -1,6 +1,6 @@
 # Threat model
 
-This threat model covers the Engineering Bridge V1 (1.4.2). Bridge assumes one trusted local operator controls startup configuration and the local MCP client. It is not designed for untrusted remote callers.
+This threat model covers Engineering Bridge 1.5.0. Bridge assumes one trusted local operator controls startup configuration and the local MCP client. It is not designed for untrusted remote callers.
 
 | Risk | Current control | Remaining responsibility or limit |
 |---|---|---|
@@ -17,7 +17,11 @@ This threat model covers the Engineering Bridge V1 (1.4.2). Bridge assumes one t
 | Symlink or mode-change writes outside the workspace | Symlink/mode patches and non-regular Git entries are rejected | Read-only tasks still lack symlink/read containment |
 | Sensitive executor errors leak | stderr and partial failure output are discarded; fixed errors are returned; `partial_output` exists only for genuine interrupts and ordinary failures never re-expose it | Reduced diagnostic detail; no persistent redaction/logging system exists |
 | Automatic publication occurs | `APPLY` uses only `git apply`; the separate exact `COMMIT` gate creates one local commit and never pushes or creates a Release | User remains responsible for push, tags, and publication |
-| Restart loses durable state | Controlled-patch proposals/applied history, the managed workspace catalog, and validation profiles persist in three atomic 0600 state files; invalid retained records are quarantined, and global invariants fail closed | Active task supervision state (tasks, threads, evidence, review) is process-local and intentionally lost on restart |
+| Restart loses durable state | Existing proposals/catalog/profiles retain three atomic sidecars; independent validation records use a private bounded atomic/fsynced store, with unknown/corrupt/incompatible query errors | Executor task supervision remains process-local; retained validation evidence is not executor memory or a complete audit log |
+| Caller disconnect interrupts long validation | Durable admission precedes service-owned execution; start and query are independent short RPCs, neither owns the run's AbortController | A wrapper that kills Bridge invokes shutdown/crash semantics; no cloud connection lifetime is promised |
+| Network retry duplicates validation or changes its meaning | Same-key replay returns the first frozen proposal/profile identity; a new key explicitly revalidates, one active run per patch | Caller must preserve the key/run ID; PASS does not authorize APPLY |
+| Restart deletes the wrong worktree or kills a reused PID | Restart only retains INCOMPLETE/recovery evidence; it never visits old worktrees or signals old children. Normal cleanup requires precise live ownership/quiescence checks | A hard crash can leave children/stale paths; explicit later controlled recovery is needed, and manual path deletion does not clear the fence |
+| Validation executes repository-controlled config or escapes a sandbox | Start accepts no commands; fixed CONFIGURE profile, direct argv/no shell, detached candidate worktree and bounded time/output | Configured programs retain host-user access; only trusted commands/workspaces are suitable. Async v1 requires POSIX process-group supervision |
 | Retained state is corrupted or tampered with | State files are parsed strictly; individually invalid records are skipped/quarantined, while replay/applied ambiguity and global invariants fail closed | Files are not a credential store or a complete audit log; protect them like local configuration |
 | Long-running task consumes resources | Executor runs have a 15-minute hard deadline with bounded process-tree termination; active Codex turns also have a two-minute protocol-inactivity watchdog, short Codex RPC calls have a 30-second bound, and a running task may be explicitly interrupted through `control_task` | No general CPU/memory resource quota is implemented |
 

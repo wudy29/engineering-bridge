@@ -1,6 +1,6 @@
 # Security design
 
-This document separates enforced behavior from operating assumptions for the Engineering Bridge V1 (1.4.2).
+This document separates enforced behavior from operating assumptions for Engineering Bridge 1.5.0.
 
 ## Enforced in code
 
@@ -18,6 +18,8 @@ This document separates enforced behavior from operating assumptions for the Eng
 - Bridge invokes only fixed `git apply --check` and `git apply` operations for application. It never automatically tests, stages, commits, or pushes.
 - A separate exact `COMMIT` gate stages only the retained patch content and creates one commit without pushing. It rejects staged or unrelated tracked dirt, preserves stable unrelated untracked recovery anchors without staging them, and never resets or rewrites history after a post-commit verification failure.
 - Returned executor failures use fixed safe messages rather than forwarding stderr.
+- Validation commands come only from an explicitly CONFIGURE-approved profile, with direct argv, no shell, fixed per-step/total timeouts and bounded output. Async start accepts only a patch ID and idempotency key; query accepts only a run ID and cannot trigger execution or cleanup. PASS never grants APPLY authorization or mutates a proposal.
+- Async admission is durable before execution; proposal/profile identities are frozen, same-key replay never re-executes, and live execution belongs to one Bridge service. Normal shutdown terminates its supervised child/process group; restart does not resume/retry/attach or automatically inspect/delete old worktrees. Normal cleanup verifies exact run ownership and process quiescence before targeted deletion. No prune or prefix deletion is used.
 
 ## Workspace trust
 
@@ -27,13 +29,17 @@ The human reviewer must inspect every path and hunk in a proposal before supplyi
 
 ## Persistence boundary
 
-Three local state files provide restart persistence, all written atomically (write-temporary-then-rename) with mode 0600:
+The three existing local state files retain their atomic write-temporary-then-rename and mode 0600 behavior:
 
 - `<config>.managed-workspaces.json` — the managed workspace catalog (registrations and controlled-write authorization). Individually invalid records are skipped on load; persist failures roll back the in-memory change.
 - `<config>.controlled-patches.json` — controlled-patch proposals and applied history. Invalid retained records are quarantined without blocking startup; duplicate identity, applied-history contradictions, and other global invariants still fail closed.
 - `<config>.validation-profiles.json` — fixed per-workspace validation profiles configured through exact `CONFIGURE`.
 
-These files are not a credential store and not a complete audit log. Active task supervision state (tasks, threads, evidence, review outputs) remains process-local and disappears on restart.
+Async validation adds private `<config>.validation-runs/` containing versioned, atomic write/fsync/rename records (0600), plus sibling service-owner metadata/guard and `<config>.validation-worktrees/`. Their canonical locations must remain outside repositories, registered workspaces and approved onboarding roots. Each output tail is at most 64 KiB and records/storage have explicit capacity limits; no infinite stdout log is retained. Write/fsync/rename failure blocks further persistence and promptly aborts live execution, even while owned temporary-file cleanup is pending. Corrupt/incompatible records return safe errors and block unsafe admission.
+
+Startup converts leftover running records to INCOMPLETE without visiting stale worktrees. Retained ownership and `recovery_required` preserve evidence and block new admission for the affected patch; manually deleting files does not clear that fence. The owner PID is only a conservative same-host liveness veto, never authority to signal an old child or delete a worktree. Ambiguous ownership fails closed. Hard Bridge death can leave live children; explicit later controlled recovery is an operator responsibility. Async v1 is POSIX-only; unavailable async initialization does not disable the legacy tools.
+
+These files are not a credential store or a complete audit log. Immutable validation profiles retain argv and result tails may contain local data; protect state and keep credentials out of profiles/output. Active executor task supervision state (tasks, threads, evidence, review outputs) remains process-local and disappears on restart.
 
 ## Executor, state, and prompt boundaries
 

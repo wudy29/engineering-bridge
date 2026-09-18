@@ -23,6 +23,13 @@ import {
 } from "./registered-workspace-task-service.js";
 
 export type { GitStarter };
+export type ValidationGit = (cwd: string, args: readonly string[], input?: string) => Promise<GitProcessResult>;
+
+async function checkedGit(execute: ValidationGit, cwd: string, args: readonly string[], input?: string): Promise<string> {
+  const result = await execute(cwd, args, input);
+  if (result.code !== 0) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
+  return result.stdout;
+}
 
 export type ProposalBase =
   | { readonly kind: "commit"; readonly head: string }
@@ -251,6 +258,13 @@ export class ControlledPatchService {
     const proposal = this.proposals.get(patchTaskId as Id)!;
     await this.preflightPatch(proposal.workspaceRoot, proposal.base, validationProposal.patch);
     return validationProposal;
+  }
+
+  /** Reuses the exact APPLY/submit checks on an admitted immutable candidate.
+   * The per-call Git port lets its service own every preflight child and deadline. */
+  async preflightCapturedValidationProposal(proposal: ControlledPatchValidationProposal, execute: ValidationGit): Promise<void> {
+    if (this.registry.resolve(proposal.workspaceId) !== proposal.workspaceRoot) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
+    await this.preflightPatch(proposal.workspaceRoot, proposal.baseHead === null ? { kind: "unborn" } : { kind: "commit", head: proposal.baseHead }, proposal.patch, execute);
   }
 
   async apply(request: { patch_task_id: string; confirmation: string }): Promise<{
@@ -745,8 +759,8 @@ export class ControlledPatchService {
   // workspace must still match the proposal base, the patch must be
   // structurally safe, every target must be verifiable against base HEAD /
   // index / worktree, and `git apply --check` must accept the patch.
-  private async preflightPatch(workspaceRoot: string, base: ProposalBase, patch: string): Promise<PatchTarget[]> {
-    const currentBase = await this.verifyWorkspace(workspaceRoot);
+  private async preflightPatch(workspaceRoot: string, base: ProposalBase, patch: string, execute: ValidationGit = this.gitResult.bind(this)): Promise<PatchTarget[]> {
+    const currentBase = await this.verifyWorkspace(workspaceRoot, execute);
     // Unborn proposals require the repository to still be unborn: if the user
     // created the first commit meanwhile, this proposal must be rejected.
     if (!sameBase(currentBase, base)) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
@@ -757,17 +771,17 @@ export class ControlledPatchService {
         // additions are verifiable; modified targets cannot be checked.
         if (target.kind !== "added") failPatch();
       } else {
-        const entry = await this.git(workspaceRoot, ["ls-tree", base.head, "--", target.path]);
+        const entry = await checkedGit(execute, workspaceRoot, ["ls-tree", base.head, "--", target.path]);
         if (target.kind === "modified") {
           if (!/^(100644|100755) blob [0-9a-f]+\t[^\n]+\n?$/u.test(entry)) failPatch();
           continue;
         }
         if (entry.length !== 0) failPatch();
       }
-      const indexEntry = await this.git(workspaceRoot, ["ls-files", "--stage", "--", target.path]);
+      const indexEntry = await checkedGit(execute, workspaceRoot, ["ls-files", "--stage", "--", target.path]);
       if (indexEntry.length !== 0 || await pathExists(resolve(workspaceRoot, target.path))) failPatch();
     }
-    await this.git(workspaceRoot, ["apply", "--check", "--recount", "--unidiff-zero"], patch);
+    await checkedGit(execute, workspaceRoot, ["apply", "--check", "--recount", "--unidiff-zero"], patch);
     return targets;
   }
 
@@ -868,15 +882,15 @@ export class ControlledPatchService {
     }
   }
 
-  private async verifyWorkspace(workspaceRoot: string): Promise<ProposalBase> {
-    await this.verifyWorkspaceRoot(workspaceRoot);
-    const status = await this.git(workspaceRoot, ["status", "--porcelain", "--untracked-files=no"]);
+  private async verifyWorkspace(workspaceRoot: string, execute: ValidationGit = this.gitResult.bind(this)): Promise<ProposalBase> {
+    await this.verifyWorkspaceRoot(workspaceRoot, execute);
+    const status = await checkedGit(execute, workspaceRoot, ["status", "--porcelain", "--untracked-files=no"]);
     if (status.length !== 0) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
-    return this.detectBase(workspaceRoot);
+    return this.detectBase(workspaceRoot, execute);
   }
 
-  private async verifyWorkspaceRoot(workspaceRoot: string): Promise<void> {
-    const topLevel = (await this.git(workspaceRoot, ["rev-parse", "--show-toplevel"])).trim();
+  private async verifyWorkspaceRoot(workspaceRoot: string, execute: ValidationGit = this.gitResult.bind(this)): Promise<void> {
+    const topLevel = (await checkedGit(execute, workspaceRoot, ["rev-parse", "--show-toplevel"])).trim();
     let canonicalTopLevel: string;
     let canonicalWorkspaceRoot: string;
     try {
@@ -903,18 +917,18 @@ export class ControlledPatchService {
   // Any other combination — spawn/IO failures, detached or non-branch HEAD, or a
   // branch that resolves while HEAD does not — fails closed as
   // WORKSPACE_PRECONDITION_FAILED instead of being guessed as unborn.
-  private async detectBase(workspaceRoot: string): Promise<ProposalBase> {
-    const head = await this.gitResult(workspaceRoot, ["rev-parse", "--verify", "--quiet", "HEAD"]);
+  private async detectBase(workspaceRoot: string, execute: ValidationGit = this.gitResult.bind(this)): Promise<ProposalBase> {
+    const head = await execute(workspaceRoot, ["rev-parse", "--verify", "--quiet", "HEAD"]);
     if (head.code === 0) {
       const value = head.stdout.trim();
       if (!/^[0-9a-f]{40,64}$/u.test(value)) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
       return { kind: "commit", head: value };
     }
-    const symbolicRef = await this.gitResult(workspaceRoot, ["symbolic-ref", "--quiet", "HEAD"]);
+    const symbolicRef = await execute(workspaceRoot, ["symbolic-ref", "--quiet", "HEAD"]);
     if (symbolicRef.code !== 0) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
     const branch = symbolicRef.stdout.trim();
     if (!/^refs\/heads\/[^\s]+$/u.test(branch)) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
-    const branchHead = await this.gitResult(workspaceRoot, ["rev-parse", "--verify", "--quiet", branch]);
+    const branchHead = await execute(workspaceRoot, ["rev-parse", "--verify", "--quiet", branch]);
     if (branchHead.code === 0) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
     return { kind: "unborn" };
   }
