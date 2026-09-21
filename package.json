@@ -25,6 +25,7 @@
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "test": "npm run build && node --test \"dist/tests/unit/**/*.test.js\"",
     "mcp:stdio": "node dist/src/mcp-stdio.js",
+    "dashboard": "node dist/src/dashboard.js",
     "prepack": "npm run build"
   },
   "keywords": [
