@@ -9,6 +9,7 @@ import { z } from "zod";
 
 import { CodexExecutor } from "./executors/codex-executor.js";
 import { DshExecutor } from "./executors/dsh-executor.js";
+import { startObservationProducer } from "./observability/producer-heartbeat.js";
 import { VERSION } from "./version.js";
 import { CoreError, serializeError } from "./core/errors.js";
 import { CODEX_ROUTING_POLICY_ENV, parseCodexRoutingPolicy } from "./core/codex-routing-policy.js";
@@ -206,9 +207,14 @@ async function main(): Promise<void> {
     return validationRuns;
   };
 
+  let observationProducer: ReturnType<typeof startObservationProducer> | undefined;
+  let observationsStopped = false;
   // Transport EOF/caller cancellation does not own the validation lifecycle.
   // Natural exit releases the owner after active work drains; OS shutdown aborts it.
   const stop = async (reason: "bridge_shutdown" | "bridge_sigterm") => {
+    observationsStopped = true;
+    try { observationProducer?.stop(); }
+    catch { /* Observation shutdown is independent of validation ownership. */ }
     try { await validationRuns?.shutdown(reason); }
     catch (error) {
       process.stderr.write(JSON.stringify(validationError(error)) + "\n");
@@ -482,6 +488,15 @@ async function main(): Promise<void> {
   });
 
   await server.connect(new StdioServerTransport());
+  if (!observationsStopped) {
+    try {
+      observationProducer = startObservationProducer(
+        configPath,
+        [...workspaceEntries, ...catalog.entries(), ...projectRootEntries].map(({ root }) => root),
+        VERSION,
+      );
+    } catch { /* Observation startup must never change MCP availability. */ }
+  }
 }
 
 main().catch((error: unknown) => {
