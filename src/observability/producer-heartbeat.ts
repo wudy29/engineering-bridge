@@ -7,9 +7,14 @@ export function startProducerHeartbeat(
   publisher: ObservationPublisher,
   producerId: string,
   bridgeVersion: string,
-): { stop(): void } {
+): ObservationPublisher {
   let timer: NodeJS.Timeout | undefined;
   let stopped = false;
+  const publish: ObservationPublisher["publish"] = observation => {
+    if (stopped) return;
+    try { publisher.publish(observation); }
+    catch { /* Observation admission is best effort, including heartbeat samples. */ }
+  };
   const stop = (): void => {
     if (stopped) return;
     stopped = true;
@@ -20,16 +25,12 @@ export function startProducerHeartbeat(
     const metadata = {
       pid: process.pid, bridge_version: bridgeVersion, started_at: new Date().toISOString(),
     };
-    const sample = (): void => {
-      if (stopped) return;
-      try { publisher.publish({ kind: "producer", record_id: producerId, metadata }); }
-      catch { /* Even a failing optional publisher must not escape a timer. */ }
-    };
+    const sample = (): void => publish({ kind: "producer", record_id: producerId, metadata });
     sample();
     timer = setInterval(sample, 5000);
     timer.unref();
   } catch { stop(); }
-  return { stop };
+  return { publish, stop };
 }
 
 /** Called only after MCP connect. Construction performs no filesystem I/O. */
@@ -37,7 +38,7 @@ export function startObservationProducer(
   configPath: string,
   protectedRoots: readonly string[],
   bridgeVersion: string,
-): { stop(): void } {
+): ObservationPublisher {
   let publisher: ObservationPublisher | undefined;
   try {
     const producerId = randomUUID();
@@ -46,6 +47,6 @@ export function startObservationProducer(
     return startProducerHeartbeat(publisher, producerId, bridgeVersion);
   } catch {
     try { publisher?.stop(); } catch { /* Optional startup only. */ }
-    return { stop(): void {} };
+    return { publish(): void {}, stop(): void {} };
   }
 }

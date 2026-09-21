@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 
 import type { ObservationEnvelope } from "../../src/observability/observation-publisher.js";
 import { VERSION } from "../../src/version.js";
@@ -23,19 +24,22 @@ const expectedTools = [
 ].sort();
 const bridge = new URL("../../src/mcp-stdio.js", import.meta.url);
 const store = new URL("../../src/observability/observation-store.js", import.meta.url);
+const dsh = new URL("../../src/executors/dsh-executor.js", import.meta.url);
 
-test("optional observation failures/stalls preserve the full tool catalog and EOF exit status", { timeout: 30_000 }, async t => {
+test("real run_task observations preserve outcomes, the full tool catalog and EOF exit status across sink failures", { timeout: 30_000 }, async t => {
   const root = await fs.realpath(await fs.mkdtemp(join(tmpdir(), "bridge-mcp-observation-")));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "workspace");
+  await fs.mkdir(workspace);
   let baseline: unknown;
   for (const mode of ["normal", "blocked", "rejected", "stalled", "timer-failure"] as const) {
     const config = join(root, mode + ".json");
     const directory = config + ".observations";
     const entered = join(root, mode + ".entered");
-    await fs.writeFile(config, "[]");
+    await fs.writeFile(config, JSON.stringify([{ id: "workspace", root: workspace }]));
     if (mode === "blocked") await fs.writeFile(directory, "occupied");
-    // Preload only in this fixture's child. Never replace Bridge execution services.
-    const injection = mode === "rejected" || mode === "stalled"
+    // Preload only in this fixture's child; the MCP handler and task service stay real.
+    const observationInjection = mode === "rejected" || mode === "stalled"
       ? `import { ObservationStore } from ${JSON.stringify(store.href)};
          import { writeFileSync } from "node:fs";
          ObservationStore.prototype.write = () => {
@@ -50,6 +54,11 @@ test("optional observation failures/stalls preserve the full tool catalog and EO
              return original(callback, delay, ...args);
            };`
         : "";
+    const injection = `
+      import { DshExecutor } from ${JSON.stringify(dsh.href)};
+      DshExecutor.prototype.execute = async () => ({ kind: "completed", output: "fixture review output" });
+      ${observationInjection}
+    `;
     const child = spawn(process.execPath, [
       "--import", "data:text/javascript," + encodeURIComponent(injection),
       fileURLToPath(bridge), config,
@@ -89,6 +98,52 @@ test("optional observation failures/stalls preserve the full tool catalog and EO
           catch { return false; }
         });
       }
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const response = await client.request({
+          method: "tools/call", params: { name, arguments: args }
+        }, CallToolResultSchema);
+        assert.notEqual(response.isError, true);
+        const text = response.content.find(item => item.type === "text");
+        assert.ok(text?.type === "text");
+        return JSON.parse(text.text) as Record<string, unknown>;
+      };
+      const { task_id: taskId } = await call("run_task", {
+        workspace_id: "workspace", instruction: "private instruction", executor: "dsh"
+      });
+      assert.equal(typeof taskId, "string");
+      await until(async () => {
+        const view = await call("task_result", { task_id: taskId });
+        if (view.state !== "waiting_for_supervisor_review") return false;
+        assert.equal(view.review_output, "fixture review output");
+        return true;
+      });
+      if (mode === "normal") {
+        let taskRecords: ObservationEnvelope[] = [];
+        await until(async () => {
+          const names = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
+          taskRecords = await Promise.all(names.map(async name =>
+            JSON.parse(await fs.readFile(join(directory, name), "utf8")) as ObservationEnvelope));
+          return taskRecords.some(record => record.kind === "task" && record.record_id === taskId &&
+            record.metadata.state === "waiting_for_supervisor_review");
+        });
+        const taskRecord = taskRecords.find(record => record.kind === "task" && record.record_id === taskId);
+        assert.ok(taskRecord);
+        assert.equal(taskRecord.record_id, taskId);
+        assert.deepEqual(taskRecord.metadata, {
+          task_id: taskId, state: "waiting_for_supervisor_review", executor: "dsh",
+          requested_model: null, requested_reasoning_effort: null,
+          created_at: taskRecord.metadata.created_at, started_at: taskRecord.metadata.started_at,
+          ended_at: null
+        });
+        for (const field of ["created_at", "started_at"]) {
+          const value: unknown = taskRecord.metadata[field];
+          assert.equal(typeof value, "string");
+          assert.equal(new Date(value as string).toISOString(), value);
+        }
+        assert.ok(String(taskRecord.metadata.started_at) >= String(taskRecord.metadata.created_at));
+        assert.equal((await fs.readdir(directory)).filter(name => name.endsWith(".json")).length, 2);
+      }
+      assert.deepEqual(await client.listTools(), baseline, mode);
       // This tests normal finite filesystem I/O and an unresolved sink promise.
       // It does not claim that Node can cancel a blocked kernel filesystem request.
       await client.close();

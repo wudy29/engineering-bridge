@@ -98,3 +98,61 @@ test("publisher and timer startup failures cannot escape producer startup or sto
   assert.doesNotThrow(() => { producer.stop(); producer.stop(); });
   assert.equal(stops, 1);
 });
+
+test("observation producer forwards task snapshots synchronously and preserves heartbeat and stop", async t => {
+  const seen: ObservationEnvelope[] = [];
+  let tick!: () => void;
+  let unrefs = 0;
+  let clears = 0;
+  const timer = { unref() { unrefs++; return this; } } as NodeJS.Timeout;
+  t.mock.method(globalThis, "setInterval", (callback: () => void, delay: number) => {
+    assert.equal(delay, 5000);
+    tick = callback;
+    return timer;
+  });
+  t.mock.method(globalThis, "clearInterval", (handle: NodeJS.Timeout) => {
+    assert.equal(handle, timer);
+    clears++;
+  });
+  t.mock.method(ObservationStore.prototype, "write", async (text: string) => {
+    seen.push(JSON.parse(text));
+  });
+  const producer = startObservationProducer("unused", [], "test");
+  t.after(() => producer.stop());
+  const observation = { kind: "task", record_id: "task-1", metadata: { task_id: "task-1", state: "queued" } };
+  assert.equal(producer.publish(observation), undefined);
+  assert.equal(seen.length, 0, "publication only admits; persistence is deferred");
+  await turn();
+  await turn();
+  assert.deepEqual(seen.map(x => x.kind), ["producer", "task"]);
+  assert.equal(seen[1]!.producer_id, seen[0]!.producer_id);
+  assert.equal(seen[1]!.record_id, observation.record_id);
+  assert.deepEqual(seen[1]!.metadata, observation.metadata);
+  tick();
+  await turn();
+  assert.deepEqual(seen.map(x => x.sequence), [1, 2, 3]);
+  assert.equal(seen[2]!.kind, "producer");
+  assert.deepEqual(seen[2]!.metadata, seen[0]!.metadata);
+  assert.equal(unrefs, 1);
+  producer.stop();
+  producer.stop();
+  producer.publish(observation);
+  tick();
+  await turn();
+  assert.equal(seen.length, 3);
+  assert.equal(clears, 1);
+});
+
+test("exposed publish isolates callback failures while heartbeat is active", t => {
+  let attempts = 0;
+  const producer = startProducerHeartbeat({
+    publish() { attempts++; throw new Error("publisher unavailable"); },
+    stop() { throw new Error("stop unavailable"); }
+  }, "p", "test");
+  t.after(() => producer.stop());
+  assert.doesNotThrow(() => producer.publish({ kind: "task", record_id: "t", metadata: {} }));
+  assert.equal(attempts, 2);
+  assert.doesNotThrow(() => producer.stop());
+  producer.publish({ kind: "task", record_id: "t", metadata: {} });
+  assert.equal(attempts, 2);
+});

@@ -151,6 +151,7 @@ async function main(): Promise<void> {
     catalog,
     projectRootEntries.map(({ root }) => root)
   );
+  let observationProducer: ReturnType<typeof startObservationProducer> | undefined;
   const service = new RegisteredWorkspaceTaskService(
     registry,
     (executor, workspaceRoot) => {
@@ -158,7 +159,8 @@ async function main(): Promise<void> {
         case "codex": return new CodexExecutor(workspaceRoot, undefined, undefined, undefined, undefined, codexRoutingPolicy);
         case "dsh": return new DshExecutor(workspaceRoot);
       }
-    }
+    },
+    { publishObservation: observation => { observationProducer?.publish(observation); } }
   );
   const controlledPatches = new ControlledPatchService(
     registry,
@@ -207,7 +209,6 @@ async function main(): Promise<void> {
     return validationRuns;
   };
 
-  let observationProducer: ReturnType<typeof startObservationProducer> | undefined;
   let observationsStopped = false;
   // Transport EOF/caller cancellation does not own the validation lifecycle.
   // Natural exit releases the owner after active work drains; OS shutdown aborts it.

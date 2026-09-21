@@ -13,6 +13,7 @@ import type { Executor, ExecutorRequest, ExecutorResult } from "../../../src/exe
 import { CodexExecutor } from "../../../src/executors/codex-executor.js";
 import type { ProcessStarter } from "../../../src/executors/codex-executor.js";
 import { DshExecutor } from "../../../src/executors/dsh-executor.js";
+import type { ObservationWrite } from "../../../src/observability/observation-publisher.js";
 import { RegisteredWorkspaceTaskService } from "../../../src/tasks/registered-workspace-task-service.js";
 import { RegisteredWorkspaceRegistry } from "../../../src/workspaces/registered-workspace-registry.js";
 
@@ -1290,3 +1291,174 @@ for (const kind of ["completed", "failed", "interrupted"] as const) {
     assert.equal(view?.state, kind === "completed" ? "completed" : "failed");
   });
 }
+
+test("interactive observations follow authoritative lifecycle, diagnostics, continuation and acceptance", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-09-21T00:00:00Z") });
+  const seen: ObservationWrite[] = [];
+  const turns = [deferred<ExecutorResult>(), deferred<ExecutorResult>()];
+  const requests: ExecutorRequest[] = [];
+  const executor: Executor = {
+    execute(request) { requests.push(request); return turns[requests.length - 1]!.promise; },
+    steer: async () => {},
+    interrupt: async () => {}
+  };
+  const service = new RegisteredWorkspaceTaskService(registry(), () => executor, {
+    publishObservation: observation => { seen.push(observation); }
+  });
+  const { taskId } = service.startTask({
+    workspace_id: "known", instruction: "private instruction",
+    model: "requested-model", reasoning_effort: "high"
+  });
+  const initial = {
+    task_id: taskId, state: "queued", executor: "codex",
+    requested_model: "requested-model", requested_reasoning_effort: "high",
+    created_at: "2026-09-21T00:00:00.000Z", started_at: null, ended_at: null
+  };
+  assert.deepEqual(seen, [{ kind: "task", record_id: taskId, metadata: initial }]);
+
+  t.mock.timers.tick(1000);
+  await Promise.resolve();
+  const running = { ...initial, state: "running", started_at: "2026-09-21T00:00:01.000Z" };
+  assert.deepEqual(seen[1]!.metadata, running);
+  const progress = {
+    executor_started_at: "2026-09-21T00:00:01.000Z",
+    last_activity_at: "2026-09-21T00:00:02.000Z",
+    protocol_phase: "turn/start", upstream_error_message: "private upstream detail"
+  };
+  t.mock.timers.tick(1000);
+  requests[0]!.onDiagnostics!(progress);
+  assert.deepEqual(service.taskView(taskId)?.diagnostics, progress);
+  assert.equal(service.taskView(taskId)?.state, "running");
+  assert.deepEqual(seen[2]!.metadata, {
+    ...running, last_reported_activity_at: progress.last_activity_at
+  });
+  assert.equal(service.result(taskId), undefined);
+  await service.controlTask(taskId, "steer", "private steer");
+  await service.controlTask(taskId, "interrupt");
+  assert.equal(seen.length, 3, "control requests alone do not fabricate transitions");
+
+  t.mock.timers.tick(1000);
+  const diagnostics = {
+    ...progress, executor_ended_at: "2026-09-21T00:00:03.000Z",
+    last_activity_at: "2026-09-21T00:00:03.000Z"
+  };
+  turns[0]!.resolve({
+    kind: "completed", output: "private review output", threadId: "native-thread",
+    diagnostics, evidence: [{ id: "e", type: "commandExecution", status: "completed", command: "private command" }]
+  });
+  await waitForInteractiveReady(service, taskId);
+  const review = {
+    ...running, state: "waiting_for_supervisor_review", thread_id: "native-thread",
+    last_reported_activity_at: diagnostics.last_activity_at
+  };
+  assert.deepEqual(seen[3]!.metadata, review);
+  assert.equal(service.taskView(taskId)?.review_output, "private review output");
+  assert.equal(service.taskView(taskId)?.output, undefined);
+
+  t.mock.timers.tick(1000);
+  const continuing = service.controlTask(taskId, "continue", "private continuation");
+  assert.deepEqual(seen[4]!.metadata, {
+    ...running, state: "queued", thread_id: "native-thread"
+  });
+  await continuing;
+  assert.deepEqual(seen[5]!.metadata, { ...running, thread_id: "native-thread" });
+  assert.equal(requests[1]!.threadId, "native-thread");
+
+  t.mock.timers.tick(1000);
+  turns[1]!.resolve({ kind: "completed", output: "final output" });
+  await waitForInteractiveReady(service, taskId);
+  assert.deepEqual(seen[6]!.metadata, {
+    ...running, state: "waiting_for_supervisor_review", thread_id: "native-thread"
+  });
+  t.mock.timers.tick(1000);
+  await service.controlTask(taskId, "accept");
+  assert.deepEqual(seen[7]!.metadata, {
+    ...running, state: "completed", thread_id: "native-thread",
+    ended_at: "2026-09-21T00:00:06.000Z"
+  });
+  assert.equal(service.taskView(taskId)?.output, "final output");
+  assert.deepEqual(seen.map(x => x.metadata.state), [
+    "queued", "running", "running", "waiting_for_supervisor_review",
+    "queued", "running", "waiting_for_supervisor_review", "completed"
+  ]);
+  for (const snapshot of seen) {
+    assert.equal(snapshot.kind, "task");
+    assert.equal(snapshot.record_id, taskId);
+    assert.equal(snapshot.metadata.created_at, initial.created_at);
+  }
+  assert.deepEqual(seen[0]!.metadata, initial, "earlier snapshots are not mutated");
+});
+
+for (const outcome of ["completed", "failed", "interrupted", "catch"] as const) {
+  test(`interactive ${outcome} observations survive a throwing publisher and omit unavailable DSH fields`, async t => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-09-21T01:00:00Z") });
+    const pending = deferred<ExecutorResult>();
+    const seen: ObservationWrite[] = [];
+    const service = new RegisteredWorkspaceTaskService(registry(), () => ({
+      async execute() {
+        const result = await pending.promise;
+        if (outcome === "catch") throw new Error("private upstream exception");
+        return result;
+      }
+    }), {
+      publishObservation(observation) {
+        seen.push(observation);
+        throw new Error("observation unavailable");
+      }
+    });
+    const { taskId } = service.startTask({
+      workspace_id: "known", instruction: "private instruction", executor: "dsh"
+    });
+    t.mock.timers.tick(1000);
+    await Promise.resolve();
+    t.mock.timers.tick(1000);
+    pending.resolve(outcome === "failed"
+      ? { kind: "failed", error: { code: "DSH_EXECUTION_FAILED", message: "private upstream error" } }
+      : { kind: outcome === "interrupted" ? "interrupted" : "completed", output: "private output" });
+    await waitForInteractiveReady(service, taskId);
+    const state = outcome === "completed" ? "waiting_for_supervisor_review" : "failed";
+    assert.equal(service.taskView(taskId)?.state, state);
+    const safeError = outcome === "completed" ? undefined
+      : outcome === "failed" ? { code: "DSH_EXECUTION_FAILED", message: "DSH execution failed." }
+      : outcome === "interrupted" ? { code: "TASK_INTERRUPTED", message: "The task was interrupted." }
+      : { code: "INTERNAL_ERROR", message: "The request could not be completed." };
+    const base = {
+      task_id: taskId, executor: "dsh", requested_model: null, requested_reasoning_effort: null,
+      created_at: "2026-09-21T01:00:00.000Z"
+    };
+    assert.deepEqual(seen.map(x => x.metadata), [
+      { ...base, state: "queued", started_at: null, ended_at: null },
+      { ...base, state: "running", started_at: "2026-09-21T01:00:01.000Z", ended_at: null },
+      {
+        ...base, state, started_at: "2026-09-21T01:00:01.000Z",
+        ended_at: safeError ? "2026-09-21T01:00:02.000Z" : null,
+        ...(safeError ? { error_code: safeError.code, error_summary: safeError.message } : {})
+      }
+    ]);
+    if (outcome === "completed") {
+      assert.equal(service.taskView(taskId)?.review_output, "private output");
+      await service.controlTask(taskId, "accept");
+      assert.equal(service.taskView(taskId)?.state, "completed");
+      assert.equal(service.taskView(taskId)?.output, "private output");
+      assert.equal(seen[3]!.metadata.ended_at, "2026-09-21T01:00:02.000Z");
+    } else {
+      assert.equal(service.taskView(taskId)?.error?.code, safeError!.code);
+      assert.equal(service.taskView(taskId)?.partial_output, outcome === "interrupted" ? "private output" : undefined);
+    }
+    for (const snapshot of seen) {
+      assert.equal(snapshot.kind, "task");
+      assert.equal(snapshot.record_id, taskId);
+    }
+  });
+}
+
+test("legacy and submitted patch tasks do not publish interactive task observations", async () => {
+  const seen: ObservationWrite[] = [];
+  const service = new RegisteredWorkspaceTaskService(registry(), () => ({
+    execute: async () => ({ kind: "completed", output: "legacy output" })
+  }), { publishObservation: observation => { seen.push(observation); } });
+  const { taskId } = service.runTask({ workspace_id: "known", instruction: "inspect" });
+  await waitForTerminal(service, taskId);
+  service.submitControlledPatchTask("private diff", true);
+  assert.deepEqual(seen, []);
+});
