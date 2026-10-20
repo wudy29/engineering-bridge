@@ -18,6 +18,12 @@ const TASK_ID_VALUE = "550e8400-e29b-41d4-a716-446655440000";
 if (!isId(TASK_ID_VALUE)) throw new Error("Test task ID must be a UUID v4.");
 const TASK_ID = TASK_ID_VALUE;
 const TRUSTED_CWD = "/trusted/workspace";
+// Injecting "linux"/"darwin" does not give Windows POSIX paths or execute bits.
+const nativePosixFilesystem = {
+  skip: process.platform === "win32"
+    ? "Requires native POSIX PATH parsing and executable permission semantics."
+    : false
+};
 const SHORT_TIMING = {
   executionTimeoutMs: 30,
   interruptGraceMs: 10,
@@ -1207,6 +1213,7 @@ test("win32: no resolvable command keeps the original bare spawn (which maps to 
   assert.deepEqual(invocation.args, ["app-server", "--stdio"]);
 });
 
+// This checks platform branch selection, not POSIX PATH or execute-bit semantics.
 test("POSIX: a Windows-style codex.exe layout on PATH does not change the bare spawn", async () => {
   const dir = windowsDirectory();
   writeFileSync(join(dir, "codex.exe"), "");
@@ -1253,7 +1260,7 @@ function executableFile(...segments: string[]): string {
   return path;
 }
 
-test("POSIX: an executable codex on PATH keeps the bare spawn even when a HOME fallback exists", async () => {
+test("POSIX: an executable codex on PATH keeps the bare spawn even when a HOME fallback exists", nativePosixFilesystem, async () => {
   const pathDir = posixDirectory();
   executableFile(pathDir, "codex");
   const home = posixDirectory();
@@ -1273,7 +1280,7 @@ test("POSIX: an executable codex on PATH keeps the bare spawn even when a HOME f
   assert.equal(invocation.options.shell, false);
 });
 
-test("POSIX: a PATH miss spawns $HOME/.local/bin/codex by absolute path", async () => {
+test("POSIX: a PATH miss spawns $HOME/.local/bin/codex by absolute path", nativePosixFilesystem, async () => {
   const home = posixDirectory();
   const fallback = executableFile(home, ".local", "bin", "codex");
   const invocations: Invocation[] = [];
@@ -1292,19 +1299,15 @@ test("POSIX: a PATH miss spawns $HOME/.local/bin/codex by absolute path", async 
   assert.equal(invocation.options.shell, false);
 });
 
-test("POSIX: an absent, non-executable or directory fallback keeps the bare spawn", async () => {
-  for (const layout of ["absent", "non-executable", "directory"] as const) {
+// An empty PATH isolates portable fallback guards from host-specific PATH syntax.
+test("POSIX: an absent or directory fallback keeps the bare spawn", async () => {
+  for (const layout of ["absent", "directory"] as const) {
     const home = posixDirectory();
-    if (layout === "non-executable") {
-      mkdirSync(join(home, ".local", "bin"), { recursive: true });
-      writeFileSync(join(home, ".local", "bin", "codex"), "");
-      chmodSync(join(home, ".local", "bin", "codex"), 0o644);
-    }
     if (layout === "directory") mkdirSync(join(home, ".local", "bin", "codex"), { recursive: true });
     const invocations: Invocation[] = [];
     const executor = new CodexExecutor(TRUSTED_CWD,
       fakeStarter({ appServerOutput: "final answer" }, invocations),
-      { PATH: posixDirectory(), HOME: home }, "linux");
+      { PATH: "", HOME: home }, "linux");
 
     await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
 
@@ -1313,11 +1316,27 @@ test("POSIX: an absent, non-executable or directory fallback keeps the bare spaw
   }
 });
 
+test("POSIX: a non-executable fallback keeps the bare spawn", nativePosixFilesystem, async () => {
+  const home = posixDirectory();
+  mkdirSync(join(home, ".local", "bin"), { recursive: true });
+  writeFileSync(join(home, ".local", "bin", "codex"), "");
+  chmodSync(join(home, ".local", "bin", "codex"), 0o644);
+  const invocations: Invocation[] = [];
+  const executor = new CodexExecutor(TRUSTED_CWD,
+    fakeStarter({ appServerOutput: "final answer" }, invocations),
+    { PATH: "", HOME: home }, "linux");
+
+  await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+
+  assert.equal(invocations[0]?.executable, "codex", "non-executable");
+  assert.deepEqual(invocations[0]?.args, ["app-server", "--stdio"], "non-executable");
+});
+
 test("POSIX: without HOME the fallback is never applied and the bare spawn is kept", async () => {
   const invocations: Invocation[] = [];
   const executor = new CodexExecutor(TRUSTED_CWD,
     fakeStarter({ appServerOutput: "final answer" }, invocations),
-    { PATH: posixDirectory() }, "linux");
+    { PATH: "" }, "linux");
 
   await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
 

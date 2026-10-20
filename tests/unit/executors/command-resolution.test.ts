@@ -11,6 +11,12 @@ import type { ResolveCommandOptions } from "../../../src/executors/command-resol
 
 const CODEX_NODE_TARGET = ["@openai", "codex", "bin", "codex.js"];
 const DSH_NODE_TARGET = ["@deepseek-ai", "dsh", "lib", "bin.js"];
+// Injecting "linux"/"darwin" does not give Windows POSIX paths or execute bits.
+const nativePosixFilesystem = {
+  skip: process.platform === "win32"
+    ? "Requires native POSIX PATH parsing and executable permission semantics."
+    : false
+};
 
 function directory(): string {
   return mkdtempSync(join(tmpdir(), "bridge-win-resolve-"));
@@ -45,6 +51,7 @@ function resolvePosix(host: Record<string, string>, command: string, options: Re
   return resolveCommand(host, command, { platform: "darwin", ...options });
 }
 
+// This checks platform branch selection, not POSIX PATH or execute-bit semantics.
 test("non-Windows platforms without a fallback resolve to the bare command (POSIX unchanged)", () => {
   const dir = directory();
   touch(dir, "codex.exe");
@@ -192,7 +199,7 @@ test("commands with path separators are never searched", () => {
 
 const CODEX_HOME_FALLBACK = [".local", "bin", "codex"];
 
-test("POSIX: an executable codex on an absolute PATH entry stays bare even with a valid fallback", () => {
+test("POSIX: an executable codex on an absolute PATH entry stays bare even with a valid fallback", nativePosixFilesystem, () => {
   const pathDir = directory();
   executable(pathDir, "codex");
   const home = directory();
@@ -205,7 +212,7 @@ test("POSIX: an executable codex on an absolute PATH entry stays bare even with 
   assert.deepEqual(result, { kind: "bare" });
 });
 
-test("POSIX: a PATH miss plus an executable HOME fallback becomes a direct absolute command", () => {
+test("POSIX: a PATH miss plus an executable HOME fallback becomes a direct absolute command", nativePosixFilesystem, () => {
   const home = directory();
   const fallback = executable(home, ".local", "bin", "codex");
 
@@ -217,52 +224,60 @@ test("POSIX: a PATH miss plus an executable HOME fallback becomes a direct absol
   assert.equal(isAbsolute(fallback), true);
 });
 
-test("POSIX: an absent, non-executable or directory fallback stays bare", () => {
+// An empty PATH isolates portable fallback guards from host-specific PATH syntax.
+test("POSIX: an absent or directory fallback stays bare", () => {
   const home = directory();
-  executable(home, ".local", "bin", "codex");
-  nonExecutable(home, "plain", "codex");
+  mkdirSync(join(home, ".local", "bin"), { recursive: true });
 
   assert.deepEqual(
-    resolvePosix({ PATH: directory(), HOME: home }, "codex", {
+    resolvePosix({ PATH: "", HOME: home }, "codex", {
       homeRelativeFallback: [".local", "bin", "missing"]
     }),
     { kind: "bare" }
   );
   assert.deepEqual(
-    resolvePosix({ PATH: directory(), HOME: home }, "codex", { homeRelativeFallback: ["plain", "codex"] }),
+    resolvePosix({ PATH: "", HOME: home }, "codex", { homeRelativeFallback: [".local", "bin"] }),
     { kind: "bare" }
   );
+});
+
+test("POSIX: a non-executable fallback stays bare", nativePosixFilesystem, () => {
+  const home = directory();
+  nonExecutable(home, "plain", "codex");
+
   assert.deepEqual(
-    resolvePosix({ PATH: directory(), HOME: home }, "codex", { homeRelativeFallback: [".local", "bin"] }),
+    resolvePosix({ PATH: "", HOME: home }, "codex", { homeRelativeFallback: ["plain", "codex"] }),
     { kind: "bare" }
   );
 });
 
 test("POSIX: no HOME, no opt-in or an empty opt-in keeps the historical bare result", () => {
   const home = directory();
+  // This fixture exercises guards, not execute permissions. Keep it executable
+  // on POSIX so an incorrectly applied fallback would still fail the assertions.
   executable(home, ".local", "bin", "codex");
 
   assert.deepEqual(
-    resolvePosix({ PATH: directory() }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
+    resolvePosix({ PATH: "" }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
     { kind: "bare" }
   );
   assert.deepEqual(
-    resolvePosix({ PATH: directory(), HOME: "" }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
+    resolvePosix({ PATH: "", HOME: "" }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
     { kind: "bare" }
   );
   assert.deepEqual(
-    resolvePosix({ PATH: directory(), HOME: "relative-home" }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
+    resolvePosix({ PATH: "", HOME: "relative-home" }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
     { kind: "bare" }
   );
   // Executors that never pass the option keep the historical behavior.
-  assert.deepEqual(resolvePosix({ PATH: directory(), HOME: home }, "codex"), { kind: "bare" });
+  assert.deepEqual(resolvePosix({ PATH: "", HOME: home }, "codex"), { kind: "bare" });
   assert.deepEqual(
-    resolvePosix({ PATH: directory(), HOME: home }, "codex", { homeRelativeFallback: [] }),
+    resolvePosix({ PATH: "", HOME: home }, "codex", { homeRelativeFallback: [] }),
     { kind: "bare" }
   );
 });
 
-test("POSIX: a non-executable file or a relative PATH entry never satisfies PATH", () => {
+test("POSIX: a non-executable file or a relative PATH entry never satisfies PATH", nativePosixFilesystem, () => {
   const home = directory();
   const fallback = executable(home, ".local", "bin", "codex");
   const nonExecutableOnPath = directory();
@@ -286,7 +301,7 @@ test("POSIX: command names containing path separators are never resolved", () =>
   const home = directory();
   executable(home, ".local", "bin", "codex");
   assert.deepEqual(
-    resolvePosix({ PATH: directory(), HOME: home }, "bin/codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
+    resolvePosix({ PATH: "", HOME: home }, "bin/codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
     { kind: "bare" }
   );
 });
