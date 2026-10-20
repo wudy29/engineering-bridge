@@ -25,6 +25,17 @@ export interface ExecutorRequest {
   readonly onDiagnostics?: (diagnostics: ExecutorProgressDiagnostics) => void;
 }
 
+export interface ExecutorErrorNotificationSummary {
+  readonly observed_at: string;
+  readonly scope: "active_turn" | "unattributed";
+  readonly will_retry?: boolean;
+}
+
+export interface ExecutorInterruptContext {
+  readonly requested_at: string;
+  readonly last_error_notification?: ExecutorErrorNotificationSummary;
+}
+
 export interface ExecutorDiagnostics {
   readonly executor_started_at: string;
   readonly executor_ended_at: string;
@@ -38,6 +49,8 @@ export interface ExecutorDiagnostics {
   readonly protocol_error_kind?: string;
   readonly upstream_error_code?: number;
   readonly upstream_error_message?: string;
+  readonly last_error_notification?: ExecutorErrorNotificationSummary;
+  readonly interrupt_context?: ExecutorInterruptContext;
 }
 
 export type ExecutorProgressDiagnostics = Omit<ExecutorDiagnostics, "executor_ended_at">;

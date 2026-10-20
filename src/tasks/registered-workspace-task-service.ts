@@ -3,6 +3,7 @@ import { serializeError } from "../core/errors.js";
 import type { Id } from "../core/ids.js";
 import type { SerializedError } from "../core/errors.js";
 import { CoreError } from "../core/errors.js";
+import { dashboardLabelSchema } from "../core/dashboard-label.js";
 import type { Executor, ExecutorDiagnostics, ExecutorProgressDiagnostics, ExecutorEvidence } from "../executors/executor.js";
 import type { ObservationWrite } from "../observability/observation-publisher.js";
 import { RegisteredWorkspaceRegistry } from "../workspaces/registered-workspace-registry.js";
@@ -15,6 +16,7 @@ export interface RegisteredWorkspaceTaskRequest {
   readonly executor?: ExecutorName;
   readonly model?: string;
   readonly reasoning_effort?: string;
+  readonly dashboard_title?: string;
 }
 
 type NormalizedRegisteredWorkspaceTaskRequest = RegisteredWorkspaceTaskRequest & { readonly executor: ExecutorName };
@@ -137,6 +139,7 @@ export class RegisteredWorkspaceTaskService {
     completedOutputTransform?: CompletedOutputTransform,
     terminalTaskHandler?: TerminalTaskHandler
   ): { taskId: Id } {
+    if (request.dashboard_title !== undefined) dashboardLabelSchema.parse(request.dashboard_title);
     if (request.executor === "dsh" && (request.model !== undefined || request.reasoning_effort !== undefined)) throw new CoreError("UNSUPPORTED_ACTION");
     const taskId = newId();
     const normalizedRequest = { ...request, executor: request.executor ?? "codex" };
@@ -216,6 +219,7 @@ export class RegisteredWorkspaceTaskService {
   }
 
   startTask(request: RegisteredWorkspaceTaskRequest): { taskId: Id } {
+    if (request.dashboard_title !== undefined) dashboardLabelSchema.parse(request.dashboard_title);
     if (request.executor === "dsh" && (request.model !== undefined || request.reasoning_effort !== undefined)) throw new CoreError("UNSUPPORTED_ACTION");
     const taskId = newId();
     const normalizedRequest = { ...request, executor: request.executor ?? "codex" };
@@ -349,6 +353,7 @@ export class RegisteredWorkspaceTaskService {
   private publishInteractive(taskId: Id, record: InteractiveRecord): void {
     try {
       if (!this.options.publishObservation) return;
+      const displayName = this.registry.displayName(record.request.workspace_id);
       const error = record.state === "failed" && record.error
         ? serializeError(new CoreError(record.error.code)) : undefined;
       this.options.publishObservation({
@@ -356,6 +361,9 @@ export class RegisteredWorkspaceTaskService {
         record_id: taskId,
         metadata: {
           task_id: taskId,
+          workspace_id: record.request.workspace_id,
+          ...(displayName === undefined ? {} : { workspace_display_name: displayName }),
+          ...(record.request.dashboard_title === undefined ? {} : { dashboard_title: record.request.dashboard_title }),
           state: record.state,
           executor: record.request.executor,
           requested_model: record.request.model ?? null,

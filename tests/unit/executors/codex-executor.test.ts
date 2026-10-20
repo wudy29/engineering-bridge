@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import test from "node:test";
 import type { ChildProcessWithoutNullStreams, SpawnOptionsWithoutStdio } from "node:child_process";
@@ -1235,4 +1235,109 @@ test("win32: a spawned command that does not resolve still maps to CODEX_UNAVAIL
     kind: "failed",
     error: { code: "CODEX_UNAVAILABLE", message: "Codex is unavailable." }
   });
+});
+
+// ---------------------------------------------------------------------------
+// POSIX HOME-relative Codex fallback (platform seam = "darwin"/"linux").
+// ---------------------------------------------------------------------------
+
+function posixDirectory(): string {
+  return mkdtempSync(join(tmpdir(), "bridge-codex-posix-"));
+}
+
+function executableFile(...segments: string[]): string {
+  const path = join(...segments);
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(path, "");
+  chmodSync(path, 0o755);
+  return path;
+}
+
+test("POSIX: an executable codex on PATH keeps the bare spawn even when a HOME fallback exists", async () => {
+  const pathDir = posixDirectory();
+  executableFile(pathDir, "codex");
+  const home = posixDirectory();
+  executableFile(home, ".local", "bin", "codex");
+  const invocations: Invocation[] = [];
+  const executor = new CodexExecutor(TRUSTED_CWD,
+    fakeStarter({ appServerOutput: "final answer" }, invocations),
+    { PATH: pathDir, HOME: home }, "linux");
+
+  const result = await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+
+  assert.equal(result.kind, "completed");
+  const invocation = invocations[0];
+  assert.ok(invocation);
+  assert.equal(invocation.executable, "codex");
+  assert.deepEqual(invocation.args, ["app-server", "--stdio"]);
+  assert.equal(invocation.options.shell, false);
+});
+
+test("POSIX: a PATH miss spawns $HOME/.local/bin/codex by absolute path", async () => {
+  const home = posixDirectory();
+  const fallback = executableFile(home, ".local", "bin", "codex");
+  const invocations: Invocation[] = [];
+  const executor = new CodexExecutor(TRUSTED_CWD,
+    fakeStarter({ appServerOutput: "final answer" }, invocations),
+    { PATH: posixDirectory(), HOME: home }, "darwin");
+
+  const result = await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+
+  assert.equal(result.kind, "completed");
+  const invocation = invocations[0];
+  assert.ok(invocation);
+  assert.equal(invocation.executable, fallback);
+  assert.equal(isAbsolute(fallback), true);
+  assert.deepEqual(invocation.args, ["app-server", "--stdio"]);
+  assert.equal(invocation.options.shell, false);
+});
+
+test("POSIX: an absent, non-executable or directory fallback keeps the bare spawn", async () => {
+  for (const layout of ["absent", "non-executable", "directory"] as const) {
+    const home = posixDirectory();
+    if (layout === "non-executable") {
+      mkdirSync(join(home, ".local", "bin"), { recursive: true });
+      writeFileSync(join(home, ".local", "bin", "codex"), "");
+      chmodSync(join(home, ".local", "bin", "codex"), 0o644);
+    }
+    if (layout === "directory") mkdirSync(join(home, ".local", "bin", "codex"), { recursive: true });
+    const invocations: Invocation[] = [];
+    const executor = new CodexExecutor(TRUSTED_CWD,
+      fakeStarter({ appServerOutput: "final answer" }, invocations),
+      { PATH: posixDirectory(), HOME: home }, "linux");
+
+    await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+
+    assert.equal(invocations[0]?.executable, "codex", layout);
+    assert.deepEqual(invocations[0]?.args, ["app-server", "--stdio"], layout);
+  }
+});
+
+test("POSIX: without HOME the fallback is never applied and the bare spawn is kept", async () => {
+  const invocations: Invocation[] = [];
+  const executor = new CodexExecutor(TRUSTED_CWD,
+    fakeStarter({ appServerOutput: "final answer" }, invocations),
+    { PATH: posixDirectory() }, "linux");
+
+  await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+
+  assert.equal(invocations[0]?.executable, "codex");
+  assert.deepEqual(invocations[0]?.args, ["app-server", "--stdio"]);
+});
+
+test("win32: a HOME/.local/bin/codex fallback is never used", async () => {
+  const home = windowsDirectory();
+  mkdirSync(join(home, ".local", "bin"), { recursive: true });
+  writeFileSync(join(home, ".local", "bin", "codex"), "");
+  const invocations: Invocation[] = [];
+  const executor = new CodexExecutor(TRUSTED_CWD,
+    fakeStarter({ appServerOutput: "final answer" }, invocations),
+    { PATH: windowsDirectory(), HOME: home }, "win32");
+
+  await executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+
+  const invocation = invocations[0];
+  assert.ok(invocation);
+  assert.equal(invocation.executable, "codex");
+  assert.deepEqual(invocation.args, ["app-server", "--stdio"]);
 });

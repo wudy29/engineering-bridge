@@ -432,6 +432,83 @@ test("records an interrupted interactive task as TASK_INTERRUPTED without review
   });
 });
 
+for (const path of ["legacy", "interactive"] as const) {
+  test(`${path} task JSON retains safe pre-interrupt evidence and isolates the next task`, async () => {
+    const started = deferred<void>();
+    const observations: ObservationWrite[] = [];
+    let executions = 0;
+    const service = new RegisteredWorkspaceTaskService(registry(), (_name, workspaceRoot) => {
+      const run = ++executions;
+      const starter: ProcessStarter = () => {
+        const child = new EventEmitter();
+        const stdin = new PassThrough();
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        const send = (value: unknown) => stdout.write(JSON.stringify(value) + "\n");
+        const terminal = (status: string) => send({
+          method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status } }
+        });
+        stdin.on("data", chunk => {
+          const rpc = JSON.parse(chunk.toString()) as { id?: number; method: string };
+          if (rpc.id === undefined) return;
+          queueMicrotask(() => {
+            send({ id: rpc.id, result: rpc.method === "thread/start" ? { thread: { id: "thread-1" } }
+              : rpc.method === "turn/start" ? { turn: { id: "turn-1" } } : {} });
+            if (rpc.method === "turn/interrupt") terminal("interrupted");
+            if (rpc.method !== "turn/start") return;
+            if (run !== 1) { terminal("completed"); return; }
+            send({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } });
+            send({ method: "error", params: {
+              threadId: "thread-1", turnId: "turn-1", willRetry: true,
+              error: { message: "SYNTHETIC_PRIVATE_CANARY", data: "/private/SYNTHETIC_PRIVATE_CANARY" }
+            } });
+            send({ method: "item/completed", params: {
+              threadId: "thread-1", turnId: "turn-1", item: { id: "partial", type: "agentMessage", text: "partial" }
+            } });
+            started.resolve();
+          });
+        });
+        Object.assign(child, { stdin, stdout, stderr, kill: () => true });
+        return child as unknown as ChildProcessWithoutNullStreams;
+      };
+      return new CodexExecutor(workspaceRoot, starter, { PATH: "", HOME: "" }, "linux");
+    }, { publishObservation: observation => { observations.push(observation); } });
+    const input = { workspace_id: "known", instruction: "inspect" };
+    const { taskId } = path === "legacy" ? service.runTask(input) : service.startTask(input);
+    await started.promise;
+    const live = service.taskView(taskId)?.diagnostics;
+    assert.ok(live && live.executor_started_at !== undefined);
+    assert.equal(live.last_error_notification?.scope, "active_turn");
+    await service.controlTask(taskId, "interrupt");
+    if (path === "legacy") await waitForTerminal(service, taskId);
+    else await waitForInteractiveReady(service, taskId);
+    const view = service.taskView(taskId)!;
+    const json = JSON.stringify(view);
+    const decoded = JSON.parse(json) as typeof view;
+    assert.equal(decoded.state, "failed");
+    assert.equal(decoded.error?.code, "TASK_INTERRUPTED");
+    assert.equal(decoded.partial_output, "partial");
+    assert.equal(decoded.output, undefined);
+    assert.equal(decoded.review_output, undefined);
+    const retained = decoded.diagnostics;
+    assert.ok(retained && retained.executor_started_at !== undefined);
+    assert.equal(retained.last_valid_method, "turn/completed");
+    assert.equal(retained.last_error_notification?.will_retry, true);
+    assert.deepEqual(retained.interrupt_context?.last_error_notification, retained.last_error_notification);
+    assert.equal(typeof retained.interrupt_context?.requested_at, "string");
+    assert.doesNotMatch(json, /SYNTHETIC_PRIVATE_CANARY/);
+    assert.doesNotMatch(JSON.stringify(observations), /last_error_notification|interrupt_context|SYNTHETIC_PRIVATE_CANARY/);
+    const next = path === "legacy" ? service.runTask(input) : service.startTask(input);
+    if (path === "legacy") await waitForTerminal(service, next.taskId);
+    else await waitForInteractiveReady(service, next.taskId);
+    const nextDiagnostics = service.taskView(next.taskId)?.diagnostics;
+    assert.ok(nextDiagnostics && nextDiagnostics.executor_started_at !== undefined);
+    assert.equal(nextDiagnostics.last_error_notification, undefined);
+    assert.equal(nextDiagnostics.interrupt_context, undefined);
+    assert.deepEqual(service.taskView(taskId)?.diagnostics, decoded.diagnostics);
+  });
+}
+
 test("records an interrupted DSH interactive task as TASK_INTERRUPTED, not DSH_EXECUTION_FAILED", async () => {
   let executorName: "codex" | "dsh" | undefined;
   const executor: Executor = { execute: async () => ({ kind: "interrupted", output: "partial" }) };
@@ -1311,6 +1388,7 @@ test("interactive observations follow authoritative lifecycle, diagnostics, cont
   });
   const initial = {
     task_id: taskId, state: "queued", executor: "codex",
+    workspace_id: "known", workspace_display_name: "root",
     requested_model: "requested-model", requested_reasoning_effort: "high",
     created_at: "2026-09-21T00:00:00.000Z", started_at: null, ended_at: null
   };
@@ -1323,7 +1401,10 @@ test("interactive observations follow authoritative lifecycle, diagnostics, cont
   const progress = {
     executor_started_at: "2026-09-21T00:00:01.000Z",
     last_activity_at: "2026-09-21T00:00:02.000Z",
-    protocol_phase: "turn/start", upstream_error_message: "private upstream detail"
+    protocol_phase: "turn/start", upstream_error_message: "private upstream detail",
+    last_error_notification: Object.freeze({
+      observed_at: "2026-09-21T00:00:02.000Z", scope: "active_turn" as const, will_retry: true
+    })
   };
   t.mock.timers.tick(1000);
   requests[0]!.onDiagnostics!(progress);
@@ -1357,6 +1438,7 @@ test("interactive observations follow authoritative lifecycle, diagnostics, cont
 
   t.mock.timers.tick(1000);
   const continuing = service.controlTask(taskId, "continue", "private continuation");
+  assert.equal(service.taskView(taskId)?.diagnostics, undefined);
   assert.deepEqual(seen[4]!.metadata, {
     ...running, state: "queued", thread_id: "native-thread"
   });
@@ -1377,6 +1459,7 @@ test("interactive observations follow authoritative lifecycle, diagnostics, cont
     ended_at: "2026-09-21T00:00:06.000Z"
   });
   assert.equal(service.taskView(taskId)?.output, "final output");
+  assert.equal(service.taskView(taskId)?.diagnostics, undefined);
   assert.deepEqual(seen.map(x => x.metadata.state), [
     "queued", "running", "running", "waiting_for_supervisor_review",
     "queued", "running", "waiting_for_supervisor_review", "completed"
@@ -1424,6 +1507,7 @@ for (const outcome of ["completed", "failed", "interrupted", "catch"] as const) 
       : { code: "INTERNAL_ERROR", message: "The request could not be completed." };
     const base = {
       task_id: taskId, executor: "dsh", requested_model: null, requested_reasoning_effort: null,
+      workspace_id: "known", workspace_display_name: "root",
       created_at: "2026-09-21T01:00:00.000Z"
     };
     assert.deepEqual(seen.map(x => x.metadata), [
@@ -1460,5 +1544,46 @@ test("legacy and submitted patch tasks do not publish interactive task observati
   const { taskId } = service.runTask({ workspace_id: "known", instruction: "inspect" });
   await waitForTerminal(service, taskId);
   service.submitControlledPatchTask("private diff", true);
+  assert.deepEqual(seen, []);
+});
+
+test("explicit Dashboard identity is published without workspace paths or execution payloads", async () => {
+  const entries = [{ id: "known", root: ROOT, display_name: "Engineering Bridge" }];
+  const seen: ObservationWrite[] = [];
+  const service = new RegisteredWorkspaceTaskService(new RegisteredWorkspaceRegistry(entries), () => ({
+    execute: async request => {
+      assert.equal("dashboard_title" in request, false, "the executor contract is unchanged");
+      request.onDiagnostics?.({ executor_started_at: new Date().toISOString(), last_activity_at: new Date().toISOString(), upstream_error_message: "PRIVATE_DIAGNOSTIC" });
+      return { kind: "completed", output: "PRIVATE_OUTPUT", evidence: [{ id: "e", type: "commandExecution", status: "completed", command: "PRIVATE_EVIDENCE" }] };
+    }
+  }), { publishObservation: value => { seen.push(value); } });
+  const request = { workspace_id: "known", instruction: "PRIVATE_INSTRUCTION", dashboard_title: "Dashboard V0 Slice 3" };
+  const { taskId } = service.startTask(request);
+  await waitForInteractiveReady(service, taskId);
+  await service.controlTask(taskId, "continue", "PRIVATE_CONTINUATION");
+  await waitForInteractiveReady(service, taskId);
+  await service.controlTask(taskId, "accept");
+  for (const value of seen) {
+    assert.equal(value.metadata.workspace_id, "known");
+    assert.equal(value.metadata.workspace_display_name, "Engineering Bridge");
+    assert.equal(value.metadata.dashboard_title, "Dashboard V0 Slice 3");
+  }
+  assert.equal(JSON.stringify(seen).includes(ROOT), false);
+  assert.doesNotMatch(JSON.stringify(seen), /PRIVATE_|instruction|output|evidence|diagnostics/);
+});
+
+test("invalid explicit Dashboard titles are rejected before execution or observation", () => {
+  let executions = 0;
+  const seen: ObservationWrite[] = [];
+  const service = new RegisteredWorkspaceTaskService(registry(), () => {
+    executions++;
+    return { execute: async () => ({ kind: "completed", output: "unused" }) };
+  }, { publishObservation: value => { seen.push(value); } });
+  for (const dashboard_title of ["", " ", "a\nb", "a\rb", "a\tb", "a\u2028b", "x".repeat(101)]) {
+    const request = { workspace_id: "known", instruction: "private instruction", dashboard_title };
+    assert.throws(() => service.startTask(request));
+    assert.throws(() => service.runTask(request));
+  }
+  assert.equal(executions, 0);
   assert.deepEqual(seen, []);
 });

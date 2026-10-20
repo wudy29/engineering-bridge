@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes Engineering Bridge 1.5.0.
+This document describes Engineering Bridge 1.6.0.
 
 Engineering Bridge is a local STDIO MCP server with fifteen tools and a small layered structure:
 
@@ -9,7 +9,7 @@ Engineering Bridge is a local STDIO MCP server with fifteen tools and a small la
 3. `RegisteredWorkspaceTaskService` assigns UUID task IDs and holds task, supervisor-review, thread, output, partial-output, error, and evidence state in process memory. It resolves the requested executor through an `ExecutorFactory` and drives `CodexExecutor` or `DshExecutor`.
 4. `CodexExecutor` starts the local `codex app-server --stdio` protocol with fixed read-only task settings. `DshExecutor` starts the official headless `dsh` interface with a per-process `DSH_PERMISSION_MODE=read-only` pin and an explicit environment allowlist (including `DEEPSEEK_API_KEY` and `DSH_TOOLS_MODE`; proxy variables excluded). `ControlledPatchService` records proposal/application metadata (persisted to `<config>.controlled-patches.json`) and owns the fixed Git boundaries for applying reviewed patches and creating an explicitly confirmed controlled commit. Optional validation uses a fixed per-workspace profile persisted to `<config>.validation-profiles.json` and runs candidates in a temporary detached worktree.
 
-There is no HTTP server, UI, database, account system, background daemon, remote transport, or general command runner.
+Task control remains local STDIO MCP. A separately started loopback HTTP dashboard reads observation files; it has no task-control endpoint. There is no database, account system, installed background daemon, remote MCP transport, or general command runner.
 
 ## Read-only supervised task flow
 
@@ -22,6 +22,16 @@ There is no HTTP server, UI, database, account system, background daemon, remote
 Active executor task supervision state (tasks, threads, evidence, review outputs) is process-local and disappears on restart. Proposal/application history, workspace catalog and profiles retain their three sidecars; independent async validation records use the private store described below. Executor runs have a 15-minute hard deadline and bounded termination; active Codex turns also have a two-minute matching-protocol-activity watchdog, reset only by notifications carrying the exact active `threadId` and `turnId`; RPC responses and global or mismatched notifications cannot reset it. Short RPC calls have a separate 30-second bound. There is no automatic acceptance or persistent executor task/audit history.
 
 These executor parameters restrict writes performed by Codex and DSH, but Bridge does not create OS-level filesystem read containment. A same-user executor process may read paths outside the workspace when the operating system permits it.
+
+## Observation and dashboard flow
+
+After MCP connection, one producer ID identifies that Bridge process. `startObservationProducer` publishes a heartbeat every 5 seconds; task lifecycle hooks select public metadata for a best-effort sink. `ObservationStore` writes latest snapshots to `<config>.observations/`, outside Git/workspace/approved-root and validation-execution boundaries. It uses hashed kind/record IDs, private directory/file permissions on POSIX, temporary writes and rename. Sink failure disables that optional store without changing canonical task/validation outcomes. Snapshots can survive process exit but cannot restore supervision and are not an event log; no disk pruning is implemented.
+
+`src/dashboard.ts` serves `GET /` and `GET /api/snapshots` on `127.0.0.1:4317`. It validates Host, returns `no-store`, and has no write route. The reader rejects unsafe directories and malformed, oversized, mismatched or non-regular entries, and selects permitted fields rather than exposing raw records. It reads neither executor output nor private instructions. The HTTP surface has no authentication or TLS and must stay local.
+
+The Chinese HTML is maintained in TypeScript and rebuilt into `dist/src/dashboard.js`. Polling every 2 seconds classifies producer heartbeats as fresh through 15 seconds, stale beyond that, or unknown. Only fresh `queued`/`running` tasks are current; review, ended, and stale/unknown history are separate collapsed sections. Freshness is observation age, not proof of OS process liveness. Explicit public task/workspace labels are validated; missing titles fall back to project, executor and short task ID. A bounded browser localStorage cutoff hides earlier review/ended cards and survives reload; restoring removes the cutoff. Neither control mutates server state or deletes observations.
+
+Codex startup keeps PATH precedence and opts into a POSIX executable-file fallback at absolute `HOME/.local/bin/codex`; Windows and DSH launch policies stay unchanged. Bounded error-notification summaries and the first-interrupt snapshot remain process-local `task_result` diagnostics, with no raw text or raw IDs. Later errors cannot rewrite that frozen snapshot, and diagnostics do not enter observation records.
 
 ## Controlled patch flow
 

@@ -12,6 +12,7 @@ import { DshExecutor } from "./executors/dsh-executor.js";
 import { startObservationProducer } from "./observability/producer-heartbeat.js";
 import { VERSION } from "./version.js";
 import { CoreError, serializeError } from "./core/errors.js";
+import { dashboardLabelSchema } from "./core/dashboard-label.js";
 import { CODEX_ROUTING_POLICY_ENV, parseCodexRoutingPolicy } from "./core/codex-routing-policy.js";
 import { RegisteredWorkspaceTaskService } from "./tasks/registered-workspace-task-service.js";
 import { ControlledPatchService } from "./tasks/controlled-patch-service.js";
@@ -31,6 +32,7 @@ import { WorkspaceOnboardingService } from "./workspaces/workspace-onboarding-se
 const WorkspaceEntrySchema = z.object({
   id: z.string().min(1),
   root: z.string().min(1),
+  display_name: dashboardLabelSchema.optional(),
   allow_write: z.boolean().optional()
 }).strict();
 
@@ -235,16 +237,18 @@ async function main(): Promise<void> {
     inputSchema: {
       workspace_id: z.string().min(1),
       instruction: z.string().min(1),
+      dashboard_title: dashboardLabelSchema.optional().describe("Optional public title for the local Dashboard (single line, at most 100 characters). Supply explicitly; never derive from private instruction, output, evidence or diagnostics."),
       executor: z.enum(["codex", "dsh"]).optional().default("codex"),
       model: z.string().min(1).optional(),
       reasoning_effort: z.string().min(1).optional()
     }
-  }, ({ workspace_id, instruction, executor, model, reasoning_effort }) => {
+  }, ({ workspace_id, instruction, dashboard_title, executor, model, reasoning_effort }) => {
     try {
       if (executor === "dsh" && (model !== undefined || reasoning_effort !== undefined)) {
         throw new CoreError("UNSUPPORTED_ACTION");
       }
       const { taskId } = service.startTask({ workspace_id, instruction, executor,
+        ...(dashboard_title === undefined ? {} : { dashboard_title }),
         ...(model === undefined ? {} : { model }),
         ...(reasoning_effort === undefined ? {} : { reasoning_effort }) });
       return jsonContent({ task_id: taskId });

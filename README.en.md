@@ -2,11 +2,11 @@
 
 **Connect Chat directly to local Codex or DSH: no more shuttling prompts and results—Chat dispatches, supervises, and accepts the executor's work.**
 
-[![v1.5.0](https://img.shields.io/badge/version-v1.5.0-blue)](RELEASE_NOTES.md)
+[![v1.6.0](https://img.shields.io/badge/version-v1.6.0-blue)](RELEASE_NOTES.md)
 [![CI](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[简体中文](README.md) · **v1.5.0 · V1 · Local · Continuously maintainer-tested on macOS.** The version does not imply a tag, GitHub Release, or npm publication; these remain separate actions. Windows has Codex and DSH npm CLI launch smoke coverage. Async validation requires POSIX process-group supervision and returns `VALIDATION_PLATFORM_UNSUPPORTED` on Windows; the old synchronous and other tools keep their existing behavior.
+[简体中文](README.md) · **v1.6.0 · V1 · Local · Continuously maintainer-tested on macOS.** The version does not imply a tag, GitHub Release, or npm publication; these remain separate actions. Windows has Codex and DSH npm CLI launch smoke coverage. Async validation requires POSIX process-group supervision and returns `VALIDATION_PLATFORM_UNSUPPORTED` on Windows; the old synchronous and other tools keep their existing behavior.
 
 ## Before / now
 
@@ -27,7 +27,7 @@ flowchart LR
 
 **State boundary:** Bridge owns control state, not session truth. The native Codex thread/session remains the source of execution history; Bridge keeps only the temporary supervision/control state needed for continue, steer, interrupt, and accept. DSH's headless interface currently has no machine-resumable session seam, so a DSH `continue` starts a new execution and `task_result` never fabricates a thread id. Task supervision state (task/thread/evidence/review) may be lost on Bridge restart by design; V1 does not persist or mirror any executor's session history in SQLite, a database, or a transcript mirror.
 
-Everything above is a local process connection over MCP/STDIO. There is no HTTP endpoint or cloud service in Engineering Bridge.
+Task control uses local MCP/STDIO. v1.6.0 also has a separately started Chinese read-only dashboard, served only on `127.0.0.1:4317`; it provides no remote MCP, task-control endpoint, or cloud service.
 
 ## What is it?
 
@@ -44,7 +44,7 @@ There are four roles:
 - **Chat client:** understands your request, calls tools, and displays results in the conversation; it must be able to launch a local STDIO MCP server.
 - **Engineering Bridge:** maps a `workspace_id` to a project path in trusted local configuration, starts and tracks tasks, and validates controlled patches.
 - **Local executor:** Codex runs through `codex app-server --stdio`; DSH runs through the official headless interface. Both perform read-only inspection or prepare a patch.
-- **MCP-STDIO:** the local protocol and process connection between the client and Bridge; there is no HTTP endpoint or cloud service.
+- **MCP-STDIO:** the local task-control connection between client and Bridge; the separate dashboard reads observation snapshots and does not carry MCP.
 
 ## What can it do today?
 
@@ -88,8 +88,8 @@ This repository used Bridge to generate its CI workflow, Bug Report template, an
 | --- | --- | --- |
 | Read-only analysis, code location, and review in a pre-registered workspace; `run_task`, `generate_controlled_patch`, and `refine_controlled_patch` select Codex or DSH per call (Codex by default) | `APPLY` itself does not automatically validate/test, stage, commit, push, or create a Release; a Git commit requires a separate exact `COMMIT` | Workspace GUI/manager |
 | Bind or create and register a workspace inside `project_root` with exact `BIND`/`CREATE` | Not OS-level read isolation | Adapt other CLI agents one at a time |
-| Generate a complete Git patch before any write; controlled writes for managed workspaces after exact `AUTHORIZE` | No HTTP, UI, account system, caller authentication, or remote transport | DSH native headless session resume |
-| Apply only after exact `APPLY`, with base-HEAD and repository-state revalidation; unborn repositories support added 100644 text files | Does not persist task/thread/evidence supervision history; no resource quota | Persistent task/audit history |
+| Generate a complete Git patch before any write; controlled writes for managed workspaces after exact `AUTHORIZE` | Loopback read-only dashboard only; no account system, caller authentication, or remote MCP transport | DSH native headless session resume |
+| Apply only after exact `APPLY`, with base-HEAD and repository-state revalidation; unborn repositories support added 100644 text files | Does not restore task/thread/evidence supervision state; snapshots are not an audit log, and there is no resource quota | Persistent task/audit history |
 | Commit an already-`APPLY`ed controlled patch only after exact `COMMIT`; Bridge never pushes | Does not automatically publish or create a Release | — |
 | Fixed validation profiles; synchronous validation plus async start/query with retained PASS/FAIL/INCOMPLETE | Not a host sandbox; no restart resume or automatic stale-worktree cleanup | — |
 | Controlled-patch proposals/applied history, workspace catalog, profiles and independent validation runs survive restarts | Validation records are not executor session history | Carefully explore multi-agent orchestration |
@@ -105,7 +105,7 @@ For controlled writes, the project must also be a clean Git top-level (with an e
 
 **Per executor:**
 
-- **Codex:** install and authenticate the `codex` CLI so it is callable from `PATH`. Bridge launches Codex through `codex app-server --stdio`: no shell, approval `never`, network disabled.
+- **Codex:** install and authenticate the `codex` CLI; `PATH` takes priority. On POSIX, only a miss on absolute `PATH` entries permits an executable regular `.local/bin/codex` beneath an absolute `HOME`. Windows keeps its existing shell-free native-executable/npm-shim launch paths. Bridge launches Codex through `codex app-server --stdio`: no shell, approval `never`, network disabled.
 - **DSH:** install the official npm package `@deepseek-ai/dsh`; `dsh` must be callable from `PATH` or resolvable by Bridge through the `DSH_HOME`/`~/.dsh` profiles fallback. If `DEEPSEEK_API_KEY` is set in the environment Bridge runs under, Bridge forwards it to DSH—it is the only credential environment variable Bridge forwards. Keep it out of config files (see section 4). Bridge launches DSH with `dsh --profile headless <instruction>` and pins `DSH_PERMISSION_MODE=read-only` itself—do not set it yourself. `DSH_TOOLS_MODE` is an optional passthrough; proxy variables are not forwarded.
 
 ### 2. Clone, install, and build
@@ -113,11 +113,11 @@ For controlled writes, the project must also be a clean Git top-level (with an e
 ```sh
 git clone https://github.com/wudy29/engineering-bridge.git
 cd engineering-bridge
-npm install
+npm ci
 npm run build
 ```
 
-The current v1.5.0 version has no one-click installer.
+The current v1.6.0 version has no one-click installer.
 
 ### 3. Register a workspace
 
@@ -265,6 +265,23 @@ Caller disconnect does not cancel a service-owned run while Bridge remains alive
 Keep trusted configuration and sidecars outside repositories, registered workspaces, and approved `project_root` trees. Async state lives beside the canonical configuration path in `<config>.validation-runs/` (private directory, one atomic JSON record per run), with `<config>.validation-worktrees/` and service-owner metadata/guard beside it. Snapshot commands and output can contain local information; do not include credentials. Unsafe storage or unavailable ownership returns safe async errors while old tools remain available; no configuration is moved automatically.
 
 Validation applies the candidate only in a temporary detached worktree. This protects the registered workspace from candidate files and build artifacts, but configured programs still have the Bridge user's host permissions: only configure trusted commands. Validation does not change proposal state, authorize APPLY, or automatically APPLY/COMMIT/push. See the [tool reference](docs/tools.md) and [architecture](docs/architecture.md).
+
+## Chinese read-only dashboard and task observations
+
+After building, start the dashboard separately with the same configuration path used by MCP:
+
+```sh
+npm run dashboard -- /absolute/path/to/bridge-state/workspaces.json
+```
+
+Open `http://127.0.0.1:4317/` locally. After MCP connects, a producer emits a heartbeat every 5 seconds and writes selected task metadata on a best-effort basis to `<config>.observations/`. Keep configuration and this directory outside repositories, registered workspaces, and approved roots. The dashboard polls every 2 seconds; a heartbeat up to 15 seconds old is fresh. Freshness is not OS process-liveness proof and never restores task control. Observation-write failure does not change task execution results.
+
+- Current tasks contain only `queued` / `running` records from fresh producers. Review and ended records have separate collapsed groups. Stale or unknown producers' records are labelled historical observations whose current state cannot be confirmed.
+- `run_task` accepts an explicitly public `dashboard_title`; manual workspace configuration accepts a public `display_name`. Both are nonblank single-line strings of at most 100 UTF-16 code units; keep secrets out. Without a title, cards show project, executor, and a short task ID, never text extracted from private instructions, output, or diagnostics.
+- “清理历史显示” (clear history display) stores only a cutoff in this browser origin's localStorage, hiding earlier review and ended cards across polling/reloads while later records remain visible. “恢复显示” (restore display) removes it. If storage is unavailable, clearing applies only to the current page. Neither action changes task state, deletes files, accepts work, or cancels a task.
+- HTTP accepts only allowed loopback Host values and `GET /` or `GET /api/snapshots`, with `no-store` responses and no write endpoint, authentication, or TLS. Host validation is not authentication; local processes able to reach the port may read metadata. Do not proxy, forward, or expose the port.
+
+`task_result` retains bounded Codex `diagnostics.last_error_notification` and a frozen `diagnostics.interrupt_context` from the first local interrupt. These summaries exclude raw error text, details, and raw thread/turn IDs; they do not change `TASK_INTERRUPTED`, form a cross-restart event log, or enter dashboard observations. v1.6.0 adds no automatic disk-history retention or eviction policy.
 
 ## Safety boundary
 

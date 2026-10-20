@@ -171,7 +171,7 @@ test("MCP and Codex client metadata use the shared package VERSION, and stdio re
     ]);
 
     const schemas = new Map(listed.tools.map((tool) => [tool.name, tool.inputSchema as {
-      properties?: Record<string, { type?: string; minLength?: number; const?: unknown }>;
+      properties?: Record<string, { type?: string; minLength?: number; maxLength?: number; const?: unknown }>;
       required?: string[];
     }]));
     for (const name of ["run_task", "generate_controlled_patch", "refine_controlled_patch"]) {
@@ -181,6 +181,9 @@ test("MCP and Codex client metadata use the shared package VERSION, and stdio re
       assert.equal(properties?.reasoning_effort?.type, "string");
       assert.equal(properties?.reasoning_effort?.minLength, 1);
     }
+    assert.equal(schemas.get("run_task")?.properties?.dashboard_title?.type, "string");
+    assert.equal(schemas.get("run_task")?.properties?.dashboard_title?.maxLength, 100);
+    assert.equal(schemas.get("run_task")?.required?.includes("dashboard_title"), false);
 
     // COMMIT requires every field and the exact literal confirmation.
     const commitSchema = schemas.get("commit_controlled_patch");

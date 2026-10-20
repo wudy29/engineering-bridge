@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -23,11 +23,29 @@ function touch(...segments: string[]): string {
   return path;
 }
 
+// Explicit modes keep the POSIX executability cases independent of the umask
+// the test host happens to run with.
+function executable(...segments: string[]): string {
+  const path = touch(...segments);
+  chmodSync(path, 0o755);
+  return path;
+}
+
+function nonExecutable(...segments: string[]): string {
+  const path = touch(...segments);
+  chmodSync(path, 0o644);
+  return path;
+}
+
 function resolve(host: Record<string, string>, command: string, options: ResolveCommandOptions = {}) {
   return resolveCommand(host, command, { platform: "win32", ...options });
 }
 
-test("non-Windows platforms always resolve to the bare command (POSIX unchanged)", () => {
+function resolvePosix(host: Record<string, string>, command: string, options: ResolveCommandOptions = {}) {
+  return resolveCommand(host, command, { platform: "darwin", ...options });
+}
+
+test("non-Windows platforms without a fallback resolve to the bare command (POSIX unchanged)", () => {
   const dir = directory();
   touch(dir, "codex.exe");
   const result = resolveCommand({ PATH: dir }, "codex", { platform: "darwin" });
@@ -166,4 +184,124 @@ test("custom PATHEXT without leading dots still finds a shim target", () => {
 test("commands with path separators are never searched", () => {
   assert.deepEqual(resolve({ PATH: directory() }, "bin/codex"), { kind: "bare" });
   assert.deepEqual(resolve({ PATH: directory() }, "bin\\codex"), { kind: "bare" });
+});
+
+// ---------------------------------------------------------------------------
+// POSIX HOME-relative fallback (opt-in; platform seam = "darwin"/"linux").
+// ---------------------------------------------------------------------------
+
+const CODEX_HOME_FALLBACK = [".local", "bin", "codex"];
+
+test("POSIX: an executable codex on an absolute PATH entry stays bare even with a valid fallback", () => {
+  const pathDir = directory();
+  executable(pathDir, "codex");
+  const home = directory();
+  executable(home, ".local", "bin", "codex");
+
+  const result = resolvePosix({ PATH: pathDir, HOME: home }, "codex", {
+    homeRelativeFallback: CODEX_HOME_FALLBACK
+  });
+
+  assert.deepEqual(result, { kind: "bare" });
+});
+
+test("POSIX: a PATH miss plus an executable HOME fallback becomes a direct absolute command", () => {
+  const home = directory();
+  const fallback = executable(home, ".local", "bin", "codex");
+
+  const result = resolvePosix({ PATH: directory(), HOME: home }, "codex", {
+    homeRelativeFallback: CODEX_HOME_FALLBACK
+  });
+
+  assert.deepEqual(result, { kind: "direct", executable: fallback });
+  assert.equal(isAbsolute(fallback), true);
+});
+
+test("POSIX: an absent, non-executable or directory fallback stays bare", () => {
+  const home = directory();
+  executable(home, ".local", "bin", "codex");
+  nonExecutable(home, "plain", "codex");
+
+  assert.deepEqual(
+    resolvePosix({ PATH: directory(), HOME: home }, "codex", {
+      homeRelativeFallback: [".local", "bin", "missing"]
+    }),
+    { kind: "bare" }
+  );
+  assert.deepEqual(
+    resolvePosix({ PATH: directory(), HOME: home }, "codex", { homeRelativeFallback: ["plain", "codex"] }),
+    { kind: "bare" }
+  );
+  assert.deepEqual(
+    resolvePosix({ PATH: directory(), HOME: home }, "codex", { homeRelativeFallback: [".local", "bin"] }),
+    { kind: "bare" }
+  );
+});
+
+test("POSIX: no HOME, no opt-in or an empty opt-in keeps the historical bare result", () => {
+  const home = directory();
+  executable(home, ".local", "bin", "codex");
+
+  assert.deepEqual(
+    resolvePosix({ PATH: directory() }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
+    { kind: "bare" }
+  );
+  assert.deepEqual(
+    resolvePosix({ PATH: directory(), HOME: "" }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
+    { kind: "bare" }
+  );
+  assert.deepEqual(
+    resolvePosix({ PATH: directory(), HOME: "relative-home" }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
+    { kind: "bare" }
+  );
+  // Executors that never pass the option keep the historical behavior.
+  assert.deepEqual(resolvePosix({ PATH: directory(), HOME: home }, "codex"), { kind: "bare" });
+  assert.deepEqual(
+    resolvePosix({ PATH: directory(), HOME: home }, "codex", { homeRelativeFallback: [] }),
+    { kind: "bare" }
+  );
+});
+
+test("POSIX: a non-executable file or a relative PATH entry never satisfies PATH", () => {
+  const home = directory();
+  const fallback = executable(home, ".local", "bin", "codex");
+  const nonExecutableOnPath = directory();
+  nonExecutable(nonExecutableOnPath, "codex");
+
+  assert.deepEqual(
+    resolvePosix({ PATH: `${nonExecutableOnPath}:${directory()}`, HOME: home }, "codex", {
+      homeRelativeFallback: CODEX_HOME_FALLBACK
+    }),
+    { kind: "direct", executable: fallback }
+  );
+  assert.deepEqual(
+    resolvePosix({ PATH: `relative-dir:${directory()}`, HOME: home }, "codex", {
+      homeRelativeFallback: CODEX_HOME_FALLBACK
+    }),
+    { kind: "direct", executable: fallback }
+  );
+});
+
+test("POSIX: command names containing path separators are never resolved", () => {
+  const home = directory();
+  executable(home, ".local", "bin", "codex");
+  assert.deepEqual(
+    resolvePosix({ PATH: directory(), HOME: home }, "bin/codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
+    { kind: "bare" }
+  );
+});
+
+test("win32: the HOME-relative fallback option never changes Windows resolution", () => {
+  const home = directory();
+  executable(home, ".local", "bin", "codex");
+  assert.deepEqual(
+    resolve({ PATH: directory(), HOME: home }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
+    { kind: "bare" }
+  );
+  const exeDir = directory();
+  const exe = touch(exeDir, "codex.exe");
+  assert.deepEqual(
+    resolve({ PATH: exeDir, HOME: home }, "codex", { homeRelativeFallback: CODEX_HOME_FALLBACK }),
+    { kind: "direct", executable: exe }
+  );
 });

@@ -1,12 +1,15 @@
 import { realpathSync } from "node:fs";
+import { basename } from "node:path";
 
 import { CoreError } from "../core/errors.js";
+import { dashboardLabelSchema, DASHBOARD_LABEL_MAX_LENGTH } from "../core/dashboard-label.js";
 import { isWorkspaceRoot } from "./workspace-paths.js";
 
 export interface WorkspaceRegistration {
   readonly id: string;
   readonly root: string;
   readonly allow_write?: boolean | undefined;
+  readonly display_name?: string | undefined;
 }
 
 export interface WorkspaceLookup {
@@ -18,6 +21,7 @@ export interface WorkspaceLookup {
 
 type Registration = {
   root: string;
+  displayName: string;
   canonicalRoot: string;
   allowWrite: boolean;
   source: "manual" | "managed";
@@ -37,12 +41,14 @@ export class RegisteredWorkspaceRegistry {
       if (typeof entry.id !== "string" || entry.id.length === 0 ||
           !isWorkspaceRoot(entry.root) ||
           (entry.allow_write !== undefined && typeof entry.allow_write !== "boolean") ||
+          (entry.display_name !== undefined && !dashboardLabelSchema.safeParse(entry.display_name).success) ||
           this.registrations.has(entry.id)) {
         throw new CoreError("WORKSPACE_BOUNDARY_VIOLATION");
       }
       const canonicalRoot = canonicalize(entry.root);
       this.registrations.set(entry.id, {
         root: entry.root,
+        displayName: entry.display_name ?? rootDisplayName(entry.root),
         canonicalRoot,
         allowWrite: entry.allow_write ?? false,
         source: "manual"
@@ -57,6 +63,10 @@ export class RegisteredWorkspaceRegistry {
     const registration = this.registrations.get(workspaceId);
     if (registration === undefined) throw new CoreError("UNKNOWN_WORKSPACE");
     return registration.root;
+  }
+
+  displayName(workspaceId: string): string | undefined {
+    return this.registrations.get(workspaceId)?.displayName;
   }
 
   resolveExecution(workspaceId: string): { root: string; allowWrite: boolean } {
@@ -96,7 +106,7 @@ export class RegisteredWorkspaceRegistry {
     const canonicalRoot = this.canonicalize(root);
     this.refreshManualCanonicalRoots();
     if (this.canonicalRoots.has(canonicalRoot)) throw new CoreError("WORKSPACE_BOUNDARY_VIOLATION");
-    this.registrations.set(id, { root, canonicalRoot, allowWrite, source: "managed" });
+    this.registrations.set(id, { root, displayName: rootDisplayName(root), canonicalRoot, allowWrite, source: "managed" });
     this.canonicalRoots.set(canonicalRoot, id);
   }
 
@@ -132,4 +142,9 @@ function bestEffortCanonicalRoot(root: string): string {
   } catch {
     return root;
   }
+}
+
+function rootDisplayName(root: string): string {
+  return basename(root).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .trim().slice(0, DASHBOARD_LABEL_MAX_LENGTH) || "未命名项目";
 }

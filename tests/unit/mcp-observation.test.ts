@@ -32,11 +32,12 @@ test("real run_task observations preserve outcomes, the full tool catalog and EO
   const workspace = join(root, "workspace");
   await fs.mkdir(workspace);
   let baseline: unknown;
-  for (const mode of ["normal", "blocked", "rejected", "stalled", "timer-failure"] as const) {
+  for (const mode of ["normal", "named", "blocked", "rejected", "stalled", "timer-failure"] as const) {
     const config = join(root, mode + ".json");
     const directory = config + ".observations";
     const entered = join(root, mode + ".entered");
-    await fs.writeFile(config, JSON.stringify([{ id: "workspace", root: workspace }]));
+    await fs.writeFile(config, JSON.stringify([{ id: "workspace", root: workspace,
+      ...(mode === "named" ? { display_name: "Engineering Bridge" } : {}) }]));
     if (mode === "blocked") await fs.writeFile(directory, "occupied");
     // Preload only in this fixture's child; the MCP handler and task service stay real.
     const observationInjection = mode === "rejected" || mode === "stalled"
@@ -78,7 +79,7 @@ test("real run_task observations preserve outcomes, the full tool catalog and EO
       else assert.deepEqual(catalog, baseline, mode);
       const result = await client.callTool({ name: "task_result", arguments: { task_id: "unknown" } });
       assert.equal(result.isError, true);
-      if (mode === "normal") {
+      if (mode === "normal" || mode === "named") {
         await until(async () => {
           try { return (await fs.readdir(directory)).some(name => name.endsWith(".json")); }
           catch { return false; }
@@ -108,7 +109,8 @@ test("real run_task observations preserve outcomes, the full tool catalog and EO
         return JSON.parse(text.text) as Record<string, unknown>;
       };
       const { task_id: taskId } = await call("run_task", {
-        workspace_id: "workspace", instruction: "private instruction", executor: "dsh"
+        workspace_id: "workspace", instruction: "private instruction", executor: "dsh",
+        ...(mode === "named" ? { dashboard_title: "Dashboard V0 Slice 3" } : {})
       });
       assert.equal(typeof taskId, "string");
       await until(async () => {
@@ -117,7 +119,7 @@ test("real run_task observations preserve outcomes, the full tool catalog and EO
         assert.equal(view.review_output, "fixture review output");
         return true;
       });
-      if (mode === "normal") {
+      if (mode === "normal" || mode === "named") {
         let taskRecords: ObservationEnvelope[] = [];
         await until(async () => {
           const names = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
@@ -131,6 +133,8 @@ test("real run_task observations preserve outcomes, the full tool catalog and EO
         assert.equal(taskRecord.record_id, taskId);
         assert.deepEqual(taskRecord.metadata, {
           task_id: taskId, state: "waiting_for_supervisor_review", executor: "dsh",
+          workspace_id: "workspace", workspace_display_name: mode === "named" ? "Engineering Bridge" : "workspace",
+          ...(mode === "named" ? { dashboard_title: "Dashboard V0 Slice 3" } : {}),
           requested_model: null, requested_reasoning_effort: null,
           created_at: taskRecord.metadata.created_at, started_at: taskRecord.metadata.started_at,
           ended_at: null
@@ -142,6 +146,16 @@ test("real run_task observations preserve outcomes, the full tool catalog and EO
         }
         assert.ok(String(taskRecord.metadata.started_at) >= String(taskRecord.metadata.created_at));
         assert.equal((await fs.readdir(directory)).filter(name => name.endsWith(".json")).length, 2);
+        assert.equal(JSON.stringify(taskRecords).includes(workspace), false);
+        assert.doesNotMatch(JSON.stringify(taskRecords), /private instruction|fixture review output/);
+        if (mode === "named") {
+          for (const dashboard_title of ["a\nb", "x".repeat(101)]) {
+            const invalid = await client.callTool({ name: "run_task", arguments: {
+              workspace_id: "workspace", instruction: "private instruction", executor: "dsh", dashboard_title,
+            } });
+            assert.equal(invalid.isError, true);
+          }
+        }
       }
       assert.deepEqual(await client.listTools(), baseline, mode);
       // This tests normal finite filesystem I/O and an unresolved sink promise.

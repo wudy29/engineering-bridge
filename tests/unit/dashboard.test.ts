@@ -5,6 +5,7 @@ import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test, { type TestContext } from "node:test";
+import { runInNewContext } from "node:vm";
 
 import { CoreError } from "../../src/core/errors.js";
 import { observationsDirectory, readSnapshots, startDashboardServer } from "../../src/dashboard.js";
@@ -68,8 +69,49 @@ test("valid records expose only the producer and task view fields", async t => {
     pid: 123, bridge_version: "1.5.0", started_at: time,
   }]);
   assert.deepEqual(view.tasks, [{
-    ...task().metadata, producer_id: "producer-a",
+    ...task().metadata, producer_id: "producer-a", observed_at: time,
   }]);
+});
+
+test("task report time comes only from a valid envelope timestamp, without excluding legacy records", async t => {
+  const f = await fixture(t);
+  await f.write(task("reported", "producer-a", { observed_at: "PRIVATE_METADATA" }));
+  await f.write({ ...task("legacy"), observed_at: undefined });
+  await f.write({ ...task("invalid"), observed_at: "PRIVATE_RAW_VALUE" });
+  const view = await readSnapshots(f.config, now);
+  assert.equal(view.tasks.length, 3);
+  assert.equal(Reflect.get(view.tasks.find(value => value.task_id === "reported")!, "observed_at"), time);
+  for (const id of ["legacy", "invalid"]) {
+    assert.equal(Reflect.get(view.tasks.find(value => value.task_id === id)!, "observed_at"), undefined);
+  }
+  assert.doesNotMatch(JSON.stringify(view), /PRIVATE_/);
+});
+
+test("old and named snapshots coexist, invalid optional labels fall back, and reader never deletes", async t => {
+  const f = await fixture(t);
+  await f.write(task("old", "producer-a", { state: "completed", ended_at: time }));
+  await f.write(task("named", "producer-a", {
+    workspace_id: "bridge", workspace_display_name: "Engineering Bridge", dashboard_title: "Dashboard V0 Slice 3",
+    root: "/private/workspace", instruction: "PRIVATE_INSTRUCTION", output: "PRIVATE_OUTPUT",
+    evidence: "PRIVATE_EVIDENCE", diagnostics: "PRIVATE_DIAGNOSTICS", error_summary: "PRIVATE_ERROR",
+  }));
+  await f.write(task("invalid-labels", "producer-a", {
+    workspace_display_name: "multiline\nname", dashboard_title: "x".repeat(101),
+  }));
+  const before = (await fs.readdir(f.directory)).sort();
+  const view = await readSnapshots(f.config, now + 86_400_000);
+  assert.equal(view.tasks.length, 3);
+  const named = view.tasks.find(value => value.task_id === "named")!;
+  assert.equal(named.workspace_id, "bridge");
+  assert.equal(named.workspace_display_name, "Engineering Bridge");
+  assert.equal(named.dashboard_title, "Dashboard V0 Slice 3");
+  for (const id of ["old", "invalid-labels"]) {
+    const value = view.tasks.find(item => item.task_id === id)!;
+    assert.equal(value.workspace_display_name, undefined);
+    assert.equal(value.dashboard_title, undefined);
+  }
+  assert.doesNotMatch(JSON.stringify(view), /PRIVATE_|private\/workspace/);
+  assert.deepEqual((await fs.readdir(f.directory)).sort(), before, "reading never deletes old terminal snapshots");
 });
 
 test("malformed, invalid schema, mismatched hash and task identity are independently skipped", async t => {
@@ -229,14 +271,76 @@ test("HTTP is loopback-only, read-only, uncached, and serves the embedded pollin
   const html = await get("/");
   assert.equal(html.status, 200);
   assert.match(html.headers["content-type"] ?? "", /text\/html/);
-  for (const label of ["Engineering Bridge Dashboard", "Producer heartbeat", "Requested model",
-    "Requested reasoning effort", "waiting_for_supervisor_review", "completed", "Fetch error", "Read error"]) {
+  for (const label of ["Engineering Bridge", "Bridge 在线", "心跳延迟", "状态未知", "技术详情",
+    "等待执行", "执行中", "等待调用方验收", "已完成", "失败", "暂无当前任务", "暂时无法读取 Bridge 状态", "旧进程历史观测"]) {
     assert.ok(html.body.includes(label), label);
   }
+  assert.match(html.body, /lang="zh-CN"/);
   assert.match(html.body, /textContent/);
-  assert.doesNotMatch(html.body, /innerHTML/);
+  assert.doesNotMatch(html.body, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
   assert.match(html.body, /finally \{ setTimeout\(poll, 2000\); \}/);
   assert.match(html.body, /poll\(\);/);
+  const script = html.body.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(script);
+  // Keep the initial fetch pending: these checks exercise the shipped formatters without a DOM library.
+  const ui = runInNewContext(script + "\n;({ relativeAge, relativeTime, durationText, modelText, stateLabels, partitionTasks, activityText });", {
+    document: { getElementById: () => ({ addEventListener() {} }) }, fetch: () => new Promise(() => {}),
+  });
+  await t.test("relative times are readable and do not invent missing or future activity", () => {
+    for (const [age, label] of [[0, "刚刚"], [8000, "8 秒前"], [120000, "2 分钟前"],
+      [3600000, "1 小时前"], [86400000, "1 天前"], [null, "暂无记录"], [-1, "暂无记录"]]) {
+      assert.equal(ui.relativeAge(age), label);
+    }
+    assert.equal(ui.relativeTime(time, now + 8000), "8 秒前");
+    assert.equal(ui.relativeTime(undefined, now), "暂无记录");
+    assert.equal(ui.relativeTime("invalid", now), "暂无记录");
+  });
+  await t.test("review and disconnected tasks never keep presenting an execution timer", () => {
+    const value = { ...task().metadata, started_at: time };
+    assert.equal(ui.durationText({ ...value, state: "running" }, now + 24000), "已运行 24 秒");
+    for (const elapsed of [192000, 147 * 3600000]) {
+      assert.equal(ui.durationText({ ...value, state: "waiting_for_supervisor_review" }, now + elapsed), "结果已返回，待调用方验收");
+    }
+    for (const state of ["queued", "running", "waiting_for_supervisor_review"]) {
+      assert.equal(ui.durationText({ ...value, state }, now + 147 * 3600000, false), "历史观测，当前状态不可确认");
+    }
+    for (const state of ["completed", "failed"]) {
+      assert.equal(ui.durationText({ ...value, state, ended_at: new Date(now + 484000).toISOString() }, now + 900000), "耗时 8 分 04 秒");
+      assert.equal(ui.durationText({ ...value, state, ended_at: null }, now), "耗时未记录");
+    }
+    assert.equal(ui.durationText(task().metadata, now + 8000), "已等待 8 秒");
+    assert.equal(ui.durationText({ ...value, state: "running", started_at: null }, now), "等待开始");
+    assert.equal(ui.stateLabels.get("waiting_for_supervisor_review"), "等待调用方验收");
+    assert.equal(ui.stateLabels.get("completed"), "已完成");
+  });
+  await t.test("fresh review tasks are separate from current tasks, all disconnected observations remain inspectable", () => {
+    const records = ["fresh", "stale", "unknown", "missing"].map(id => ({ producer_id: id, task_id: id, state: "waiting_for_supervisor_review" }));
+    const view = { producers: ["fresh", "stale", "unknown"].map(freshness => ({ producer_id: freshness, freshness })), tasks: records };
+    const parts = ui.partitionTasks(view);
+    assert.equal(JSON.stringify(parts.review.map((value: { task_id: string }) => value.task_id)), '["fresh"]');
+    assert.equal(JSON.stringify(parts.past.map((value: { task_id: string }) => value.task_id)), '["stale","unknown","missing"]');
+    assert.equal(parts.current.length + parts.review.length + parts.ended.length + parts.past.length, records.length);
+    assert.equal(parts.current.length, 0);
+    assert.equal(parts.ended.length, 0);
+    assert.ok(records.every(value => value.state === "waiting_for_supervisor_review"));
+    assert.equal(ui.partitionTasks({ ...view, producers: [] }).past.length, records.length);
+    assert.equal(ui.partitionTasks({ ...view, producers: view.producers.map(value => ({ ...value, freshness: "fresh" })) }).review.length, 3);
+    assert.match(html.body, /<details id="past-records"[^>]*>/);
+    assert.doesNotMatch(html.body, /<details id="past-records"[^>]*\bopen\b/);
+  });
+  await t.test("missing activity uses the report time with an honest label", () => {
+    assert.equal(ui.activityText({ last_reported_activity_at: time, observed_at: new Date(now + 7000).toISOString() }, now + 8000), "最近活动：8 秒前");
+    assert.equal(ui.activityText({ observed_at: time }, now + 8000), "最后上报：8 秒前");
+    assert.equal(ui.activityText({}, now), "最后上报：暂无记录");
+  });
+  await t.test("model and effort names use friendly labels with literal unknown fallbacks", () => {
+    for (const [effort, label] of [["low", "低"], ["medium", "中等"], ["high", "高"], ["max", "最高"]]) {
+      assert.equal(ui.modelText({ requested_model: "gpt-6-astra", requested_reasoning_effort: effort }), "Astra · " + label + "思考");
+    }
+    assert.equal(ui.modelText({ requested_model: "future-model", requested_reasoning_effort: "future-effort" }), "future-model · future-effort思考");
+    assert.equal(ui.modelText({ requested_model: "__proto__", requested_reasoning_effort: "constructor" }), "__proto__ · constructor思考");
+    assert.equal(ui.modelText(task().metadata), "未指定模型 · 未指定思考强度");
+  });
   const api = await get("/api/snapshots");
   assert.equal(api.status, 200);
   assert.match(api.headers["content-type"] ?? "", /application\/json/);
@@ -245,6 +349,10 @@ test("HTTP is loopback-only, read-only, uncached, and serves the embedded pollin
     ["/", "GET", "evil.example", 403],
     ["/", "GET", "127.0.0.1.evil.example", 403],
     ["/", "POST", "localhost", 405],
+    ["/api/snapshots", "PUT", "localhost", 405],
+    ["/api/snapshots", "PATCH", "localhost", 405],
+    ["/api/snapshots", "OPTIONS", "localhost", 405],
+    ["/", "GET", "127.0.0.1:1", 403],
     ["/api/snapshots", "DELETE", "localhost", 405],
     ["/", "HEAD", "localhost", 405],
     ["/missing", "GET", "localhost", 404],
