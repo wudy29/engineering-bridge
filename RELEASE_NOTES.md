@@ -27,7 +27,7 @@ Add a Chinese read-only dashboard and best-effort task observations, retain the 
 
 - The 15-tool MCP surface, explicit write gates, executor deadlines, read-only defaults, observation privacy and retained validation behavior remain unchanged.
 - Candidate verification records fresh install, full/production audits, typecheck, build, focused/full tests, local Chrome acceptance and package-scope inspection separately from publication. Audit counts are time-specific and should be checked again at the next release gate.
-- Windows native CI for this candidate: **NOT RUN**. Retaining the matrix or running platform fixtures on macOS does not establish a new native Windows result.
+- Native CI passed on Ubuntu and Windows Server 2025 in both [push CI](https://github.com/wudy29/engineering-bridge/actions/runs/39513363458) and [PR CI](https://github.com/wudy29/engineering-bridge/actions/runs/40260052738). Both runs correspond to head SHA `77e21d6efebc59fb73164e4162f46964172864a0`. These results do not constitute comprehensive Windows platform certification or production deployment acceptance.
 
 ## Engineering Bridge v1.5.0
 
