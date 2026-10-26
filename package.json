@@ -1,6 +1,6 @@
 {
   "name": "engineering-bridge",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "A local MCP bridge for supervised read-only Codex and DSH tasks with controlled patch application.",
   "type": "module",
   "files": [
@@ -25,6 +25,7 @@
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "test": "npm run build && node --test \"dist/tests/unit/**/*.test.js\"",
     "mcp:stdio": "node dist/src/mcp-stdio.js",
+    "dashboard": "node dist/src/dashboard.js",
     "prepack": "npm run build"
   },
   "keywords": [

@@ -9,8 +9,10 @@ import { z } from "zod";
 
 import { CodexExecutor } from "./executors/codex-executor.js";
 import { DshExecutor } from "./executors/dsh-executor.js";
+import { startObservationProducer } from "./observability/producer-heartbeat.js";
 import { VERSION } from "./version.js";
 import { CoreError, serializeError } from "./core/errors.js";
+import { dashboardLabelSchema } from "./core/dashboard-label.js";
 import { CODEX_ROUTING_POLICY_ENV, parseCodexRoutingPolicy } from "./core/codex-routing-policy.js";
 import { RegisteredWorkspaceTaskService } from "./tasks/registered-workspace-task-service.js";
 import { ControlledPatchService } from "./tasks/controlled-patch-service.js";
@@ -30,6 +32,7 @@ import { WorkspaceOnboardingService } from "./workspaces/workspace-onboarding-se
 const WorkspaceEntrySchema = z.object({
   id: z.string().min(1),
   root: z.string().min(1),
+  display_name: dashboardLabelSchema.optional(),
   allow_write: z.boolean().optional()
 }).strict();
 
@@ -150,6 +153,7 @@ async function main(): Promise<void> {
     catalog,
     projectRootEntries.map(({ root }) => root)
   );
+  let observationProducer: ReturnType<typeof startObservationProducer> | undefined;
   const service = new RegisteredWorkspaceTaskService(
     registry,
     (executor, workspaceRoot) => {
@@ -157,7 +161,8 @@ async function main(): Promise<void> {
         case "codex": return new CodexExecutor(workspaceRoot, undefined, undefined, undefined, undefined, codexRoutingPolicy);
         case "dsh": return new DshExecutor(workspaceRoot);
       }
-    }
+    },
+    { publishObservation: observation => { observationProducer?.publish(observation); } }
   );
   const controlledPatches = new ControlledPatchService(
     registry,
@@ -206,9 +211,13 @@ async function main(): Promise<void> {
     return validationRuns;
   };
 
+  let observationsStopped = false;
   // Transport EOF/caller cancellation does not own the validation lifecycle.
   // Natural exit releases the owner after active work drains; OS shutdown aborts it.
   const stop = async (reason: "bridge_shutdown" | "bridge_sigterm") => {
+    observationsStopped = true;
+    try { observationProducer?.stop(); }
+    catch { /* Observation shutdown is independent of validation ownership. */ }
     try { await validationRuns?.shutdown(reason); }
     catch (error) {
       process.stderr.write(JSON.stringify(validationError(error)) + "\n");
@@ -228,16 +237,18 @@ async function main(): Promise<void> {
     inputSchema: {
       workspace_id: z.string().min(1),
       instruction: z.string().min(1),
+      dashboard_title: dashboardLabelSchema.optional().describe("Optional public title for the local Dashboard (single line, at most 100 characters). Supply explicitly; never derive from private instruction, output, evidence or diagnostics."),
       executor: z.enum(["codex", "dsh"]).optional().default("codex"),
       model: z.string().min(1).optional(),
       reasoning_effort: z.string().min(1).optional()
     }
-  }, ({ workspace_id, instruction, executor, model, reasoning_effort }) => {
+  }, ({ workspace_id, instruction, dashboard_title, executor, model, reasoning_effort }) => {
     try {
       if (executor === "dsh" && (model !== undefined || reasoning_effort !== undefined)) {
         throw new CoreError("UNSUPPORTED_ACTION");
       }
       const { taskId } = service.startTask({ workspace_id, instruction, executor,
+        ...(dashboard_title === undefined ? {} : { dashboard_title }),
         ...(model === undefined ? {} : { model }),
         ...(reasoning_effort === undefined ? {} : { reasoning_effort }) });
       return jsonContent({ task_id: taskId });
@@ -482,6 +493,15 @@ async function main(): Promise<void> {
   });
 
   await server.connect(new StdioServerTransport());
+  if (!observationsStopped) {
+    try {
+      observationProducer = startObservationProducer(
+        configPath,
+        [...workspaceEntries, ...catalog.entries(), ...projectRootEntries].map(({ root }) => root),
+        VERSION,
+      );
+    } catch { /* Observation startup must never change MCP availability. */ }
+  }
 }
 
 main().catch((error: unknown) => {

@@ -401,4 +401,4 @@ Out of scope:
 - executing the Ombre-Brain bootstrap itself.
 
 This specification changes Engineering Bridge only. It does not modify or operate on
-`/Users/mac/Downloads/ombre-brain-private`.
+a private downstream workspace.

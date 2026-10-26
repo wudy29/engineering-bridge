@@ -1,6 +1,6 @@
 # MCP tool reference
 
-This is the tool surface of Engineering Bridge 1.5.0. The local STDIO MCP server exposes fifteen tools. The two async validation tools are additive; the original thirteen contracts remain supported.
+This is the tool surface of Engineering Bridge 1.6.0. The local STDIO MCP server exposes fifteen tools. The two async validation tools are additive; the original thirteen contracts remain supported.
 
 ## Codex routing policy
 
@@ -26,6 +26,10 @@ Conditional fields:
 
 - `thread_id`: present only for Codex tasks once a real native app-server thread exists. DSH headless has no machine-resumable session seam, so DSH tasks never carry a fabricated `thread_id`.
 - `partial_output`: present only when a genuine interrupt produced real partial output (for example, DSH cached partial stdout or the last completed Codex agent message). The task state is still `failed`; `partial_output` is never completed `output` and never appears in `error`.
+- `diagnostics.last_error_notification`: the latest eligible Codex `error` notification observed in this execution, with a Bridge-generated ISO `observed_at`, `scope` (`active_turn` only when both IDs match; otherwise `unattributed`), and optional boolean `will_retry`. Known foreign thread/turn notifications are excluded. Error text, details, raw IDs and payloads are never retained; the retry flag is only an upstream declaration, not a severity or success guarantee.
+- `diagnostics.interrupt_context`: the first accepted local interrupt's Bridge-generated ISO `requested_at` and optional frozen `last_error_notification` as observed before that request. Later errors can update the outer summary but cannot change this snapshot. No local request means no context; no retained eligible error means no summary, not proof that no fault occurred. These bounded fields reset for each execution/continue and do not change `TASK_INTERRUPTED` or turn success/failure semantics.
+
+These diagnostics are available through `task_result` while the task remains queryable. They are not an event history or a cross-restart persistence guarantee; the existing observation records and dashboard do not add these fields.
 
 `evidence` contains bounded command-execution and file-change items. When the existing bounds truncate or evict evidence, explicit markers are returned: strings cut by the size bound end with `[truncated]`, an oversized changes list gains a `[truncated: N additional changes omitted]` entry, and evidence evicted by the total count limit is reported through a synthetic `evidence-drop` item. These markers mean the diagnostic information is incomplete.
 
@@ -167,6 +171,6 @@ Use a trusted, canonical configuration directory outside every repository, regis
 
 For configuration `<config>`, async uses private `<config>.validation-runs/`, sibling `<config>.validation-runs.owner.json` / `.owner-guard`, and `<config>.validation-worktrees/`. Records are atomic write/fsync/rename replacements with bounded 64 KiB per-step tails, a 4 MiB record cap and 256 MiB/4096-entry store limits. Capacity fails closed rather than evicting history. Snapshots retain configured argv; keep credentials out of profiles and output. Only one Bridge can own a store at a time; another instance returns safe async ownership errors while legacy tools remain available. Async v1 requires POSIX; Windows returns `VALIDATION_PLATFORM_UNSUPPORTED` without disabling the old tools.
 
-Normal SIGTERM/SIGINT or service shutdown aborts supervised children/process groups within existing bounds and attempts bounded, ownership-verified cleanup. Caller EOF lets active work finish before natural process exit. A hard Bridge crash cannot guarantee child termination; startup never signals an old child, resumes, retries, attaches, visits an old worktree, or deletes a stale scene. Instead it durably converts leftover non-terminal records to `INCOMPLETE` (`supervisor_lost`) with the existing cleanup disposition and recovery fence. Uncertain persistence/ownership fails closed. The fence is not cleared by manually deleting paths; a later explicit controlled recovery is required and no cleanup tool is exposed in v1.5.0.
+Normal SIGTERM/SIGINT or service shutdown aborts supervised children/process groups within existing bounds and attempts bounded, ownership-verified cleanup. Caller EOF lets active work finish before natural process exit. A hard Bridge crash cannot guarantee child termination; startup never signals an old child, resumes, retries, attaches, visits an old worktree, or deletes a stale scene. Instead it durably converts leftover non-terminal records to `INCOMPLETE` (`supervisor_lost`) with the existing cleanup disposition and recovery fence. Uncertain persistence/ownership fails closed. The fence is not cleared by manually deleting paths; a later explicit controlled recovery is required and no cleanup tool is exposed in v1.6.0.
 
 Completed records remain queryable after restart. Refresh the connector catalog after installing the new version (13 → 15). No existing tool is renamed or made asynchronous; no list/history, cleanup, subscription, or streaming tool is added.

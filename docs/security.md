@@ -1,6 +1,6 @@
 # Security design
 
-This document separates enforced behavior from operating assumptions for Engineering Bridge 1.5.0.
+This document separates enforced behavior from operating assumptions for Engineering Bridge 1.6.0.
 
 ## Enforced in code
 
@@ -49,8 +49,20 @@ Task results can include `review_output`, bounded command/file-change `evidence`
 
 The patch-generation prompt constrains expected output but is not relied upon by itself; code validates the returned patch before application.
 
+## Loopback dashboard and observation privacy
+
+The optional dashboard binds only `127.0.0.1`, defaults to port 4317, and accepts only `127.0.0.1`/`localhost` Host values with an optional matching port. Only `GET /` and `GET /api/snapshots` are served; other methods/hosts are rejected and responses carry `Cache-Control: no-store`. There is no task-control or deletion route, remote MCP transport, authentication, or TLS. Loopback and Host validation limit exposure but do not authenticate a local reader; do not publish this listener through a proxy or tunnel.
+
+Observation snapshots are separate, best-effort metadata beneath `<config>.observations/`, not canonical execution state. The writer enforces storage boundaries and private POSIX permissions; the reader bounds each record, checks schema/identity and regular-file/directory properties, and returns selected fields. Labels use text rendering, not HTML. Public titles/display names must be explicitly safe to show: they may persist on disk and be readable through local HTTP. Private instructions, output, evidence and the new pre-interrupt diagnostic summaries are not exported. Other metadata, including IDs, selected model, timestamps and known fixed error summaries, remains locally visible.
+
+Heartbeat freshness does not prove process liveness or authorize control. Old/unknown producers' records are historical observations, not current confirmable tasks. Browser clear/restore changes only an origin-local cutoff; it does not accept/cancel tasks, erase files, or implement disk retention. Storage failure can limit hiding to the current page. No automatic disk-history eviction is provided in v1.6.0.
+
+Codex diagnostics retain only bounded error-notification timing/scope/retry metadata and the snapshot frozen at the first local interrupt. Raw error text, payloads and thread/turn IDs are excluded from these summaries; absence is not proof that no fault occurred. Existing interrupt, timeout and task-result boundaries remain unchanged.
+
+The release lockfile pins the reviewed security updates without new dependencies, overrides or changed dependency ranges. `npm ci` uses that lockfile; audit results are point-in-time evidence, not a promise against future advisories.
+
 ## Not provided
 
-Bridge has no caller authentication, HTTP or remote service, UI, persistent database, persistent task/thread/evidence supervision history, persistent logs, resource quota, automatic acceptance, or restart recovery of active task state. Do not expose the STDIO process through an untrusted wrapper. Do not place credentials or sensitive material in prompts, configuration, or public reports.
+Bridge has no caller authentication, remote MCP service, writable dashboard, persistent database, complete task/thread/evidence audit history, persistent executor logs, resource quota, automatic acceptance, or restart recovery of active task state. Local observation snapshots persist separately and do not restore supervision. Do not expose the STDIO process through an untrusted wrapper. Do not place credentials or sensitive material in prompts, configuration, or public reports.
 
 See [SECURITY.md](../SECURITY.md) for the operator-facing security policy and [threat-model.md](threat-model.md) for the compact threat summary.

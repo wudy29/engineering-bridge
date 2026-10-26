@@ -2,11 +2,11 @@
 
 **打通 Chat 与本地 Codex 与 Deepseek harness：不再搬提示词，Chat 直接调度、监督并验收 Codex 与 Deepseek harness。**
 
-[![v1.5.0](https://img.shields.io/badge/version-v1.5.0-blue)](RELEASE_NOTES.md)
+[![v1.6.0](https://img.shields.io/badge/version-v1.6.0-blue)](RELEASE_NOTES.md)
 [![CI](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[English](README.en.md) · **v1.5.0 · V1 · 本地运行 · macOS 由维护者持续实测。** 版本号不代表已创建 tag、GitHub Release 或 npm 发布，这些仍是独立操作。Windows 侧已有 Codex 与 DSH npm CLI 启动路径 smoke 验证；本版 async validation 依赖 POSIX process-group supervision，Windows 返回 `VALIDATION_PLATFORM_UNSUPPORTED`，旧同步与其他工具保持既有行为。
+[English](README.en.md) · **v1.6.0 · V1 · 本地运行 · macOS 由维护者持续实测。** 版本号不代表已创建 tag、GitHub Release 或 npm 发布，这些仍是独立操作。Windows 侧已有 Codex 与 DSH npm CLI 启动路径 smoke 验证；本版 async validation 依赖 POSIX process-group supervision，Windows 返回 `VALIDATION_PLATFORM_UNSUPPORTED`，旧同步与其他工具保持既有行为。
 
 ## 以前 / 现在
 
@@ -27,7 +27,7 @@ flowchart LR
 
 **状态边界：** Bridge 持有控制状态，不持有第二份会话事实。Codex 原生 thread/session 是执行历史的来源；Bridge 只保留继续、定向纠正、打断和验收所需的临时监督/控制状态。DSH 的 headless 接口当前没有可机器恢复的 session seam，因此 DSH 的 `continue` 是新的执行，`task_result` 也绝不伪造 thread id。任务监督状态（task/thread/evidence/review）在 Bridge 重启时可按设计丢失；V1 不会把任何执行器会话历史持久化或镜像到 SQLite、数据库或 transcript mirror。
 
-以上全部是本机进程通过 MCP/STDIO 建立的连接。Engineering Bridge 不存在 HTTP 端点或云服务。
+以上任务控制通过本机 MCP/STDIO 连接。v1.6.0 另有独立启动的中文只读看板，HTTP 仅监听 `127.0.0.1:4317`；它不提供远程 MCP、任务控制或云服务。
 
 ## 它是什么？
 
@@ -44,7 +44,7 @@ Engineering Bridge 是一个在你电脑上运行的小型“工程桥梁”。�
 - **聊天客户端：** 理解你的要求、调用工具，并把结果显示在对话中；它必须支持启动本地 STDIO MCP 服务。
 - **Engineering Bridge：** 把 `workspace_id` 映射到可信本机配置中的项目路径，启动并跟踪任务，校验受控补丁。
 - **本机执行器：** Codex 通过 `codex app-server --stdio` 运行；DSH 通过官方 headless 接口运行。两者都只执行只读检查或准备补丁。
-- **MCP-STDIO：** 客户端与 Bridge 之间的本地协议和进程连接；没有 HTTP 端点或云服务。
+- **MCP-STDIO：** 客户端与 Bridge 之间的本地任务控制连接；独立看板只读取观测快照，不承载 MCP。
 
 ## 今天可以做什么？
 
@@ -88,8 +88,8 @@ Chat 保留需求背景、前面的设计取舍和已经发生过的失败；Cod
 | --- | --- | --- |
 | 在预登记工作区中进行只读分析、代码定位和审阅；`run_task`、`generate_controlled_patch`、`refine_controlled_patch` 每次调用可选 Codex 或 DSH（默认 Codex） | `APPLY` 本身不自动运行校验/测试，不 stage、commit、push 或创建 Release；Git commit 需要单独精确 `COMMIT` | workspace GUI/manager |
 | 在 `project_root` 内用精确 `BIND`/`CREATE` 绑定或创建工作区 | 不是 OS 级读取隔离 | 其他 CLI agent 逐个适配 |
-| 写入前生成完整 Git 补丁；managed 工作区经精确 `AUTHORIZE` 后受控写入 | 没有 HTTP、UI、账号系统、调用方认证或远程传输 | DSH 原生 headless session resume |
-| 仅在精确 `APPLY` 后应用，并重新校验 base HEAD 与仓库状态；支持 unborn 仓库新增 100644 文本文件 | 不持久化 task/thread/evidence 监督历史；没有资源配额 | 持久 task/audit 历史 |
+| 写入前生成完整 Git 补丁；managed 工作区经精确 `AUTHORIZE` 后受控写入 | 仅有 loopback 只读看板；没有账号系统、调用方认证或远程 MCP 传输 | DSH 原生 headless session resume |
+| 仅在精确 `APPLY` 后应用，并重新校验 base HEAD 与仓库状态；支持 unborn 仓库新增 100644 文本文件 | 不恢复 task/thread/evidence 监督状态；观测快照不是审计日志，没有资源配额 | 持久 task/audit 历史 |
 | 对已 `APPLY` 的受控补丁仅在精确 `COMMIT` 后创建一个 Git commit；Bridge 绝不 push | 不会自动发布或创建 Release | — |
 | 固定校验 profile（精确 `CONFIGURE`）；保留同步校验，新增 async start/query 与 retained PASS/FAIL/INCOMPLETE | 校验不是主机级沙箱；重启不续跑，不自动清理遗留现场 | — |
 | 受控补丁提案/应用历史、managed 工作区目录、validation profile 与独立 validation run 跨重启保留 | validation run 不是执行器会话历史 | 谨慎探索多 agent 编排 |
@@ -105,7 +105,7 @@ Chat 保留需求背景、前面的设计取舍和已经发生过的失败；Cod
 
 **按执行器准备：**
 
-- **Codex：** 安装并认证 `codex` CLI，使其可从 `PATH` 调用。Bridge 以 `codex app-server --stdio` 启动 Codex：不经过 shell，approval 为 `never`，网络禁用。
+- **Codex：** 安装并认证 `codex` CLI，优先从 `PATH` 解析。POSIX 上仅在绝对 `PATH` 项未找到可执行文件时，才尝试绝对 `HOME` 下的 `.local/bin/codex`，且必须是可执行普通文件；Windows 的原生可执行文件/npm shim 无 shell 启动路径保持不变。Bridge 以 `codex app-server --stdio` 启动 Codex：不经过 shell，approval 为 `never`，网络禁用。
 - **DSH：** 安装官方 npm 包 `@deepseek-ai/dsh`；`dsh` 可从 `PATH` 调用，或由 Bridge 经 `DSH_HOME`/`~/.dsh` 的 profiles 回退路径找到。若 Bridge 运行环境的环境变量中设置了 `DEEPSEEK_API_KEY`，Bridge 会将其转发给 DSH——这是 Bridge 转发的唯一凭据环境变量；密钥不要写进配置文件（见第 4 节）。Bridge 以 `dsh --profile headless <指令>` 启动 DSH，并自行固定 `DSH_PERMISSION_MODE=read-only`——请勿自行设置该变量。`DSH_TOOLS_MODE` 是可选透传；proxy 变量不会转发。
 
 ### 2. Clone、安装与构建
@@ -113,11 +113,11 @@ Chat 保留需求背景、前面的设计取舍和已经发生过的失败；Cod
 ```sh
 git clone https://github.com/wudy29/engineering-bridge.git
 cd engineering-bridge
-npm install
+npm ci
 npm run build
 ```
 
-当前 v1.5.0 没有一键安装器。
+当前 v1.6.0 没有一键安装器。
 
 ### 3. 登记工作区
 
@@ -280,6 +280,23 @@ caller 断开不会取消仍由 Bridge 持有的 validation；若客户端或 wr
 - `INCOMPLETE`：profile 缺失、preflight 失败、超时、spawn/信号/基础或清理失败；unborn 仓库提案（`base_head` 为 null）返回 `INCOMPLETE` 且 `reason: "unsupported_unborn_base"`，不会创建临时 worktree 或执行任何命令。
 
 临时 worktree 隔离保护已登记工作区的整洁（候选补丁与构建产物不会进入真实工作区），但**不是主机级沙箱**：校验命令以 Bridge 所在的系统用户权限运行，仍受该用户的主机访问权限边界约束。因此只应为可信工作区配置你完全信任的命令。
+
+## 中文只读看板与任务观测
+
+构建后，用与 MCP 相同的配置路径单独启动看板：
+
+```sh
+npm run dashboard -- /absolute/path/to/bridge-state/workspaces.json
+```
+
+在本机浏览器打开 `http://127.0.0.1:4317/`。MCP 生产者在连接后每 5 秒发布心跳，并将选定的任务元数据尽力写入配置旁的 `<config>.observations/`；配置及该目录应位于仓库、已登记工作区和批准根目录之外。看板每 2 秒读取快照，15 秒内的心跳视为新鲜；这不是操作系统进程存活证明，也不恢复任务控制状态。观测写入失败不会改变任务执行结果。
+
+- “当前任务”只显示新鲜生产者的 `queued` / `running`。等待审核、已结束任务分别折叠；旧进程或心跳未知的记录单独标记为“历史观测，当前状态不可确认”。
+- `run_task` 可显式传入公开的 `dashboard_title`；手动工作区登记可配置公开的 `display_name`。两者都是非空单行、至多 100 个 UTF-16 代码单元；不要写入秘密。缺少任务标题时显示项目、执行器和短任务 ID，不从私有指令、输出或诊断提取标题。
+- “清理历史显示”仅在当前浏览器 origin 的 localStorage 保存时间标记，隐藏此前的审核卡片和已结束卡片；轮询、刷新后保留，之后的新记录仍显示。“恢复显示”清除标记；存储不可用时仅本页生效。两者都不改变任务状态、不删除磁盘文件，也不是任务验收或取消。
+- HTTP 仅接受允许的 loopback Host 和 `GET /`、`GET /api/snapshots`，响应为 `no-store`，没有写端点、认证或 TLS。Host 检查不是身份认证；同机可访问该端口的进程可能读取元数据。不要代理、转发或公开此端口。
+
+`task_result` 保留 Codex 的有界 `diagnostics.last_error_notification`，以及首次本地中断前冻结的 `diagnostics.interrupt_context`。它们不含原始错误文本、详情或原始 thread/turn ID，不改变 `TASK_INTERRUPTED` 语义，不是跨重启事件日志，也不会发布到看板。v1.6.0 没有磁盘历史自动淘汰。
 
 ## 安全边界
 

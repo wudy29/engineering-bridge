@@ -1,9 +1,14 @@
 # Threat model
 
-This threat model covers Engineering Bridge 1.5.0. Bridge assumes one trusted local operator controls startup configuration and the local MCP client. It is not designed for untrusted remote callers.
+This threat model covers Engineering Bridge 1.6.0. Bridge assumes one trusted local operator controls startup configuration and the local MCP client. It is not designed for untrusted remote callers.
 
 | Risk | Current control | Remaining responsibility or limit |
 |---|---|---|
+| Dashboard is exposed beyond the trusted machine | Bind to `127.0.0.1`; validate loopback Host; GET-only routes with `no-store` and no execution/deletion route | No authentication or TLS; local readers may access metadata. Never proxy/tunnel the dashboard publicly |
+| Public labels disclose secrets or inject HTML | Explicit bounded single-line labels; text rendering; no automatic title extraction from private instructions/output | Operator/caller must keep public labels free of secrets; observations can persist on disk |
+| Old records are mistaken for live tasks or clearing is mistaken for deletion | Heartbeat-based current/review/history partitions; clear/restore stores only a browser-origin cutoff | Freshness is not process-liveness proof; hiding never changes task state or disk contents, and no automatic disk eviction exists |
+| Observation failure changes execution truth | Separate best-effort sink; bounded selected metadata; directory/file identity and storage-boundary checks | Snapshots are neither canonical task state nor a complete audit log |
+| Pre-interrupt errors leak raw payloads or change lifecycle | Bounded timing/scope/retry summaries; freeze first-interrupt context; exclude raw error text and IDs | Process-local diagnostic hints only; no complete history or cross-restart guarantee |
 | Caller chooses an arbitrary workspace | MCP accepts only a registered ID; manual roots come from startup configuration, managed roots are confined to `project_root` approved roots | Operator must protect and review the configuration file |
 | Onboarding escapes the approved root | `bind_project`/`create_project` require exact `BIND`/`CREATE`, canonicalize the candidate with `realpath`, and fail closed unless it equals or is contained by an approved root | Operator chooses `project_root` entries; symlink containment is enforced on the canonical path |
 | Executor modifies files during a task or proposal | `run_task`, supervisor continuations, steering, and proposal generation use fixed read-only settings: Codex approval `never` and read-only sandbox; DSH pinned `DSH_PERMISSION_MODE=read-only` per process | Same-user reads are not contained to the workspace |

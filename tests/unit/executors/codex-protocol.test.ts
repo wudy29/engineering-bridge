@@ -5,7 +5,7 @@ import test from "node:test";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { isId } from "../../../src/core/ids.js";
 import { CodexExecutor, type ProcessStarter } from "../../../src/executors/codex-executor.js";
-import type { ExecutorRequest, ExecutorResult } from "../../../src/executors/executor.js";
+import type { ExecutorProgressDiagnostics, ExecutorRequest, ExecutorResult } from "../../../src/executors/executor.js";
 
 const taskId = "550e8400-e29b-41d4-a716-446655440000";
 if (!isId(taskId)) throw new Error("Invalid fixture ID");
@@ -50,13 +50,14 @@ function server(onRequest?: (message: Rpc, peer: Peer) => boolean | void) {
   } });
   Object.assign(child, { stdin, stdout, stderr, kill(signal: string) { signals.push(signal); child.emit("signal", signal); return true; } });
   const starter: ProcessStarter = () => child as unknown as ChildProcessWithoutNullStreams;
-  const executor = new CodexExecutor("/trusted/workspace", starter, {}, process.platform, timing);
+  const executor = new CodexExecutor("/trusted/workspace", starter, { PATH: "", HOME: "" }, "linux", timing);
   return { ...peer, executor };
 }
 type Peer = Pick<ReturnType<typeof server>, "send" | "raw" | "exit" | "terminal" | "child" | "stdout" | "stderr" | "sent" | "signals">;
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-function diagnostics(result: ExecutorResult): Record<string, unknown> {
-  return result.diagnostics as unknown as Record<string, unknown>;
+function diagnostics(result: ExecutorResult): NonNullable<ExecutorResult["diagnostics"]> {
+  assert.ok(result.diagnostics);
+  return result.diagnostics;
 }
 function failed(result: ExecutorResult, category: string, code = "CODEX_EXECUTION_FAILED") {
   assert.equal(result.kind, "failed");
@@ -64,6 +65,298 @@ function failed(result: ExecutorResult, category: string, code = "CODEX_EXECUTIO
   assert.equal(result.error.code, code);
   assert.equal(diagnostics(result).failure_category, category);
   assert.equal(typeof diagnostics(result).last_activity_at, "string");
+}
+
+test("pre-interrupt error survives ordinary activity and interrupted completion", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-05T00:00:00Z") });
+  const peer = server((rpc, io) => {
+    if (rpc.method !== "turn/interrupt") return;
+    io.send({ id: rpc.id, result: {} });
+    io.terminal("interrupted");
+    return true;
+  });
+  const pending = peer.executor.execute(request);
+  await tick();
+  peer.send({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1", status: "inProgress" } } });
+  peer.send({ method: "error", params: {
+    threadId: "thread-1", turnId: "turn-1", willRetry: true,
+    error: { message: "SYNTHETIC_PRIVATE_CANARY", additionalDetails: "/private/SYNTHETIC_PRIVATE_CANARY" }
+  } });
+  peer.send({ method: "item/started", params: {
+    threadId: "thread-1", turnId: "turn-1", item: { id: "ordinary", type: "reasoning" }
+  } });
+  await peer.executor.interrupt();
+  const result = await pending;
+  assert.equal(result.kind, "interrupted");
+  assert.equal(diagnostics(result).last_valid_method, "turn/completed");
+  assert.equal(diagnostics(result).rpc_timeout, false);
+  assert.equal(diagnostics(result).failure_category, undefined);
+  const summary = { observed_at: "2026-10-05T00:00:00.000Z", scope: "active_turn", will_retry: true };
+  assert.deepEqual(diagnostics(result).last_error_notification, summary);
+  assert.deepEqual(diagnostics(result).interrupt_context, {
+    requested_at: "2026-10-05T00:00:00.000Z", last_error_notification: summary
+  });
+  assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE_CANARY/);
+});
+
+test("first interrupt freezes error B before its RPC; later error C and callbacks cannot alter it", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-05T00:00:00Z") });
+  const peer = server((rpc) => rpc.method === "turn/interrupt");
+  let snapshot: ExecutorProgressDiagnostics["interrupt_context"];
+  const pending = peer.executor.execute({ ...request, onDiagnostics(update) {
+    if (update.last_error_notification) {
+      assert.ok(Object.isFrozen(update.last_error_notification));
+      assert.equal(Reflect.set(update.last_error_notification, "scope", "SYNTHETIC_PRIVATE_CANARY"), false);
+    }
+    if (update.interrupt_context) {
+      if (!snapshot) {
+        assert.equal(peer.sent.some(rpc => rpc.method === "turn/interrupt"), false);
+        snapshot = update.interrupt_context;
+      }
+      assert.ok(Object.isFrozen(update.interrupt_context));
+      assert.equal(Reflect.set(update.interrupt_context, "requested_at", "SYNTHETIC_PRIVATE_CANARY"), false);
+      assert.equal(Reflect.set(update.interrupt_context.last_error_notification!, "will_retry", true), false);
+    }
+    Reflect.set(update, "last_error_notification", { scope: "SYNTHETIC_PRIVATE_CANARY" });
+  } });
+  await tick();
+  peer.send({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } });
+  for (const willRetry of [true, false]) peer.send({
+    method: "error", params: { threadId: "thread-1", turnId: "turn-1", willRetry }
+  });
+  peer.send({ method: "error", params: { threadId: "foreign", turnId: "turn-1", willRetry: true } });
+  peer.send({ method: "error", params: { threadId: "thread-1", turnId: null, willRetry: true } });
+  await peer.executor.interrupt();
+  peer.send({ method: "error", params: { willRetry: true } });
+  await peer.executor.interrupt();
+  assert.equal(peer.sent.filter(rpc => rpc.method === "turn/interrupt").length, 1);
+  peer.send({ id: peer.sent.find(rpc => rpc.method === "turn/interrupt")!.id, result: {} });
+  peer.terminal("completed");
+  const result = await pending;
+  assert.equal(result.kind, "interrupted", "late success cannot flip the locked result");
+  assert.deepEqual(diagnostics(result).interrupt_context, {
+    requested_at: "2026-10-05T00:00:00.000Z",
+    last_error_notification: { observed_at: "2026-10-05T00:00:00.000Z", scope: "active_turn", will_retry: false }
+  });
+  assert.strictEqual(diagnostics(result).interrupt_context, snapshot);
+  assert.deepEqual(diagnostics(result).last_error_notification, {
+    observed_at: "2026-10-05T00:00:00.000Z", scope: "unattributed", will_retry: true
+  });
+  assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE_CANARY/);
+});
+
+test("local interruption without an error records only the accepted request", async () => {
+  const peer = server();
+  const pending = peer.executor.execute(request);
+  await tick();
+  await peer.executor.interrupt();
+  const result = await pending;
+  assert.equal(result.kind, "interrupted");
+  assert.deepEqual(Object.keys(diagnostics(result).interrupt_context!), ["requested_at"]);
+  assert.equal(diagnostics(result).last_error_notification, undefined);
+  assert.equal(diagnostics(result).failure_category, undefined);
+});
+
+for (const status of ["completed", "interrupted", "failed"]) {
+  test(`an error notification preserves upstream ${status} without a local interrupt or retry`, async () => {
+    const peer = server();
+    const pending = peer.executor.execute(request);
+    await tick();
+    peer.send({ method: "error", params: { threadId: "thread-1", turnId: "turn-1", willRetry: true } });
+    peer.terminal(status);
+    const result = await pending;
+    assert.equal(result.kind, status);
+    assert.equal(diagnostics(result).last_error_notification?.will_retry, true);
+    assert.equal(diagnostics(result).interrupt_context, undefined);
+    assert.equal(diagnostics(result).failure_category, status === "failed" ? "turn_failed" : undefined);
+    assert.equal(peer.sent.filter(rpc => rpc.method === "turn/start").length, 1);
+    assert.equal(peer.sent.some(rpc => rpc.method === "turn/interrupt"), false);
+  });
+}
+
+const privateCanary = "SYNTHETIC_PRIVATE_CANARY";
+const errorCases: { name: string; params?: unknown; scope?: "active_turn" | "unattributed"; retry?: boolean }[] = [
+  { name: "matching IDs before turn/started", params: { threadId: "thread-1", turnId: "turn-1", willRetry: false }, scope: "active_turn", retry: false },
+  { name: "foreign thread", params: { threadId: "foreign", turnId: "turn-1" } },
+  { name: "foreign turn", params: { threadId: "thread-1", turnId: "foreign" } },
+  { name: "foreign thread only", params: { threadId: "foreign" } },
+  { name: "foreign turn only", params: { turnId: "foreign" } },
+  { name: "missing IDs", params: { willRetry: true }, scope: "unattributed", retry: true },
+  { name: "thread only", params: { threadId: "thread-1" }, scope: "unattributed" },
+  { name: "turn only", params: { turnId: "turn-1" }, scope: "unattributed" },
+  { name: "omitted params", scope: "unattributed" },
+  { name: "null params", params: null, scope: "unattributed" },
+  { name: "string params", params: privateCanary, scope: "unattributed" },
+  { name: "array params", params: [privateCanary], scope: "unattributed" },
+  { name: "number params", params: 42, scope: "unattributed" },
+  { name: "empty ID", params: { threadId: "", turnId: "turn-1" } },
+  { name: "null ID", params: { threadId: "thread-1", turnId: null } },
+  { name: "wrong ID type", params: { threadId: [], turnId: "turn-1" } },
+  { name: "string retry", params: { willRetry: "true" }, scope: "unattributed" },
+  { name: "null retry", params: { willRetry: null }, scope: "unattributed" },
+  { name: "object retry", params: { willRetry: { message: privateCanary } }, scope: "unattributed" },
+  { name: "large payload", params: {
+    threadId: "thread-1", turnId: "turn-1", willRetry: true, observed_at: "untrusted time",
+    error: { message: privateCanary.repeat(4096), additionalDetails: privateCanary, data: [privateCanary] }
+  }, scope: "active_turn", retry: true },
+  { name: "large foreign ID", params: { threadId: privateCanary.repeat(4096), turnId: "turn-1" } }
+];
+for (const example of errorCases) {
+  test(`error summary attribution and privacy: ${example.name}`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-05T00:00:00Z") });
+    const peer = server();
+    const pending = peer.executor.execute(request);
+    await tick();
+    peer.send({ method: "error", ...(example.params === undefined ? {} : { params: example.params }) });
+    peer.terminal();
+    const result = await pending;
+    assert.equal(result.kind, "completed");
+    assert.deepEqual(diagnostics(result).last_error_notification, example.scope === undefined ? undefined : {
+      observed_at: "2026-10-05T00:00:00.000Z", scope: example.scope,
+      ...(example.retry === undefined ? {} : { will_retry: example.retry })
+    });
+    assert.equal(diagnostics(result).interrupt_context, undefined);
+    assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE_CANARY|untrusted time/);
+  });
+}
+
+for (const phase of ["thread/start", "turn/start"]) {
+  test(`error before ${phase} response stays unattributed without buffering or promotion`, async () => {
+    const peer = server((rpc, io) => {
+      if (rpc.method === phase) io.send({ method: "error", params: {
+        threadId: "thread-1", turnId: "turn-1", error: { message: privateCanary.repeat(4096) }
+      } });
+    });
+    const pending = peer.executor.execute(request);
+    await tick();
+    peer.terminal();
+    const result = await pending;
+    assert.equal(result.kind, "completed");
+    assert.equal(diagnostics(result).last_error_notification?.scope, "unattributed");
+    assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE_CANARY/);
+  });
+}
+
+test("a known foreign thread cannot be attributed while turn identity is pending", async () => {
+  const peer = server((rpc, io) => {
+    if (rpc.method === "turn/start") io.send({ method: "error", params: { threadId: "foreign", turnId: "turn-1" } });
+  });
+  const pending = peer.executor.execute(request);
+  await tick();
+  peer.terminal();
+  assert.equal(diagnostics(await pending).last_error_notification, undefined);
+});
+
+for (const phase of ["initialize", "thread/start", "turn/start"]) {
+  test(`early local interrupt at ${phase} records no fabricated cooperative RPC`, async () => {
+    const peer = server(rpc => rpc.method === phase);
+    const pending = peer.executor.execute(request);
+    await tick();
+    await peer.executor.interrupt();
+    const result = await pending;
+    assert.equal(result.kind, "interrupted");
+    assert.equal(typeof diagnostics(result).interrupt_context?.requested_at, "string");
+    assert.equal(diagnostics(result).interrupt_context?.last_error_notification, undefined);
+    assert.equal(diagnostics(result).rpc_method, phase);
+    assert.equal(diagnostics(result).protocol_phase, phase);
+    assert.equal(peer.sent.some(rpc => rpc.method === "turn/interrupt"), false);
+  });
+}
+
+test("a locked hard deadline rejects local interrupt context despite active notifications", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const peer = server();
+  const pending = peer.executor.execute(request);
+  await tick();
+  peer.send({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } });
+  for (let i = 0; i < 5; i += 1) {
+    t.mock.timers.tick(90);
+    peer.send({ method: "error", params: { threadId: "thread-1", turnId: "turn-1" } });
+  }
+  t.mock.timers.tick(50);
+  await peer.executor.interrupt();
+  peer.terminal();
+  const result = await pending;
+  failed(result, "execution_deadline");
+  assert.equal(diagnostics(result).interrupt_context, undefined);
+  assert.equal(peer.sent.some(rpc => rpc.method === "turn/interrupt"), false);
+});
+
+test("unattributed error evidence does not extend the inactivity watchdog", async (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const peer = server();
+  const pending = peer.executor.execute(request);
+  await tick();
+  t.mock.timers.tick(90);
+  peer.send({ method: "error", params: {} });
+  t.mock.timers.tick(10);
+  await peer.executor.interrupt();
+  peer.terminal();
+  const result = await pending;
+  failed(result, "inactivity_timeout", "EXECUTOR_STALLED");
+  assert.equal(diagnostics(result).last_error_notification?.scope, "unattributed");
+  assert.equal(diagnostics(result).interrupt_context, undefined);
+});
+
+test("settled protocol failure and trailing notifications cannot create interrupt evidence", async () => {
+  const peer = server();
+  const pending = peer.executor.execute(request);
+  await tick();
+  peer.raw('broken-json\n{"method":"error","params":{"willRetry":true}}\n');
+  await assert.rejects(peer.executor.interrupt(), { code: "INVALID_STATE_TRANSITION" });
+  const result = await pending;
+  failed(result, "protocol_error", "CODEX_PROTOCOL_ERROR");
+  assert.equal(diagnostics(result).last_error_notification, undefined);
+  assert.equal(diagnostics(result).interrupt_context, undefined);
+});
+
+test("1000 error notifications retain at most two small summaries", async () => {
+  const peer = server();
+  const pending = peer.executor.execute(request);
+  await tick();
+  peer.send({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1" } } });
+  for (let i = 0; i < 1000; i += 1) {
+    if (i === 500) await peer.executor.interrupt();
+    peer.send({ method: "error", params: {
+      ...(i < 500 ? { threadId: "thread-1", turnId: "turn-1" } : {}),
+      willRetry: i % 2 === 0, error: { message: privateCanary }
+    } });
+  }
+  peer.terminal("interrupted");
+  const result = await pending;
+  assert.equal(result.kind, "interrupted");
+  const { last_error_notification, interrupt_context } = diagnostics(result);
+  assert.equal(last_error_notification?.scope, "unattributed");
+  assert.equal(interrupt_context?.last_error_notification?.scope, "active_turn");
+  assert.equal(interrupt_context?.last_error_notification?.will_retry, false);
+  const json = JSON.stringify({ last_error_notification, interrupt_context });
+  assert.ok(Buffer.byteLength(json, "utf8") < 1024);
+  assert.doesNotMatch(json, /\[|SYNTHETIC_PRIVATE_CANARY/);
+});
+
+for (const sameTask of [true, false]) {
+  test(`reusing an executor for ${sameTask ? "the same" : "another"} task resets all anomaly metadata`, async () => {
+    const peers = [server(), server()];
+    let runs = 0;
+    const executor = new CodexExecutor("/trusted/workspace",
+      () => peers[runs++]!.child as unknown as ChildProcessWithoutNullStreams,
+      { PATH: "", HOME: "" }, "linux", timing);
+    const first = executor.execute(request);
+    await tick();
+    peers[0]!.send({ method: "error", params: { willRetry: true } });
+    await executor.interrupt();
+    peers[0]!.terminal("interrupted");
+    assert.ok(diagnostics(await first).interrupt_context?.last_error_notification);
+    const otherId = "550e8400-e29b-41d4-a716-446655440001";
+    assert.ok(isId(otherId));
+    const second = executor.execute({ ...request, taskId: sameTask ? request.taskId : otherId });
+    await tick();
+    peers[1]!.terminal();
+    const result = await second;
+    assert.equal(result.kind, "completed");
+    assert.equal(diagnostics(result).last_error_notification, undefined);
+    assert.equal(diagnostics(result).interrupt_context, undefined);
+  });
 }
 
 for (const method of ["initialize", "model/list", "thread/start", "thread/resume", "turn/start"]) {
@@ -224,9 +517,11 @@ test("processing stops at terminal event even when trailing messages share its c
   await tick();
   peer.raw([
     { method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } },
+    { method: "error", params: { threadId: "thread-1", turnId: "turn-1", willRetry: true } },
     { method: "item/completed", params: { item: { id: "late", type: "commandExecution", command: "late" } } }
   ].map((message) => JSON.stringify(message) + "\n").join(""));
   assert.equal((await pending).kind, "completed");
+  assert.equal(diagnostics(await pending).last_error_notification, undefined);
   assert.deepEqual(evidence, []);
 });
 

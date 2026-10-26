@@ -9,6 +9,7 @@ import {
   signalExecution,
   signalProcessGroup,
   type Executor,
+  type ExecutorErrorNotificationSummary,
   type ExecutorEvidence,
   type ExecutorProgressDiagnostics,
   type ExecutorRequest,
@@ -28,6 +29,11 @@ const DEFAULT_RPC_CALL_TIMEOUT_MS = 30_000;
 // location so a Windows npm install can be launched through Node directly
 // (never through a shell).
 const CODEX_NODE_TARGET = ["@openai", "codex", "bin", "codex.js"] as const;
+// Conventional per-user Codex install location on POSIX hosts, relative to
+// HOME. A launch environment whose PATH omits ~/.local/bin otherwise hides a
+// perfectly good per-user `codex`; the resolver consults this only after PATH
+// produced no executable `codex`, and never on Windows.
+const CODEX_HOME_FALLBACK = [".local", "bin", "codex"] as const;
 // Machine- and human-readable marker appended to any bounded evidence string
 // that was cut by MAX_TEXT, and the basis of the synthetic change/evidence
 // entries that make list and count truncation visible.
@@ -153,14 +159,19 @@ export class CodexExecutor implements Executor {
         cwd: this.workspaceRoot, shell: false, stdio: ["pipe", "pipe", "pipe"],
         detached: this.platform !== "win32", env: environment(this.hostEnvironment)
       };
-      // Windows: a directly spawnable codex.exe is preferred; an npm-installed
-      // codex.cmd shim is resolved to the official bin/codex.js Node target and
-      // launched through Node directly. Nothing here goes through a shell, and
-      // the user instruction travels over stdin, never through the command
-      // line. Everywhere else (and as the Windows fallback) the original bare
-      // "codex" spawn is unchanged.
+      // POSIX: an executable `codex` on the host PATH keeps the original bare
+      // spawn, so the launched process performs its own PATH lookup. Only a
+      // PATH miss (for example a launch environment whose PATH omits
+      // ~/.local/bin) may resolve to the per-user HOME fallback; the resolver
+      // ignores that option on Windows. There, a directly spawnable codex.exe
+      // is preferred and an npm-installed codex.cmd shim is resolved to the
+      // official bin/codex.js Node target and launched through Node directly.
+      // Nothing here goes through a shell, and the user instruction travels
+      // over stdin, never through the command line.
       const resolved = resolveCommand(this.hostEnvironment, "codex", {
-        nodeTarget: CODEX_NODE_TARGET, platform: this.platform
+        nodeTarget: CODEX_NODE_TARGET,
+        homeRelativeFallback: CODEX_HOME_FALLBACK,
+        platform: this.platform
       });
       if (resolved.kind === "direct") {
         child = this.startProcess(resolved.executable, ["app-server", "--stdio"], options);
@@ -329,6 +340,14 @@ export class CodexExecutor implements Executor {
     };
     this.beginInterrupt = () => {
       if (settled || terminationResult !== undefined) return;
+      if (diagnostics.interrupt_context === undefined) report({
+        interrupt_context: Object.freeze({
+          requested_at: new Date().toISOString(),
+          ...(diagnostics.last_error_notification === undefined ? {} : {
+            last_error_notification: diagnostics.last_error_notification
+          })
+        })
+      });
       const result: ExecutorResult = { kind: "interrupted", output, evidence: visibleEvidence() };
       if (this.threadId !== undefined) Object.assign(result, { threadId: this.threadId });
       if (this.threadId && this.startedTurnId) {
@@ -430,7 +449,26 @@ export class CodexExecutor implements Executor {
         return;
       }
       if (typeof message.method !== "string" || "result" in message || "error" in message) { protocolError(); return; }
-      report({ last_activity_at: new Date().toISOString(), last_valid_method: safeMethod(message.method) });
+      let errorNotification: ExecutorErrorNotificationSummary | undefined;
+      if (message.method === "error") {
+        const params = object(message.params) ? message.params : {};
+        const threadId = params.threadId;
+        const turnId = params.turnId;
+        const activeTurnId = this.startedTurnId ?? this.turnId;
+        const validIds = (threadId === undefined || (typeof threadId === "string" && threadId.length > 0)) &&
+          (turnId === undefined || (typeof turnId === "string" && turnId.length > 0));
+        const conflict = (threadId !== undefined && this.threadId !== undefined && threadId !== this.threadId) ||
+          (turnId !== undefined && activeTurnId !== undefined && turnId !== activeTurnId);
+        if (validIds && !conflict) errorNotification = Object.freeze({
+          observed_at: new Date().toISOString(),
+          scope: threadId !== undefined && turnId !== undefined &&
+            threadId === this.threadId && turnId === activeTurnId ? "active_turn" : "unattributed",
+          ...(typeof params.willRetry === "boolean" ? { will_retry: params.willRetry } : {})
+        });
+      }
+      // Freeze the small summary before any callback can request interruption.
+      report({ last_activity_at: new Date().toISOString(), last_valid_method: safeMethod(message.method),
+        ...(errorNotification === undefined ? {} : { last_error_notification: errorNotification }) });
       // The notification envelope permits any JSON params, including omission.
       // Validate only the methods whose fields the executor actually consumes.
       const known = ["turn/started", "turn/completed", "item/started", "item/completed"].includes(message.method);

@@ -3,7 +3,9 @@ import { serializeError } from "../core/errors.js";
 import type { Id } from "../core/ids.js";
 import type { SerializedError } from "../core/errors.js";
 import { CoreError } from "../core/errors.js";
+import { dashboardLabelSchema } from "../core/dashboard-label.js";
 import type { Executor, ExecutorDiagnostics, ExecutorProgressDiagnostics, ExecutorEvidence } from "../executors/executor.js";
+import type { ObservationWrite } from "../observability/observation-publisher.js";
 import { RegisteredWorkspaceRegistry } from "../workspaces/registered-workspace-registry.js";
 
 export type ExecutorName = "codex" | "dsh";
@@ -14,6 +16,7 @@ export interface RegisteredWorkspaceTaskRequest {
   readonly executor?: ExecutorName;
   readonly model?: string;
   readonly reasoning_effort?: string;
+  readonly dashboard_title?: string;
 }
 
 type NormalizedRegisteredWorkspaceTaskRequest = RegisteredWorkspaceTaskRequest & { readonly executor: ExecutorName };
@@ -92,6 +95,7 @@ type TaskRecord =
 type NonTerminalTaskRecord = Extract<TaskRecord, { state: "queued" | "running" }>;
 
 type InteractiveRecord = {
+  created_at: string; started_at: string | null; ended_at: string | null;
   state: ControlledTaskState; request: NormalizedRegisteredWorkspaceTaskRequest; evidence: readonly ExecutorEvidence[];
   executor?: Executor | undefined; threadId?: string | undefined; output?: string | undefined;
   partialOutput?: string | undefined; diagnostics?: ExecutorDiagnostics | ExecutorProgressDiagnostics | undefined; error?: SerializedError | undefined;
@@ -126,7 +130,8 @@ export class RegisteredWorkspaceTaskService {
 
   constructor(
     private readonly registry: RegisteredWorkspaceRegistry,
-    private readonly executorFactory: ExecutorFactory
+    private readonly executorFactory: ExecutorFactory,
+    private readonly options: { publishObservation?: (observation: ObservationWrite) => void } = {}
   ) {}
 
   runTask(
@@ -134,6 +139,7 @@ export class RegisteredWorkspaceTaskService {
     completedOutputTransform?: CompletedOutputTransform,
     terminalTaskHandler?: TerminalTaskHandler
   ): { taskId: Id } {
+    if (request.dashboard_title !== undefined) dashboardLabelSchema.parse(request.dashboard_title);
     if (request.executor === "dsh" && (request.model !== undefined || request.reasoning_effort !== undefined)) throw new CoreError("UNSUPPORTED_ACTION");
     const taskId = newId();
     const normalizedRequest = { ...request, executor: request.executor ?? "codex" };
@@ -213,10 +219,16 @@ export class RegisteredWorkspaceTaskService {
   }
 
   startTask(request: RegisteredWorkspaceTaskRequest): { taskId: Id } {
+    if (request.dashboard_title !== undefined) dashboardLabelSchema.parse(request.dashboard_title);
     if (request.executor === "dsh" && (request.model !== undefined || request.reasoning_effort !== undefined)) throw new CoreError("UNSUPPORTED_ACTION");
     const taskId = newId();
     const normalizedRequest = { ...request, executor: request.executor ?? "codex" };
-    this.interactive.set(taskId, { state: "queued", request: normalizedRequest, evidence: [] });
+    const record: InteractiveRecord = {
+      state: "queued", request: normalizedRequest, evidence: [],
+      created_at: new Date().toISOString(), started_at: null, ended_at: null
+    };
+    this.interactive.set(taskId, record);
+    this.publishInteractive(taskId, record);
     queueMicrotask(() => void this.executeInteractive(taskId));
     return { taskId };
   }
@@ -286,6 +298,8 @@ export class RegisteredWorkspaceTaskService {
     if (action === "accept") {
       if (record.state !== "waiting_for_supervisor_review") throw new CoreError("INVALID_STATE_TRANSITION");
       record.state = "completed";
+      record.ended_at = new Date().toISOString();
+      this.publishInteractive(taskId, record);
       this.interactiveTerminalTaskIds.push(taskId);
       this.trimInteractiveTerminalTasks();
     } else if (action === "continue") {
@@ -293,6 +307,8 @@ export class RegisteredWorkspaceTaskService {
       record.request = { ...record.request, instruction };
       record.diagnostics = undefined;
       record.state = "queued";
+      record.ended_at = null;
+      this.publishInteractive(taskId, record);
       queueMicrotask(() => void this.executeInteractive(taskId));
     } else if (action === "steer") {
       // DSH headless has no steer seam: the action is unsupported for the
@@ -334,10 +350,43 @@ export class RegisteredWorkspaceTaskService {
   private readonly interactive = new Map<Id, InteractiveRecord>();
   private interactiveTerminalTaskIds: Id[] = [];
 
+  private publishInteractive(taskId: Id, record: InteractiveRecord): void {
+    try {
+      if (!this.options.publishObservation) return;
+      const displayName = this.registry.displayName(record.request.workspace_id);
+      const error = record.state === "failed" && record.error
+        ? serializeError(new CoreError(record.error.code)) : undefined;
+      this.options.publishObservation({
+        kind: "task",
+        record_id: taskId,
+        metadata: {
+          task_id: taskId,
+          workspace_id: record.request.workspace_id,
+          ...(displayName === undefined ? {} : { workspace_display_name: displayName }),
+          ...(record.request.dashboard_title === undefined ? {} : { dashboard_title: record.request.dashboard_title }),
+          state: record.state,
+          executor: record.request.executor,
+          requested_model: record.request.model ?? null,
+          requested_reasoning_effort: record.request.reasoning_effort ?? null,
+          ...(record.threadId === undefined ? {} : { thread_id: record.threadId }),
+          created_at: record.created_at,
+          started_at: record.started_at,
+          ended_at: record.ended_at,
+          ...(record.diagnostics?.last_activity_at === undefined ? {} : {
+            last_reported_activity_at: record.diagnostics.last_activity_at
+          }),
+          ...(error === undefined ? {} : { error_code: error.code, error_summary: error.message })
+        }
+      });
+    } catch { /* Observation loss must never affect the authoritative task. */ }
+  }
+
   private async executeInteractive(taskId: Id): Promise<void> {
     const record = this.interactive.get(taskId);
     if (!record) return;
     record.state = "running";
+    record.started_at ??= new Date().toISOString();
+    this.publishInteractive(taskId, record);
     try {
       const registration = this.registry.resolveExecution(record.request.workspace_id);
       const executor = this.executorFactory(record.request.executor, registration.root);
@@ -348,7 +397,10 @@ export class RegisteredWorkspaceTaskService {
         ...(record.request.model !== undefined ? { model: record.request.model } : {}),
         ...(record.request.reasoning_effort !== undefined ? { reasoning_effort: record.request.reasoning_effort } : {}),
         onEvidence: (items) => { record.evidence = items; },
-        onDiagnostics: (diagnostics) => { record.diagnostics = diagnostics; } });
+        onDiagnostics: (diagnostics) => {
+          record.diagnostics = diagnostics;
+          this.publishInteractive(taskId, record);
+        } });
       record.executor = undefined;
       record.threadId = result.threadId ?? record.threadId;
       record.evidence = result.evidence ?? record.evidence;
@@ -366,11 +418,15 @@ export class RegisteredWorkspaceTaskService {
         record.state = "waiting_for_supervisor_review";
         record.output = result.output;
       }
+      record.ended_at = record.state === "failed" ? new Date().toISOString() : null;
+      this.publishInteractive(taskId, record);
       if (record.state === "failed") this.recordInteractiveTerminalTask(taskId);
     } catch (error) {
       record.executor = undefined;
       record.state = "failed";
       record.error = serializeError(error);
+      record.ended_at = new Date().toISOString();
+      this.publishInteractive(taskId, record);
       this.recordInteractiveTerminalTask(taskId);
     }
   }

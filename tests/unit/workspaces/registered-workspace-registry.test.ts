@@ -217,3 +217,28 @@ test("sourceOf distinguishes manual and managed registrations", () => {
   assert.equal(registry.sourceOf("managed-1"), "managed");
   expectCode(() => registry.sourceOf("missing"), "UNKNOWN_WORKSPACE");
 });
+
+test("Dashboard names use explicit manual labels or only a bounded root basename", () => {
+  const registry = new RegisteredWorkspaceRegistry([
+    { id: "named", root: ROOT, display_name: "Engineering Bridge" },
+    { id: "old", root: workspaceFixture("private-parent", "Reading Nook") },
+    { id: "long", root: workspaceFixture("private-parent", "x".repeat(140)) },
+    { id: "control", root: workspaceFixture("private-parent", "line\nbreak") },
+  ]);
+  registry.registerManaged("managed", workspaceFixture("private-parent", "电子相册"));
+  assert.equal(registry.displayName("named"), "Engineering Bridge");
+  assert.equal(registry.displayName("old"), "Reading Nook");
+  assert.equal(registry.displayName("managed"), "电子相册");
+  assert.equal(registry.displayName("long"), "x".repeat(100));
+  assert.equal(registry.displayName("control"), "line break");
+  assert.equal(registry.displayName("missing"), undefined);
+  assert.equal(registry.resolve("named"), ROOT);
+});
+
+test("explicit Dashboard names reject blank, multiline, control and oversized strings", () => {
+  for (const display_name of ["", "  ", "a\nb", "a\rb", "a\tb", "a\u0085b", "a\u2028b", "a\u2029b", "x".repeat(101)]) {
+    expectCode(() => new RegisteredWorkspaceRegistry([{ id: "named", root: ROOT, display_name }]), "WORKSPACE_BOUNDARY_VIOLATION");
+  }
+  const registry = new RegisteredWorkspaceRegistry([{ id: "named", root: ROOT, display_name: "名".repeat(100) }]);
+  assert.equal(registry.displayName("named"), "名".repeat(100));
+});

@@ -1,5 +1,34 @@
 # Release notes
 
+## Engineering Bridge v1.6.0
+
+Add a Chinese read-only dashboard and best-effort task observations, retain the reviewed Codex compatibility and pre-interrupt diagnostic fixes, and refresh the dependency lockfile. This version identifies a release candidate; it does not imply a commit, tag, GitHub Release, npm publication or deployment.
+
+### Dashboard and observations
+
+- Keep the Chinese HTML in TypeScript so a fresh build produces the accepted dashboard. Producer heartbeats and selected task metadata are stored separately from canonical execution state in `<config>.observations/`; failures of this optional sink do not change task execution.
+- Show only fresh-producer `queued`/`running` tasks as current. Review, ended and stale/unknown-producer history have separate collapsed groups; historical observations do not claim a currently confirmable task or restore control after restart.
+- Support explicitly public, validated task titles and workspace display names. Missing titles fall back to project, executor and short task ID; private instructions, output, evidence and diagnostics are not title sources.
+- Add browser-local clear/restore display controls that survive polling/reload. They hide earlier review/ended cards, never change task status or delete disk records. No automatic disk-history eviction is included.
+- Serve only read-only GET routes on loopback HTTP, with Host checks and no-store responses. This is neither remote MCP nor an authenticated service; do not forward or publicly expose the listener.
+
+### Codex compatibility and diagnostics
+
+- Preserve PATH-first command resolution; on POSIX, a missing executable may fall back to an executable regular `HOME/.local/bin/codex` only with an absolute HOME. Windows native/npm-shim and DSH launch paths remain unchanged and shell-free.
+- Retain bounded error-notification timing/scope/retry summaries and freeze the first local interrupt's diagnostic snapshot. Later errors cannot rewrite it. Raw error text, details and IDs are excluded; task/interrupt semantics and timeout values are unchanged. These process-local task-result fields are not published to the dashboard.
+
+### Dependency security and packaging
+
+- Lock only the six reviewed dependency updates within existing ranges: `@modelcontextprotocol/sdk` 1.30.0 → 1.31.0; `fast-uri` 3.1.5 → 3.1.8; `hono` 4.12.34 → 4.13.7; `ip-address` 10.4.0 → 10.7.1; `proxy-addr` 2.0.7 → 2.0.8; `qs` 6.15.3 → 6.16.0. No overrides, major upgrades or dependency-range changes.
+- Set package and lockfile root versions to 1.6.0; retain the existing package file rules.
+- Remove the duplicate CI Build step: `npm test` already performs a fresh build. Preserve the Ubuntu/Windows Server 2025 matrix and test/build capability.
+
+### Safety and verification boundary
+
+- The 15-tool MCP surface, explicit write gates, executor deadlines, read-only defaults, observation privacy and retained validation behavior remain unchanged.
+- Candidate verification records fresh install, full/production audits, typecheck, build, focused/full tests, local Chrome acceptance and package-scope inspection separately from publication. Audit counts are time-specific and should be checked again at the next release gate.
+- Native CI passed on Ubuntu and Windows Server 2025 in both [push CI](https://github.com/wudy29/engineering-bridge/actions/runs/39513363458) and [PR CI](https://github.com/wudy29/engineering-bridge/actions/runs/40260052738). Both runs correspond to head SHA `77e21d6efebc59fb73164e4162f46964172864a0`. These results do not constitute comprehensive Windows platform certification or production deployment acceptance.
+
 ## Engineering Bridge v1.5.0
 
 Add retained async controlled-patch validation without changing the original synchronous API. A potentially long validation no longer requires one MCP call to remain open until all steps finish.
