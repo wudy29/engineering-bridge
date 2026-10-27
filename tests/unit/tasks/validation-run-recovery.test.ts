@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import nodeTest from "node:test";
 import fs from "node:fs/promises";
 import { join } from "node:path";
+import { hostname } from "node:os";
 import { execFileSync } from "node:child_process";
 import { validationFixture, PATCH } from "../../helpers/validation-run-fixture.js";
 import { ControlledPatchValidationRunService as Service } from "../../../src/tasks/controlled-patch-validation-run-service.js";
@@ -13,6 +14,64 @@ const test = process.platform === "win32" ? nodeTest.skip : nodeTest;
 const cases = ["admitted", "parent_plan", "empty_parent", "before_apply", "preparation", "validation", "before_cleanup", "during_cleanup", "terminal"] as const;
 
 test("minimal restart preserves even an empty owned parent without accessing it or clearing its fence", async t => {
+  await t.test("legacy owner token restarts a v4 record without acquiring cleanup authority", async child => {
+    const f = await validationFixture(child);
+    const store = new ValidationRunStore(f.directory);
+    const token = "01234567-89ab-cdef-0123-456789abcdef";
+    let run = await store.admit({ patch_task_id: f.patchTaskId, idempotency_key: "legacy-owner", workspace_id: "workspace", workspace_root: f.workspace, base_head: f.baseHead, patch: PATCH, profile: (await f.profiles.get("workspace"))! });
+    run = await store.update(run.validation_run_id, run.operation_sequence, { type: "start", at: new Date().toISOString(), owner_instance_id: token });
+    const manager = new ValidationRunWorktree(f.tempRoot);
+    run = await store.update(run.validation_run_id, run.operation_sequence, { type: "worktree_owned", at: new Date().toISOString(), owned_worktree: manager.plan(run) });
+    run = await store.update(run.validation_run_id, run.operation_sequence, { type: "worktree_receipt", at: new Date().toISOString(), owned_worktree: await manager.createParent(run) });
+    const marker = join(run.owned_worktree!.parent_path, ".engineering-bridge-validation-run");
+    const markerBytes = await fs.readFile(marker, "utf8");
+    await fs.writeFile(f.directory + ".owner.json", JSON.stringify({ schema_version: 1, instance_id: token, pid: process.pid, host: hostname(), platform: process.platform, uid: process.getuid?.() ?? null }), { mode: 0o600 });
+    let pidProbes = 0, oldPathAccesses = 0, executions = 0;
+    const kill = child.mock.method(process, "kill", (pid: number, signal: number | string) => {
+      assert.equal(pid, process.pid); assert.equal(signal, 0); pidProbes++;
+      throw Object.assign(new Error("fixture owner exited"), { code: "ESRCH" });
+    });
+    const lstat = fs.lstat.bind(fs);
+    const probe = child.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+      if (String(args[0]) === f.tempRoot || String(args[0]).startsWith(f.tempRoot + "/")) {
+        oldPathAccesses++; throw Error("restart must not inspect old validation paths");
+      }
+      return lstat(...args);
+    });
+    const options = { registry: f.registry, controlledPatches: f.patches, profiles: f.profiles, directory: f.directory, tempRoot: f.tempRoot, protectedRoots: [f.workspace], runner: { async runSupervised(): Promise<never> { executions++; throw Error("restart must not spawn"); } } };
+    let service: Service;
+    try { service = await Service.open(options); }
+    finally { kill.mock.restore(); probe.mock.restore(); }
+    f.cleanup.push(() => service.shutdown());
+    const recovered = (await service.get(run.validation_run_id))!;
+    assert.equal(pidProbes, 1); assert.equal(oldPathAccesses, 0); assert.equal(executions, 0);
+    assert.equal(recovered.reason, "supervisor_lost"); assert.equal(recovered.status, "INCOMPLETE");
+    assert.equal(recovered.owner_instance_id, token);
+    assert.equal(recovered.profile_sha256, run.profile_sha256); assert.equal(recovered.proposal_fingerprint, run.proposal_fingerprint);
+    assert.deepEqual(recovered.owned_worktree, run.owned_worktree); assert.deepEqual(recovered.cleanup, run.cleanup);
+    assert.deepEqual(recovered.steps, run.steps); assert.deepEqual(recovered.current_step, run.current_step);
+    assert.equal(await fs.readFile(marker, "utf8"), markerBytes);
+    await assert.rejects(service.start({ patch_task_id: f.patchTaskId, idempotency_key: "no-new-authority" }), { code: "VALIDATION_RECOVERY_REQUIRED" });
+    await service.shutdown();
+    const restarted = await Service.open(options); f.cleanup.push(() => restarted.shutdown());
+    assert.deepEqual(await restarted.get(run.validation_run_id), recovered);
+    assert.equal(executions, 0); assert.equal(await fs.readFile(marker, "utf8"), markerBytes);
+  });
+  await t.test("non-v4 retained filenames remain rejected without changing their bytes", async child => {
+    const f = await validationFixture(child);
+    const store = new ValidationRunStore(f.directory);
+    const run = await store.admit({ patch_task_id: f.patchTaskId, idempotency_key: "old-filename-boundary", workspace_id: "workspace", workspace_root: f.workspace, base_head: f.baseHead, patch: PATCH, profile: null });
+    const legacyId = "01234567-89ab-cdef-0123-456789abcdef";
+    const file = join(f.directory, legacyId + ".json");
+    const bytes = JSON.stringify({ ...run, validation_run_id: legacyId });
+    await fs.writeFile(file, bytes, { mode: 0o600 });
+    let executions = 0;
+    const service = await Service.open({ registry: f.registry, controlledPatches: f.patches, profiles: f.profiles, directory: f.directory, tempRoot: f.tempRoot, protectedRoots: [f.workspace], runner: { async runSupervised(): Promise<never> { executions++; throw Error("invalid filename must not execute"); } } });
+    f.cleanup.push(() => service.shutdown());
+    await assert.rejects(service.get(legacyId), { code: "VALIDATION_RUN_INVALID_INPUT" });
+    await assert.rejects(service.start({ patch_task_id: f.patchTaskId, idempotency_key: "blocked-by-filename" }), { code: "VALIDATION_STORE_UNAVAILABLE" });
+    assert.equal(await fs.readFile(file, "utf8"), bytes); assert.equal(executions, 0);
+  });
   const f = await validationFixture(t);
   const store = new ValidationRunStore(f.directory);
   let run = await store.admit({ patch_task_id: f.patchTaskId, idempotency_key: "preserve-empty", workspace_id: "workspace", workspace_root: f.workspace, base_head: f.baseHead, patch: PATCH, profile: (await f.profiles.get("workspace"))! });

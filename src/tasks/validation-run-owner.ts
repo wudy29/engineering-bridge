@@ -6,10 +6,11 @@ import { z } from "zod";
 
 import { newId } from "../core/ids.js";
 
+// Keep the original owner token and integer domain; liveness and ownership checks remain authoritative.
 const ownerSchema = z.object({
-  schema_version: z.literal(1), instance_id: z.string().uuid(),
-  pid: z.number().int().positive(), host: z.string(), platform: z.string(),
-  uid: z.number().int().nonnegative().nullable(),
+  schema_version: z.literal(1), instance_id: z.guid(),
+  pid: z.number().positive().refine(Number.isInteger), host: z.string(), platform: z.string(),
+  uid: z.number().nonnegative().refine(Number.isInteger).nullable(),
 }).strict();
 type OwnerRecord = z.infer<typeof ownerSchema>;
 type Identity = { dev: bigint; ino: bigint };
