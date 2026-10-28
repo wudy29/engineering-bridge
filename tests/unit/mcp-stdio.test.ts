@@ -173,7 +173,40 @@ test("MCP and Codex client metadata use the shared package VERSION, and stdio re
     const schemas = new Map(listed.tools.map((tool) => [tool.name, tool.inputSchema as {
       properties?: Record<string, { type?: string; minLength?: number; maxLength?: number; const?: unknown }>;
       required?: string[];
+      additionalProperties?: boolean;
     }]));
+    for (const [name, schema] of schemas) {
+      assert.equal(schema.additionalProperties, false, name);
+    }
+    assert.deepEqual(schemas.get("get_controlled_patch_validation")?.properties?.validation_run_id, {
+      type: "string", format: "uuid"
+    });
+    // These legacy tools advertised a closed shape but stripped unknown inputs.
+    // Preserve both contracts; the four strict validation tools remain strict.
+    for (const [name, args] of [
+      ["run_task", { workspace_id: "missing", instruction: "inspect" }],
+      ["task_result", { task_id: "missing" }],
+      ["control_task", { task_id: "missing", action: "accept" }],
+      ["bind_project", { project_path: "/missing-bridge-fixture", confirmation: "BIND" }],
+      ["create_project", { parent: "/missing-bridge-fixture", name: "fixture", confirmation: "CREATE" }],
+      ["authorize_workspace_write", { workspace_id: "missing", confirmation: "AUTHORIZE" }],
+      ["generate_controlled_patch", { workspace_id: "missing", change_request: "inspect" }],
+      ["refine_controlled_patch", { patch_task_id: "missing", change_request: "inspect" }],
+      ["submit_controlled_patch", { workspace_id: "missing", base_head: "0".repeat(40), diff: "missing" }],
+      ["apply_controlled_patch", { patch_task_id: "missing", confirmation: "APPLY" }],
+      ["commit_controlled_patch", { patch_task_id: "missing", message: "fixture", confirmation: "COMMIT" }]
+    ] as const) {
+      const result = await client.callTool({ name, arguments: { ...args, extra: "PRIVATE_EXTRA_FIELD" } });
+      assert.doesNotMatch(JSON.stringify(result), /Input validation error|PRIVATE_EXTRA_FIELD/u, name);
+    }
+    const legacyUuid = await client.callTool({
+      name: "get_controlled_patch_validation",
+      arguments: { validation_run_id: "12345678-1234-1234-1234-123456789abc" }
+    });
+    assert.equal(legacyUuid.isError, true);
+    assert.match(JSON.stringify(legacyUuid), process.platform === "win32"
+      ? /VALIDATION_PLATFORM_UNSUPPORTED/u : /VALIDATION_RUN_INVALID_INPUT/u);
+    assert.doesNotMatch(JSON.stringify(legacyUuid), /Input validation error/u);
     for (const name of ["run_task", "generate_controlled_patch", "refine_controlled_patch"]) {
       const properties = schemas.get(name)?.properties;
       assert.equal(properties?.model?.type, "string");
@@ -947,6 +980,22 @@ index 90be1f3..3b18e51 100644
     } | undefined;
     assert.equal(configureSchema?.properties?.confirmation?.const, "CONFIGURE");
     assert.equal(configureSchema?.additionalProperties, false);
+    assert.deepEqual(configureSchema?.properties?.profile, {
+      type: "object",
+      properties: {
+        preparation: { type: "array", items: {
+          type: "object", properties: {
+            name: { type: "string", minLength: 1 },
+            argv: { type: "array", items: { type: "string" }, minItems: 1 },
+            timeout_seconds: { type: "integer", exclusiveMinimum: 0 }
+          }, required: ["name", "argv"], additionalProperties: false
+        } },
+        validation: { type: "array", items: { $ref: "#/properties/profile/properties/preparation/items" } },
+        default_step_timeout_seconds: { type: "integer", exclusiveMinimum: 0, default: 600 },
+        total_timeout_seconds: { type: "integer", exclusiveMinimum: 0, default: 1200 }
+      },
+      required: ["preparation", "validation"], additionalProperties: false
+    });
 
     const validationSchema = tools.get("validate_controlled_patch")?.inputSchema as {
       properties?: Record<string, unknown>;
@@ -1003,6 +1052,36 @@ index 90be1f3..3b18e51 100644
     });
     assert.equal(emptyArgv.isError, true);
     assert.equal(existsSync(profilePath), false);
+
+    for (const phase of ["preparation", "validation"] as const) {
+      for (const step of [
+        { name: "test", argv: [] },
+        { name: "test", argv: ["npm"], timeout_seconds: 1.5 },
+        { name: "test", argv: ["npm"], extra: "PRIVATE_STEP_FIELD" }
+      ]) {
+        const rejected = await call("configure_validation_profile", {
+          workspace_id: "workspace", profile: { preparation: [], validation: [], [phase]: [step] },
+          confirmation: "CONFIGURE"
+        });
+        assert.equal(rejected.isError, true);
+        assert.match(String(rejected.body.raw), /Input validation error/u);
+        assert.doesNotMatch(JSON.stringify(rejected), /PRIVATE_STEP_FIELD/u);
+        assert.equal(existsSync(profilePath), false);
+      }
+    }
+    for (const unsafeProfile of [
+      { ...profile, default_step_timeout_seconds: Number.MAX_SAFE_INTEGER + 1 },
+      { ...profile, total_timeout_seconds: Number.MAX_SAFE_INTEGER + 1 },
+      { preparation: [{ name: "test", argv: ["npm"], timeout_seconds: Number.MAX_SAFE_INTEGER + 1 }], validation: [] },
+      { preparation: [], validation: [{ name: "test", argv: ["npm"], timeout_seconds: Number.MAX_SAFE_INTEGER + 1 }] }
+    ]) {
+      const rejected = await call("configure_validation_profile", {
+        workspace_id: "workspace", profile: unsafeProfile, confirmation: "CONFIGURE"
+      });
+      assert.equal(rejected.isError, true);
+      assert.deepEqual(rejected.body, { error: { code: "INTERNAL_ERROR", message: "The request could not be completed." } });
+      assert.equal(existsSync(profilePath), false);
+    }
 
     const configured = await call("configure_validation_profile", {
       workspace_id: "workspace",

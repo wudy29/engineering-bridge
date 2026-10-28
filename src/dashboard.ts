@@ -33,7 +33,7 @@ const envelopeSchema = z.object({
   record_id: z.string().min(1),
   producer_id: z.string().min(1),
   observed_at: z.unknown().optional(),
-  metadata: z.record(z.unknown()),
+  metadata: z.record(z.string(), z.unknown()),
 });
 type Freshness = "fresh" | "stale" | "unknown";
 export interface ProducerView {

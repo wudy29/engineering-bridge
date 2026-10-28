@@ -67,8 +67,9 @@ const admissionSchema = proposalSchema.extend({
   patch_task_id: identifier,
   profile: sourceProfileSchema.nullable(),
 }).strict();
+// Persisted IDs retain the UUID-shaped domain accepted before Zod 4.
 const metadataSchema = z.object({
-  validation_run_id: z.string().uuid(),
+  validation_run_id: z.guid(),
   admission_sequence: positive,
   admitted_at: timestamp,
 }).strict();
@@ -104,7 +105,7 @@ const ownedWorktreeSchema = z.object({
   worktree_path: absolutePath,
   parent_identity: filesystemIdentity.nullable(),
   common_git_dir: absolutePath.nullable(),
-  run_marker: z.string().uuid(),
+  run_marker: z.guid(),
   // Optional in Slice 1 records; absence never establishes filesystem ownership.
   temp_root_identity: filesystemIdentity.nullable().optional(),
   marker_identity: filesystemIdentity.nullable().optional(),
@@ -118,7 +119,7 @@ const ownedWorktreeSchema = z.object({
 }).strict();
 const runSchema = z.object({
   schema_version: z.literal(1),
-  validation_run_id: z.string().uuid(),
+  validation_run_id: z.guid(),
   idempotency_key: opaqueKey,
   admission_sequence: positive,
   operation_sequence: natural,

@@ -548,3 +548,39 @@ test("operation sequence includes mandatory ownership and explicit cleanup event
   assert.equal(recovered.operation_sequence, 2);
   assert.deepEqual(parseValidationRun(persisted(recovered)), recovered);
 });
+
+
+test("legacy UUID-shaped persistence preserves its domain and fixed error mappings", () => {
+  for (const validation_run_id of [
+    "01234567-89ab-cdef-0123-456789abcdef",
+    "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF",
+    "00000000-0000-0000-0000-000000000000",
+    METADATA.validation_run_id,
+  ]) {
+    const admittedRun = createValidationRun(INPUT, { ...METADATA, validation_run_id });
+    const running = change(admittedRun, { type: "start", at: AT, owner_instance_id: "legacy-owner" });
+    const owned = change(running, { type: "worktree_owned", at: AT, owned_worktree: worktree(running) });
+    assert.equal(owned.validation_run_id, validation_run_id);
+    assert.equal(owned.owned_worktree!.run_marker, validation_run_id);
+    assert.deepEqual(parseValidationRun(persisted(owned)), owned);
+    assert.ok(Object.isFrozen(parseValidationRun(persisted(owned)).owned_worktree));
+    const mismatched = persisted(owned);
+    mismatched.owned_worktree.run_marker = validation_run_id === METADATA.validation_run_id
+      ? "01234567-89ab-cdef-0123-456789abcdef" : METADATA.validation_run_id;
+    code(() => parseValidationRun(mismatched), "VALIDATION_RUN_CORRUPT");
+  }
+  for (const validation_run_id of [
+    "../record", "0123456789abcdef0123456789abcdef", "01234567-89ab-cdef-0123-456789abcdeg",
+    " " + METADATA.validation_run_id, METADATA.validation_run_id + "\n", "",
+  ]) {
+    code(() => createValidationRun(INPUT, { ...METADATA, validation_run_id }), "VALIDATION_RUN_INVALID_INPUT");
+    code(() => parseValidationRun({ ...persisted(admitted()), validation_run_id }), "VALIDATION_RUN_CORRUPT");
+    const owned = persisted(change(started(), { type: "worktree_owned", at: AT, owned_worktree: worktree(started()) }));
+    owned.owned_worktree.run_marker = validation_run_id;
+    code(() => parseValidationRun(owned), "VALIDATION_RUN_CORRUPT");
+  }
+  for (const value of [0.5, -1, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN]) {
+    code(() => createValidationRun(INPUT, { ...METADATA, admission_sequence: value }), "VALIDATION_RUN_INVALID_INPUT");
+    code(() => parseValidationRun({ ...persisted(admitted()), operation_sequence: value }), "VALIDATION_RUN_CORRUPT");
+  }
+});

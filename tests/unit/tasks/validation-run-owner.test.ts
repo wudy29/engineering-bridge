@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import nodeTest from "node:test";
 import fs from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fork } from "node:child_process";
 import { once } from "node:events";
@@ -32,6 +32,30 @@ test("two owners contend for the same guard and only one can own the store", asy
   const next = await Owner.acquire(directory);
   assert.notEqual(next.instanceId, winners[0]!.value.instanceId);
   await next.release();
+  await t.test("legacy owner UUID and integer domain still use the existing handoff guard", async child => {
+    for (const values of [
+      { instance_id: "01234567-89ab-cdef-0123-456789abcdef", pid: process.pid, uid: process.getuid?.() ?? null },
+      { instance_id: "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF", pid: Number.MAX_SAFE_INTEGER + 1, uid: process.getuid?.() ?? null },
+    ]) {
+      const filename = directory + ".owner.json";
+      await fs.writeFile(filename, JSON.stringify({ schema_version: 1, ...values, host: hostname(), platform: process.platform }), { mode: 0o600 });
+      let probes = 0;
+      const kill = child.mock.method(process, "kill", (pid: number, signal: number | string) => {
+        assert.equal(pid, values.pid); assert.equal(signal, 0); probes++;
+        throw Object.assign(new Error("fixture owner exited"), { code: "ESRCH" });
+      });
+      let replacement;
+      try {
+        replacement = await Owner.acquire(directory);
+        assert.equal(probes, 1);
+        assert.notEqual(replacement.instanceId, values.instance_id);
+        assert.equal(JSON.parse(await fs.readFile(filename, "utf8")).instance_id, replacement.instanceId);
+      } finally { kill.mock.restore(); }
+      await replacement.release();
+      await assert.rejects(fs.stat(filename), { code: "ENOENT" });
+      await assert.rejects(fs.stat(directory + ".owner-guard"), { code: "ENOENT" });
+    }
+  });
 });
 test("an ordinary trusted parent can contain the dedicated private owned directory", async t => {
   const Owner = await ownerType();
@@ -90,6 +114,13 @@ test("old token cannot release a replacement owner, even when PID is the same", 
   await fs.writeFile(filename, JSON.stringify(record));
   await assert.rejects(first.release(), { code: "VALIDATION_OWNER_UNAVAILABLE" });
   assert.equal(JSON.parse(await fs.readFile(filename, "utf8")).instance_id, record.instance_id);
+  for (const token of ["01234567-89ab-cdef-0123-456789abcdef", "../owner", "0123456789abcdef0123456789abcdef"]) {
+    const bytes = JSON.stringify({ ...record, instance_id: token });
+    await fs.writeFile(filename, bytes);
+    await assert.rejects(first.release(), { code: "VALIDATION_OWNER_UNAVAILABLE" });
+    await assert.rejects(Owner.acquire(directory), { code: "VALIDATION_OWNER_UNAVAILABLE" });
+    assert.equal(await fs.readFile(filename, "utf8"), bytes);
+  }
 });
 test("two processes racing after owner death cannot both take over; no old process is attached", async (t) => {
   const Owner = await ownerType();
