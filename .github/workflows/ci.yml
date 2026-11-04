@@ -13,61 +13,70 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04
-          - windows-2025
+        include:
+          - os: ubuntu-24.04
+            node: 22
+            platform: linux
+          - os: windows-2025
+            node: 22
+            platform: win32
+          - os: macos-15
+            node: 24
+            platform: darwin
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: bash
     env:
-      BRIDGE_CI_EVIDENCE: integration-evidence
-      BRIDGE_INTEGRATION_EVIDENCE: integration-evidence/commit-signals
+      BRIDGE_CI_EVIDENCE: ${{ runner.temp }}/bridge-audit-evidence
+      BRIDGE_TEST_EVIDENCE: ${{ runner.temp }}/bridge-audit-evidence/fixtures
+      BRIDGE_INTEGRATION_EVIDENCE: ${{ runner.temp }}/bridge-audit-evidence/commit-signals
+      BRIDGE_CI_UPLOAD: ${{ runner.temp }}/bridge-audit-upload
+      BRIDGE_EXPECTED_PLATFORM: ${{ matrix.platform }}
+      BRIDGE_EXPECTED_NODE: ${{ matrix.node }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
       - name: Record platform and isolate Git configuration
-        run: |
-          mkdir -p integration-evidence
-          node --version > integration-evidence/environment.txt
-          npm --version >> integration-evidence/environment.txt
-          git --version >> integration-evidence/environment.txt
-          git rev-parse HEAD >> integration-evidence/environment.txt
-          node -e 'console.log(JSON.stringify({platform:process.platform,arch:process.arch,release:require("node:os").release()}))' >> integration-evidence/environment.txt
-          node -e 'const fs=require("node:fs"),p=require("node:path").resolve("integration-evidence/empty-git-config");fs.writeFileSync(p,"");fs.appendFileSync(process.env.GITHUB_ENV,"GIT_CONFIG_GLOBAL="+p+"\nGIT_CONFIG_NOSYSTEM=1\n")'
-          node -e 'const fs=require("node:fs"),cp=require("node:child_process"),p=require("node:path");const npm=cp.execFileSync(process.platform==="win32"?"where":"which",["npm"],{encoding:"utf8"}).split(/\r?\n/).find(Boolean);const cli=p.join(p.dirname(fs.realpathSync(npm)),process.platform==="win32"?"node_modules/npm/bin/npm-cli.js":"npm-cli.js");if(!fs.existsSync(cli))throw Error("npm CLI not resolved");fs.appendFileSync(process.env.GITHUB_ENV,"BRIDGE_NPM_CLI="+cli+"\n")'
+        run: node scripts/integration/ci-environment.mjs
       - name: Install dependencies from unchanged lockfile
         id: install
         run: node scripts/integration/record-check.mjs install node "$BRIDGE_NPM_CLI" ci --no-audit --no-fund
       - name: Typecheck
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: node scripts/integration/record-check.mjs typecheck node "$BRIDGE_NPM_CLI" run typecheck
-      - name: Build and run the complete suite at default concurrency
+      - name: Build
+        id: build
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: node scripts/integration/record-check.mjs full node "$BRIDGE_NPM_CLI" test
+        run: node scripts/integration/record-check.mjs build node "$BRIDGE_NPM_CLI" run build
+      - name: Run the complete suite at default concurrency
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: node scripts/integration/record-check.mjs full node --test 'dist/tests/unit/**/*.test.js'
+      - name: Compare the complete raw MCP schema and input contracts
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: node scripts/integration/record-check.mjs schema node --test dist/tests/unit/mcp-stdio.test.js
       - name: Verify real tgz installation, native bin wrapper, and full MCP contract
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: node scripts/integration/record-check.mjs pack node "$BRIDGE_NPM_CLI" run verify:package -- integration-evidence
+        run: node scripts/integration/record-check.mjs pack node "$BRIDGE_NPM_CLI" run verify:package -- "$BRIDGE_CI_EVIDENCE"
       - name: Verify native Git transactions and platform lifecycle boundaries
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: node scripts/integration/record-check.mjs integration node --test --test-concurrency=1 scripts/integration/git-transaction.test.mjs scripts/integration/commit-shutdown.test.mjs scripts/integration/windows-lifecycle.test.mjs
-      - name: Preserve every run, including failing gates
+      - name: Check synthetic artifacts before upload
+        id: artifacts
         if: ${{ always() }}
+        run: node scripts/integration/prepare-artifacts.mjs
+      - name: Preserve every run, including failing gates
+        if: ${{ always() && steps.artifacts.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
-          name: integration-${{ matrix.os }}-node22
-          path: |
-            integration-evidence/**/*.log
-            integration-evidence/**/*.json
-            integration-evidence/**/*.jsonl
-            integration-evidence/**/*.txt
-            integration-evidence/**/*.tgz
-            !integration-evidence/**/source/**
-            !integration-evidence/**/consumer/node_modules/**
+          name: integration-${{ matrix.os }}-node${{ matrix.node }}
+          path: ${{ runner.temp }}/bridge-audit-upload
           retention-days: 14
           if-no-files-found: error
