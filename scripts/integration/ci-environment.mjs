@@ -17,7 +17,7 @@ const metadata = {
   node: process.version, npm: run(process.execPath, [cli, "--version"]), git: run("git", ["--version"]),
   commit: run("git", ["rev-parse", "HEAD"]), tree: run("git", ["rev-parse", "HEAD^{tree}"]),
   runner: Object.fromEntries(["RUNNER_OS", "RUNNER_ARCH", "ImageOS", "ImageVersion", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REF", "GITHUB_SHA"].map(key => [key, process.env[key] ?? null])),
-  cwd: process.cwd(), tmpdir: os.tmpdir(), diagnosticPreload: false,
+  cwd: process.cwd(), tmpdir: os.tmpdir(), diagnosticPreload: process.env.BRIDGE_CI_DIAGNOSTIC === "1",
 };
 if (process.platform === "win32") assert.match(metadata.git, /windows/iu, "actual Git for Windows required");
 fs.writeFileSync(path.join(root, "environment.json"), JSON.stringify(metadata, null, 2) + "\n");
