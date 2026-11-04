@@ -28,10 +28,10 @@ jobs:
       run:
         shell: bash
     env:
-      BRIDGE_CI_EVIDENCE: ${{ runner.temp }}/bridge-audit-evidence
-      BRIDGE_TEST_EVIDENCE: ${{ runner.temp }}/bridge-audit-evidence/fixtures
-      BRIDGE_INTEGRATION_EVIDENCE: ${{ runner.temp }}/bridge-audit-evidence/commit-signals
-      BRIDGE_CI_UPLOAD: ${{ runner.temp }}/bridge-audit-upload
+      BRIDGE_CI_EVIDENCE: ${{ github.workspace }}/../bridge-audit-evidence
+      BRIDGE_TEST_EVIDENCE: ${{ github.workspace }}/../bridge-audit-evidence/fixtures
+      BRIDGE_INTEGRATION_EVIDENCE: ${{ github.workspace }}/../bridge-audit-evidence/commit-signals
+      BRIDGE_CI_UPLOAD: ${{ github.workspace }}/../bridge-audit-upload
       BRIDGE_EXPECTED_PLATFORM: ${{ matrix.platform }}
       BRIDGE_EXPECTED_NODE: ${{ matrix.node }}
     steps:
@@ -77,6 +77,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: integration-${{ matrix.os }}-node${{ matrix.node }}
-          path: ${{ runner.temp }}/bridge-audit-upload
+          path: ${{ env.BRIDGE_CI_UPLOAD }}
           retention-days: 14
           if-no-files-found: error
