@@ -4,6 +4,8 @@ import {
   type SpawnOptionsWithoutStdio
 } from "node:child_process";
 
+import { milliseconds, nowMilliseconds, scheduleDeadline, monotonicTimer, type DeadlineTimer } from "./validation-deadline.js";
+
 import { signalExecution } from "../executors/executor.js";
 
 const MAX_OUTPUT_TAIL_BYTES = 65_536;
@@ -24,7 +26,7 @@ export type ValidationProcessOutcome =
 export interface ValidationProcessRequest {
   readonly argv: readonly [string, ...string[]];
   readonly cwd: string;
-  readonly timeoutMs: number;
+  readonly timeoutMs: number | bigint;
   readonly input?: string;
 }
 
@@ -43,20 +45,10 @@ export type ValidationProcessStarter = (
   options: SpawnOptionsWithoutStdio
 ) => ChildProcessWithoutNullStreams;
 
-export interface ValidationTimer {
-  now(): number;
-  set(callback: () => void, delayMs: number): NodeJS.Timeout;
-  clear(handle: NodeJS.Timeout): void;
-}
+export type ValidationTimer = DeadlineTimer;
 
 const startProcess: ValidationProcessStarter = (executable, args, options) =>
   spawn(executable, args, options);
-
-const systemTimer: ValidationTimer = {
-  now: () => Date.now(),
-  set: (callback, delayMs) => setTimeout(callback, delayMs),
-  clear: (handle) => clearTimeout(handle)
-};
 
 function appendTail(current: Buffer, chunk: Buffer | string): Buffer {
   const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -112,15 +104,27 @@ type Completion =
   | { readonly kind: "timeout" | "spawn_error" | "signal" | "termination_error" | "aborted" };
 
 export class ValidationProcessRunner {
+  private readonly interruptions = new Map<() => void, Promise<void>>();
+  private terminationUnconfirmed = false;
+
   constructor(
     private readonly start: ValidationProcessStarter = startProcess,
-    private readonly timer: ValidationTimer = systemTimer,
+    private readonly timer: ValidationTimer = monotonicTimer,
     private readonly platform: NodeJS.Platform = process.platform,
     private readonly signaler: typeof signalExecution = signalExecution
   ) {}
 
   run(request: ValidationProcessRequest): Promise<ValidationProcessOutcome> {
     return this.execute(request);
+  }
+
+  interrupt(): void {
+    for (const interrupt of this.interruptions.keys()) interrupt();
+  }
+
+  async waitForCompletion(): Promise<void> {
+    await Promise.all(this.interruptions.values());
+    if (this.terminationUnconfirmed) throw new Error("Validation process shutdown could not be confirmed.");
   }
 
   runSupervised(request: ValidationProcessRequest, control: ValidationProcessControl): Promise<SupervisedValidationProcessOutcome> {
@@ -132,23 +136,28 @@ export class ValidationProcessRunner {
   }
 
   private execute(request: ValidationProcessRequest, control?: ValidationProcessControl): Promise<ValidationProcessOutcome> {
-    const startedAt = this.timer.now();
+    const startedAt = nowMilliseconds(this.timer);
 
     return new Promise((resolve) => {
+      let releaseFinished!: () => void;
+      const finished = new Promise<void>(done => { releaseFinished = done; });
       let completed = false;
       let outputTail = Buffer.alloc(0);
       let terminationOutcome: "timeout" | "spawn_error" | "aborted" | "signal" | undefined;
-      let timeoutHandle: NodeJS.Timeout | undefined;
+      let cancelTimeout: (() => void) | undefined;
       let terminationGraceHandle: NodeJS.Timeout | undefined;
       let pollHandle: NodeJS.Timeout | undefined;
       let child: ChildProcessWithoutNullStreams | undefined;
       let childClosed = false;
+      let childExited = false;
+      let groupQuiescent = false;
       let stdout = Buffer.alloc(0);
       let stdoutTruncated = false;
       const groupGone = (): boolean => {
+        if (groupQuiescent) return true;
         if (child?.pid === undefined || this.platform === "win32") return false;
         try { process.kill(-child.pid, 0); return false; }
-        catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+        catch (error) { return groupQuiescent = (error as NodeJS.ErrnoException).code === "ESRCH"; }
       };
 
       const complete = (completion: Completion): void => {
@@ -157,10 +166,7 @@ export class ValidationProcessRunner {
         }
         completed = true;
 
-        if (timeoutHandle !== undefined) {
-          this.timer.clear(timeoutHandle);
-          timeoutHandle = undefined;
-        }
+        cancelTimeout?.();
 
         if (terminationGraceHandle !== undefined) {
           this.timer.clear(terminationGraceHandle);
@@ -168,8 +174,11 @@ export class ValidationProcessRunner {
         }
         if (pollHandle !== undefined) this.timer.clear(pollHandle);
         control?.signal.removeEventListener("abort", abort);
+        this.interruptions.delete(abort);
+        this.terminationUnconfirmed ||= completion.kind === "termination_error";
+        releaseFinished();
 
-        const durationMs = this.timer.now() - startedAt;
+        const durationMs = Number(nowMilliseconds(this.timer) - startedAt);
         const normalizedTail = decodeTail(outputTail);
         let machineOutput = "";
         if (control) {
@@ -180,7 +189,8 @@ export class ValidationProcessRunner {
           disposition: child?.pid === undefined ? "not_started" as const : childClosed && groupGone() ? "quiescent" as const : "unknown" as const,
           stdout: machineOutput, stdoutTruncated,
         };
-        if (control && details.disposition === "unknown" && child) {
+        if (child && (control && details.disposition === "unknown" ||
+          this.platform !== "win32" && child.pid !== undefined && completion.kind === "termination_error")) {
           child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); child.unref();
         }
         const tail = control ? decodeTail(appendTail(Buffer.alloc(0), Buffer.from(normalizedTail))) : normalizedTail;
@@ -228,7 +238,7 @@ export class ValidationProcessRunner {
 
       const signalChild = (signal: NodeJS.Signals): void => {
         try {
-          if (child) this.signaler(child, this.platform, signal, control ? !childClosed : true);
+          if (child && !groupQuiescent) this.signaler(child, this.platform, signal, !childExited);
         } catch {
           // The grace periods bound termination even when signaling throws.
         }
@@ -242,10 +252,7 @@ export class ValidationProcessRunner {
         }
         terminationOutcome = outcome;
 
-        if (timeoutHandle !== undefined) {
-          this.timer.clear(timeoutHandle);
-          timeoutHandle = undefined;
-        }
+        cancelTimeout?.();
 
         terminationGraceHandle = this.timer.set(() => {
           terminationGraceHandle = undefined;
@@ -256,7 +263,7 @@ export class ValidationProcessRunner {
           signalChild("SIGKILL");
         }, 1_000);
         signalChild("SIGTERM");
-        if (control && !completed) {
+        if (this.platform !== "win32" && child?.pid !== undefined && !completed) {
           const poll = (): void => {
             pollHandle = undefined;
             if (completed) return;
@@ -267,6 +274,7 @@ export class ValidationProcessRunner {
         }
       };
 
+      this.interruptions.set(abort, finished);
       child.stdout.on("data", (chunk: Buffer | string) => {
         capture(chunk);
         if (control && !completed) {
@@ -277,14 +285,24 @@ export class ValidationProcessRunner {
       });
       child.stderr.on("data", capture);
       child.on("error", () => {
-        if (control && child?.pid !== undefined) { beginTermination("spawn_error"); return; }
+        if (completed) return;
+        if (this.platform !== "win32" && child?.pid !== undefined) { beginTermination("spawn_error"); return; }
         if (terminationOutcome === undefined) {
           complete({ kind: "spawn_error" });
         }
       });
+      child.on("exit", () => {
+        if (completed) return;
+        childExited = true;
+        if (this.platform !== "win32" && child?.pid !== undefined && !groupGone()) {
+          beginTermination("signal");
+        }
+      });
       child.on("close", (exitCode) => {
+        if (completed) return;
         childClosed = true;
-        if (control && child?.pid !== undefined && !groupGone()) {
+        childExited = true;
+        if (this.platform !== "win32" && child?.pid !== undefined && !groupGone()) {
           beginTermination(terminationOutcome ?? "signal");
           return;
         }
@@ -303,10 +321,9 @@ export class ValidationProcessRunner {
         beginTermination("spawn_error");
       });
 
-      timeoutHandle = this.timer.set(() => {
-        timeoutHandle = undefined;
+      cancelTimeout = scheduleDeadline(this.timer, startedAt + milliseconds(request.timeoutMs), () => {
         beginTermination("timeout");
-      }, request.timeoutMs);
+      });
       control?.signal.addEventListener("abort", abort, { once: true });
       if (control?.signal.aborted) abort();
 

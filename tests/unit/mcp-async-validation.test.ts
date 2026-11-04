@@ -42,7 +42,8 @@ test("a second Bridge cannot acquire the async owner, while legacy tools remain 
   await second.close();
   const id = runId(await f.connected.ok(START, { patch_task_id: f.patchTaskId, idempotency_key: "owner" }));
   await f.waitForTerminal(id);
-  assert.equal((await f.connected.ok(GET, { validation_run_id: id })).status, "PASS");
+  const { result } = await f.terminal(id, "PASS");
+  assert.equal(result.status, "PASS");
   await f.untouched();
 });
 
@@ -111,12 +112,50 @@ for (const [exit, status] of [["process.stdout.write('validated')", "PASS"], ["p
     const id = runId(await f.connected.ok(START, { patch_task_id: f.patchTaskId, idempotency_key: "result" }));
     await f.waitForTerminal(id);
     const before = await fs.readFile(join(f.directory, id + ".json"), "utf8");
-    const result = await f.connected.ok(GET, { validation_run_id: id }) as unknown as ValidationRun;
+    const { result } = await f.terminal(id, status);
     assert.equal(result.status, status); assert.equal(result.steps[1]?.status, status);
     assert.equal(await fs.readFile(f.counter, "utf8"), "run\n");
     assert.equal(await fs.readFile(join(f.directory, id + ".json"), "utf8"), before); await f.untouched();
   });
 }
+
+test("terminal diagnostics capture the actual request and a synthetic non-PASS before teardown", async t => {
+  const f = await mcpValidationFixture(t);
+  await f.configure(f.script("process.kill(process.pid,'SIGTERM')"));
+  const id = runId(await f.connected.ok(START, { patch_task_id: f.patchTaskId, idempotency_key: "diagnostic-proof" }));
+  await f.waitForTerminal(id);
+  const { result, evidencePath } = await f.terminal(id, "PASS");
+  assert.equal(result.status, "INCOMPLETE"); assert.equal(result.reason, "signal");
+  assert.ok(evidencePath);
+  const evidence = JSON.parse(await fs.readFile(evidencePath, "utf8"));
+  assert.equal(evidence.capturedBeforeTeardown, true);
+  assert.equal(evidence.changed, false); assert.equal(evidence.beforeSha256, evidence.afterSha256);
+  assert.deepEqual(JSON.parse(evidence.before), result);
+  const events = evidence.sessions[0].events;
+  assert.ok(events.some((event: any) => event.event === "request" && event.name === GET));
+  assert.ok(events.some((event: any) => event.event === "response" && event.status === "INCOMPLETE"));
+  assert.equal(events.some((event: any) => event.event === "fixture-cleanup-start"), false);
+  if (evidence.diagnostic) {
+    const trace = evidence.sessions[0].trace.events;
+    assert.ok(trace.some((event: any) => event.event === "owner-acquired"));
+    assert.ok(trace.some((event: any) => event.event === "terminal-get"));
+    const cleanup = trace.filter((event: any) => event.event === "service-operation-start" && event.kind === "cleanup");
+    assert.ok(cleanup.length > 0);
+    for (const event of cleanup) {
+      assert.ok(BigInt(event.effectiveRemainingMs) > 0n && BigInt(event.effectiveRemainingMs) <= 5000n);
+      assert.ok(BigInt(event.totalRemainingMs) > BigInt(event.effectiveRemainingMs));
+    }
+  }
+  t.after(async () => {
+    const after = JSON.parse(await fs.readFile(join(evidencePath!, "..", "after-teardown.json"), "utf8"));
+    assert.ok(after.sessions[0].events.some((event: any) => event.event === "bridge-close"));
+    if (evidence.diagnostic) {
+      const trace = after.sessions[0].trace.events;
+      assert.ok(trace.some((event: any) => event.event === "owner-released"));
+      assert.ok(trace.some((event: any) => event.event === "bridge-exit"));
+    }
+  });
+});
 
 test("missing profile is retained INCOMPLETE; invalid inputs cannot admit runs or inject commands", async t => {
   const f = await mcpValidationFixture(t);

@@ -1,4 +1,4 @@
-import { performance } from "node:perf_hooks";
+import { monotonicTimer, nowMilliseconds, scheduleDeadline, secondsToMilliseconds } from "./validation-deadline.js";
 
 import type { ControlledPatchService, ControlledPatchValidationProposal, ValidationGit } from "./controlled-patch-service.js";
 import type { ValidationProfileStore } from "./validation-profile-store.js";
@@ -26,8 +26,8 @@ type Active = {
   stop: AbortController;
   cleanupStop?: AbortController;
   stopReason?: string;
-  startedMs: number;
-  deadlineMs: number;
+  startedMs: bigint;
+  deadlineMs: bigint;
   changes: Promise<unknown>;
   done: Promise<void>;
   quiescent: boolean;
@@ -37,7 +37,7 @@ const SHUTDOWN_MS = 8000;
 function at(): string { return new Date().toISOString(); }
 function failure(code: string): Error & { code: string } { return Object.assign(new Error(code), { code }); }
 function duration(active: Active): number {
-  return Math.max(active.run.total_duration_ms, Math.floor(performance.now() - active.startedMs));
+  return Math.max(active.run.total_duration_ms, Number(nowMilliseconds() - active.startedMs));
 }
 
 /** Internal service lifecycle only. MCP requests never own its abort controllers or promises. */
@@ -122,10 +122,10 @@ export class ControlledPatchValidationRunService {
         ...input, workspace_id: proposal.workspaceId, workspace_root: proposal.workspaceRoot,
         base_head: proposal.baseHead, patch: proposal.patch, profile: profile ?? null,
       });
-      const startedMs = performance.now();
+      const startedMs = nowMilliseconds();
       const active: Active = {
         run, proposal, stop: new AbortController(), startedMs,
-        deadlineMs: startedMs + (run.profile_snapshot?.total_timeout_seconds ?? 0) * 1000,
+        deadlineMs: startedMs + secondsToMilliseconds(run.profile_snapshot?.total_timeout_seconds ?? 0),
         changes: Promise.resolve(), done: Promise.resolve(), quiescent: true,
       };
       if (this.closing) { active.stopReason = this.closingReason; active.stop.abort(); }
@@ -191,16 +191,16 @@ export class ControlledPatchValidationRunService {
   }
 
   private async operation(active: Active, kind: "preflight" | "worktree_add" | "candidate_apply" | "profile" | "cleanup",
-    request: Omit<ValidationProcessRequest, "timeoutMs">, timeout: number,
+    request: Omit<ValidationProcessRequest, "timeoutMs">, timeout: bigint,
     signal = active.stop.signal, deadlineMs = active.deadlineMs): Promise<SupervisedValidationProcessOutcome> {
     this.stopped(active, signal);
-    const remaining = Math.floor(deadlineMs - performance.now());
-    if (remaining <= 0) throw failure(kind === "cleanup" ? "cleanup_timeout" : "total_timeout");
+    const remaining = deadlineMs - nowMilliseconds();
+    if (remaining <= 0n) throw failure(kind === "cleanup" ? "cleanup_timeout" : "total_timeout");
     // Only this service's live runner can establish quiescence. Restart never
     // infers it from retained process identities or attempts filesystem cleanup.
     active.quiescent = false;
     const outcome = await this.runner.runSupervised({
-      ...request, timeoutMs: Math.min(timeout, Math.max(1, Math.floor(deadlineMs - performance.now()))),
+      ...request, timeoutMs: timeout < remaining ? timeout : remaining,
     }, { signal });
     active.quiescent = outcome.disposition !== "unknown";
     return outcome;
@@ -211,7 +211,7 @@ export class ControlledPatchValidationRunService {
     return async (cwd, args, input) => {
       const outcome = await this.operation(active, kind, {
         argv: ["git", ...args], cwd, ...(input === undefined ? {} : { input }),
-      }, 60_000, signal, deadlineMs);
+      }, 60_000n, signal, deadlineMs);
       if (outcome.kind !== "exit" || outcome.disposition !== "quiescent" || outcome.stdoutTruncated) {
         throw failure(active.stopReason ?? (outcome.stdoutTruncated ? "preflight_output_limit" : outcome.kind));
       }
@@ -230,7 +230,7 @@ export class ControlledPatchValidationRunService {
 
   private async execute(active: Active): Promise<void> {
     let reason: string | undefined;
-    let timer: NodeJS.Timeout | undefined;
+    let cancelTimeout: (() => void) | undefined;
     try {
       if (active.stop.signal.aborted) reason = active.stopReason ?? "bridge_shutdown";
       else if (active.run.profile_snapshot === null) reason = "validation_profile_missing";
@@ -239,7 +239,8 @@ export class ControlledPatchValidationRunService {
         await this.checkpoint(active, { type: "finish", total_duration_ms: duration(active), reason } as ValidationRunEvent);
         return;
       }
-      timer = setTimeout(() => { active.stopReason = "total_timeout"; active.stop.abort(); }, Math.max(0, active.deadlineMs - performance.now()));
+      cancelTimeout = scheduleDeadline(monotonicTimer, active.deadlineMs, () => { active.stopReason = "total_timeout"; active.stop.abort(); });
+      active.stop.signal.addEventListener("abort", cancelTimeout, { once: true });
       await this.checkpoint(active, { type: "start", owner_instance_id: this.owner.instanceId } as ValidationRunEvent);
       reason = "preflight_failed";
       this.stopped(active, active.stop.signal);
@@ -264,7 +265,7 @@ export class ControlledPatchValidationRunService {
           await this.checkpoint(active, { type: "step_started", phase, index } as ValidationRunEvent);
           const result = await this.operation(active, "profile", {
             argv: step.argv as readonly [string, ...string[]], cwd: registered.worktree_path,
-          }, step.timeout_seconds * 1000);
+          }, secondsToMilliseconds(step.timeout_seconds));
           const incomplete = result.kind !== "exit" || result.disposition !== "quiescent";
           const outcome = incomplete ? {
             kind: "incomplete", reason: active.stopReason ?? (result.disposition === "unknown" ? "process_unconfirmed" : result.kind),
@@ -283,7 +284,10 @@ export class ControlledPatchValidationRunService {
           output_tail: active.run.current_step.output_tail,
         } } as ValidationRunEvent);
       }
-    } finally { if (timer) clearTimeout(timer); }
+    } finally {
+      cancelTimeout?.();
+      if (cancelTimeout) active.stop.signal.removeEventListener("abort", cancelTimeout);
+    }
     if (this.fatal) return;
     const cleanup = await this.cleanup(active);
     try {
@@ -315,7 +319,7 @@ export class ControlledPatchValidationRunService {
     await this.checkpoint(active, { type: "cleanup", cleanup: { state: "pending", reason: null, recovery_required: true } } as ValidationRunEvent);
     const signal = new AbortController();
     active.cleanupStop = signal;
-    const deadlineMs = performance.now() + CLEANUP_MS;
+    const deadlineMs = nowMilliseconds() + BigInt(CLEANUP_MS);
     let timer: NodeJS.Timeout;
     let expired = false;
     const pending = this.worktree.cleanup(active.run, this.checkedGit(active, "cleanup", signal.signal, deadlineMs), signal.signal, active.quiescent)

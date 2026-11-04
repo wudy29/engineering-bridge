@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { isolateGitLineEndings } from "../../helpers/git-fixture.js";
 
@@ -110,6 +111,7 @@ class FakeProfileStore {
 }
 
 class FakeValidationProcessRunner {
+  async waitForCompletion(): Promise<void> {}
   readonly invocations: ValidationProcessRequest[] = [];
   readonly overrides = new Map<string, ValidationProcessOutcome>();
   readonly prefixOverrides: Array<{
@@ -861,10 +863,10 @@ test("validate caps each configured step timeout at min(step timeout, remaining 
       invocation
     ])
   );
-  assert.equal(byArgv.get("npm ci --ignore-scripts")?.timeoutMs, 500_000);
-  assert.equal(byArgv.get("npm run build")?.timeoutMs, 500_000);
-  assert.equal(byArgv.get("npm test")?.timeoutMs, 90_000);
-  assert.equal(byArgv.get("npm run lint")?.timeoutMs, 500_000);
+  assert.equal(byArgv.get("npm ci --ignore-scripts")?.timeoutMs, 500_000n);
+  assert.equal(byArgv.get("npm run build")?.timeoutMs, 500_000n);
+  assert.equal(byArgv.get("npm test")?.timeoutMs, 90_000n);
+  assert.equal(byArgv.get("npm run lint")?.timeoutMs, 500_000n);
 });
 
 test("real Git validation uses a detached temporary worktree, isolates candidate changes and artifacts, and cleans up after PASS", async (t) => {
@@ -948,4 +950,155 @@ test("real Git validation removes the temporary worktree after timeout/INCOMPLET
   assert.equal(report.steps[0]?.duration_ms, 30_000);
   assert.equal(report.steps[0]?.output_tail, "validation timed out");
   assertRealValidationPreserved(harness);
+});
+
+for (const stage of ["worktree", "apply", "step", "cleanup", "throw"] as const) {
+  test(`F04 preserves temporary worktree when ${stage} process quiescence is unknown`, async (t) => {
+    let removals = 0;
+    const harness = makeHarness({ proposal: COMMIT_PROPOSAL, profile: PROFILE, removeParent: async () => { removals++; } });
+    t.after(() => { for (const parent of harness.tempParent.created) rmSync(parent, { recursive: true, force: true }); });
+    const prefix = stage === "apply" ? "git apply" : stage === "step" ? "npm ci" : "git -C /workspaces/workspace-a worktree " + (stage === "cleanup" ? "remove" : "add");
+    harness.runner.prefixOverrides.push({ prefix, outcome: stage === "throw"
+      ? Promise.resolve().then(() => { throw new Error("unknown runner failure"); })
+      : { kind: "termination_error", durationMs: 2000, outputTail: "partial" } });
+    const report = await harness.service.validate("task-1");
+    assert.equal(report.status, "INCOMPLETE");
+    assert.equal(report.cleanup, "failed");
+    assert.equal(report.reason, "cleanup_failed");
+    assert.equal(removals, 0, "never remove a directory still owned by an unquiesced process");
+    const cleanupCalls = harness.runner.invocations.filter(({ argv }) => argv.includes("remove"));
+    assert.equal(cleanupCalls.length, stage === "cleanup" ? 1 : 0);
+    assert.equal(existsSync(harness.tempParent.created[0]!), true);
+  });
+}
+
+test("F04 real synchronous validation maps a surviving descendant to INCOMPLETE before safe worktree cleanup", { skip: process.platform === "win32" }, async (t) => {
+  const childCode = "process.on('SIGTERM',()=>{});process.send('ready');setInterval(()=>{},1000)";
+  const parentCode = `const c=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{stdio:['ignore','ignore','ignore','ipc']});c.once('message',()=>{console.log('descendant:'+c.pid);c.disconnect();process.exit(0)});`;
+  const harness = await makeRealValidationHarness(realProfile([{ name: "descendant", argv: [process.execPath, "-e", parentCode] }]));
+  let gone = false;
+  let pid: number | undefined;
+  t.after(async () => {
+    if (pid && !gone) {
+      try { process.kill(pid, "SIGKILL"); } catch (error) {
+        assert.equal((error as NodeJS.ErrnoException).code, "ESRCH"); gone = true;
+      }
+      for (let i = 0; i < 100 && !gone; i++) {
+        try { process.kill(pid, 0); } catch (error) {
+          assert.equal((error as NodeJS.ErrnoException).code, "ESRCH"); gone = true;
+        }
+        if (!gone) await delay(10);
+      }
+      assert.equal(gone, true, "fixture must stop before removal");
+    }
+    cleanupRealValidationHarness(harness);
+  });
+  const report = await harness.service.validate(harness.patchTaskId);
+  pid = Number(report.steps[0]?.output_tail.match(/descendant:(\d+)/)?.[1]);
+  assert.ok(pid);
+  try { process.kill(pid, 0); } catch (error) { assert.equal((error as NodeJS.ErrnoException).code, "ESRCH"); gone = true; }
+  assert.equal(report.status, "INCOMPLETE");
+  assert.equal(report.reason, "signal");
+  assert.equal(gone, true, "cleanup happens only after the descendant exits");
+  assert.equal(report.cleanup, "success");
+  assertRealValidationPreserved(harness);
+});
+
+test("F05 sync validation shutdown rejects admission and joins step termination plus cleanup", async t => {
+  const harness = makeHarness({ proposal: COMMIT_PROPOSAL, profile: PROFILE });
+  t.after(() => { for (const parent of harness.tempParent.created) rmSync(parent, { recursive: true, force: true }); });
+  let stop!: (outcome: ValidationProcessOutcome) => void;
+  const pending = new Promise<ValidationProcessOutcome>(resolve => { stop = resolve; });
+  harness.runner.prefixOverrides.push({ prefix: "npm ci", outcome: pending });
+  let interrupts = 0;
+  Object.assign(harness.runner, { interrupt() { interrupts++; stop({ kind: "aborted", durationMs: 1, outputTail: "partial" }); } });
+  const report = harness.service.validate("task-1");
+  while (!harness.runner.invocations.some(({ argv }) => argv[0] === "npm")) await new Promise<void>(resolve => setImmediate(resolve));
+  const lifecycle = harness.service as ControlledPatchValidationService & { shutdown(): Promise<void> };
+  assert.equal(typeof lifecycle.shutdown, "function");
+  const stopped = lifecycle.shutdown(); assert.equal(lifecycle.shutdown(), stopped);
+  await assert.rejects(harness.service.validate("task-2"), (error: unknown) => error instanceof CoreError && error.code === "INVALID_STATE_TRANSITION");
+  await stopped;
+  assert.equal(interrupts, 1);
+  assert.equal((await report).status, "INCOMPLETE");
+  assert.equal((await report).reason, "aborted");
+  assert.equal((await report).cleanup, "success");
+  assert.equal(harness.runner.invocations.some(({ argv }) => argv.join(" ") === "npm run build"), false);
+});
+
+test("F05 sync shutdown stops the next validation stage even before its first spawn", async t => {
+  const harness = makeHarness({ proposal: COMMIT_PROPOSAL, profile: PROFILE });
+  t.after(() => { for (const parent of harness.tempParent.created) rmSync(parent, { recursive: true, force: true }); });
+  Object.assign(harness.runner, { interrupt() {} });
+  const report = harness.service.validate("task-1");
+  await harness.service.shutdown();
+  assert.equal((await report).status, "INCOMPLETE");
+  assert.equal(harness.runner.invocations.filter(({ argv }) => !argv.includes("remove")).length, 0);
+});
+
+for (const unknown of ["termination_error", "deadline"] as const) {
+  test(`F05 sync shutdown reports ${unknown} without pretending cleanup completed`, async t => {
+    const harness = makeHarness({ proposal: COMMIT_PROPOSAL, profile: PROFILE });
+    t.after(() => { for (const parent of harness.tempParent.created) rmSync(parent, { recursive: true, force: true }); });
+    let finish!: (outcome: ValidationProcessOutcome) => void;
+    const pending = new Promise<ValidationProcessOutcome>(resolve => { finish = resolve; });
+    harness.runner.prefixOverrides.push({ prefix: "npm ci", outcome: pending });
+    Object.assign(harness.runner, { interrupt() { if (unknown === "termination_error") finish({ kind: "termination_error", durationMs: 2000, outputTail: "partial" }); } });
+    const report = harness.service.validate("task-1");
+    while (!harness.runner.invocations.some(({ argv }) => argv[0] === "npm")) await new Promise<void>(resolve => setImmediate(resolve));
+    if (unknown === "deadline") t.mock.timers.enable({ apis: ["setTimeout"] });
+    const stopped = assert.rejects(harness.service.shutdown(), /shutdown/i);
+    if (unknown === "deadline") t.mock.timers.tick(10_000);
+    await stopped;
+    assert.equal(existsSync(harness.tempParent.created[0]!), true);
+    if (unknown === "deadline") finish({ kind: "termination_error", durationMs: 10_000, outputTail: "partial" });
+    assert.equal((await report).cleanup, "failed");
+    assert.equal(harness.runner.invocations.some(({ argv }) => argv.includes("remove")), false);
+  });
+}
+
+test("F05 sync shutdown waits for cleanup runner after the report deadline", async t => {
+  const timer = new ManualCleanupDeadlineTimer();
+  let removals = 0;
+  const harness = makeHarness({ proposal: COMMIT_PROPOSAL, profile: PROFILE, cleanupDeadlineTimer: timer, removeParent: async () => { removals++; } });
+  t.after(() => { for (const parent of harness.tempParent.created) rmSync(parent, { recursive: true, force: true }); });
+  let finishCleanup!: (outcome: ValidationProcessOutcome) => void;
+  let drained!: () => void;
+  const pending = new Promise<ValidationProcessOutcome>(resolve => { finishCleanup = resolve; });
+  const quiescent = new Promise<void>(resolve => { drained = resolve; });
+  harness.runner.prefixOverrides.push({ prefix: "git -C /workspaces/workspace-a worktree remove", outcome: pending });
+  Object.assign(harness.runner, { interrupt() {}, waitForCompletion: () => quiescent });
+  const report = harness.service.validate("task-1");
+  while (!harness.runner.invocations.some(({ argv }) => argv.includes("remove"))) await new Promise<void>(resolve => setImmediate(resolve));
+  let settled = false;
+  const stopped = harness.service.shutdown();
+  void stopped.then(() => { settled = true; }, () => { settled = true; });
+  const rejected = assert.rejects(stopped, /shutdown/i);
+  assert.equal(timer.fire(), 5000);
+  assert.equal((await report).cleanup, "failed");
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(settled, false, "report deadline is not process quiescence");
+  finishCleanup({ kind: "aborted", durationMs: 5000, outputTail: "" }); drained();
+  await rejected;
+  assert.equal(removals, 0);
+});
+
+test("F06 legacy total budget ignores wall-clock jumps", async t => {
+  let wall = 0;
+  t.mock.method(Date, "now", () => (wall += 1_300_000));
+  const harness = makeHarness({ proposal: COMMIT_PROPOSAL, profile: PROFILE });
+  const report = await harness.service.validate("task-1");
+  assert.equal(report.status, "PASS"); assert.ok(report.total_duration_ms >= 0);
+});
+test("F06 legacy maximum seconds retain exact step and total budgets", async () => {
+  const harness = makeHarness({ proposal: COMMIT_PROPOSAL, nowMs: () => 0, profile: {
+    preparation: [], validation: [{ name: "huge", argv: ["check"] }],
+    defaultStepTimeoutSeconds: Number.MAX_SAFE_INTEGER, totalTimeoutSeconds: Number.MAX_SAFE_INTEGER,
+  } });
+  const report = await harness.service.validate("task-1");
+  assert.equal(report.status, "PASS");
+  assert.equal(harness.runner.invocations.find(r => r.argv[0] === "check")?.timeoutMs, 9007199254740991000n);
+  assert.equal(harness.runner.invocations[0]?.timeoutMs, 9007199254740991000n);
+  assert.equal(harness.runner.invocations.at(-1)?.timeoutMs, 5000, "cleanup keeps its independent bounded deadline");
+  assert.doesNotThrow(() => JSON.stringify(report));
 });

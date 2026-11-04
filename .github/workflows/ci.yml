@@ -4,14 +4,25 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   ci:
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
+          - ubuntu-24.04
           - windows-2025
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      BRIDGE_CI_EVIDENCE: integration-evidence
+      BRIDGE_INTEGRATION_EVIDENCE: integration-evidence/commit-signals
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -20,7 +31,43 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Install dependencies
-        run: npm ci
-      - name: Run tests
-        run: npm test
+      - name: Record platform and isolate Git configuration
+        run: |
+          mkdir -p integration-evidence
+          node --version > integration-evidence/environment.txt
+          npm --version >> integration-evidence/environment.txt
+          git --version >> integration-evidence/environment.txt
+          git rev-parse HEAD >> integration-evidence/environment.txt
+          node -e 'console.log(JSON.stringify({platform:process.platform,arch:process.arch,release:require("node:os").release()}))' >> integration-evidence/environment.txt
+          node -e 'const fs=require("node:fs"),p=require("node:path").resolve("integration-evidence/empty-git-config");fs.writeFileSync(p,"");fs.appendFileSync(process.env.GITHUB_ENV,"GIT_CONFIG_GLOBAL="+p+"\nGIT_CONFIG_NOSYSTEM=1\n")'
+          node -e 'const fs=require("node:fs"),cp=require("node:child_process"),p=require("node:path");const npm=cp.execFileSync(process.platform==="win32"?"where":"which",["npm"],{encoding:"utf8"}).split(/\r?\n/).find(Boolean);const cli=p.join(p.dirname(fs.realpathSync(npm)),process.platform==="win32"?"node_modules/npm/bin/npm-cli.js":"npm-cli.js");if(!fs.existsSync(cli))throw Error("npm CLI not resolved");fs.appendFileSync(process.env.GITHUB_ENV,"BRIDGE_NPM_CLI="+cli+"\n")'
+      - name: Install dependencies from unchanged lockfile
+        id: install
+        run: node scripts/integration/record-check.mjs install node "$BRIDGE_NPM_CLI" ci --no-audit --no-fund
+      - name: Typecheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: node scripts/integration/record-check.mjs typecheck node "$BRIDGE_NPM_CLI" run typecheck
+      - name: Build and run the complete suite at default concurrency
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: node scripts/integration/record-check.mjs full node "$BRIDGE_NPM_CLI" test
+      - name: Verify real tgz installation, native bin wrapper, and full MCP contract
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: node scripts/integration/record-check.mjs pack node "$BRIDGE_NPM_CLI" run verify:package -- integration-evidence
+      - name: Verify native Git transactions and platform lifecycle boundaries
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: node scripts/integration/record-check.mjs integration node --test --test-concurrency=1 scripts/integration/git-transaction.test.mjs scripts/integration/commit-shutdown.test.mjs scripts/integration/windows-lifecycle.test.mjs
+      - name: Preserve every run, including failing gates
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-${{ matrix.os }}-node22
+          path: |
+            integration-evidence/**/*.log
+            integration-evidence/**/*.json
+            integration-evidence/**/*.jsonl
+            integration-evidence/**/*.txt
+            integration-evidence/**/*.tgz
+            !integration-evidence/**/source/**
+            !integration-evidence/**/consumer/node_modules/**
+          retention-days: 14
+          if-no-files-found: error

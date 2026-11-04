@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import type {
   ChildProcessWithoutNullStreams,
   SpawnOptionsWithoutStdio
@@ -6,6 +7,7 @@ import type {
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   ValidationProcessRunner,
@@ -663,4 +665,140 @@ test("clears the timeout after normal exit so it cannot fire later", async () =>
   assert.equal(timers.pending.size, 0);
   assert.equal(timers.fireAll(), 0);
   assert.deepEqual(child.killSignals, []);
+});
+
+for (const stdio of ["ignore", "pipe"] as const) {
+  test(`F04 legacy validation waits for owned ${stdio} descendants and never returns exit/0`, { skip: process.platform === "win32" }, async () => {
+    let descendant: number | undefined;
+    let gone = false;
+    const childCode = "process.on('SIGTERM',()=>{});process.send('ready');setInterval(()=>{},1000)";
+    const parentCode = `const c=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childCode)}],{stdio:['ignore',${stdio === "pipe" ? "1,2" : "'ignore','ignore'"},'ipc']});c.once('message',()=>{console.log('partial:'+c.pid);c.disconnect();process.exit(0)});`;
+    const runner = new ValidationProcessRunner((executable, args, options) => {
+      const child = spawn(executable, args, options);
+      child.stdout.on("data", (chunk: Buffer) => {
+        const match = chunk.toString().match(/partial:(\d+)/);
+        if (match) descendant = Number(match[1]);
+      });
+      return child;
+    });
+    try {
+      const outcome = await runner.run({ argv: [process.execPath, "-e", parentCode], cwd: process.cwd(), timeoutMs: 5000 });
+      assert.equal(outcome.kind, "signal", "leftover validation work is INCOMPLETE, never PASS");
+      assert.match(outcome.outputTail, /partial:\d+/);
+      assert.deepEqual(Object.keys(outcome).sort(), ["durationMs", "kind", "outputTail"]);
+      assert.ok(descendant);
+      try { process.kill(descendant, 0); } catch (error) {
+        assert.equal((error as NodeJS.ErrnoException).code, "ESRCH"); gone = true;
+      }
+      assert.equal(gone, true, "descendant must be gone before run resolves");
+    } finally {
+      if (descendant && !gone) {
+        try { process.kill(descendant, "SIGKILL"); } catch (error) {
+          assert.equal((error as NodeJS.ErrnoException).code, "ESRCH"); gone = true;
+        }
+        for (let i = 0; i < 100 && !gone; i++) {
+          try { process.kill(descendant, 0); } catch (error) {
+            assert.equal((error as NodeJS.ErrnoException).code, "ESRCH"); gone = true;
+          }
+          if (!gone) await delay(10);
+        }
+        assert.equal(gone, true, "fixture cleanup");
+      }
+    }
+  });
+}
+
+test("F04 unknown group remains termination_error after bounded TERM/KILL without direct PID fallback", async () => {
+  const child = fakeChild();
+  Object.assign(child.process, { pid: 424243, unref() {} });
+  const timers = new ManualTimer();
+  const signals: Array<[NodeJS.Signals, boolean | undefined]> = [];
+  const originalKill = process.kill;
+  process.kill = ((pid: number, signal: string | number) => {
+    assert.equal(pid, -424243); assert.equal(signal, 0); return true;
+  }) as typeof process.kill;
+  try {
+    const runner = new ValidationProcessRunner(starterFor(child, []), timers, "linux", (_child, _platform, signal, directAlive) => {
+      signals.push([signal, directAlive]); return true;
+    });
+    const result = runner.run(request(["validator"]));
+    child.process.emit("exit", 0);
+    child.close(0);
+    timers.fireAll();
+    assert.equal((await result).kind, "termination_error");
+    await assert.rejects(runner.waitForCompletion(), /shutdown/);
+    assert.deepEqual(signals, [["SIGTERM", false], ["SIGKILL", false]]);
+    assert.equal(timers.pending.size, 0);
+    child.close(0); child.error();
+    assert.equal(signals.length, 2);
+  } finally { process.kill = originalKill; }
+});
+
+for (const platform of ["linux", "win32"] as const) {
+  test(`F05 runner-owned interruption preserves legacy ${platform} outcome and signalling`, async () => {
+    const child = fakeChild();
+    const timers = new ManualTimer();
+    const calls: ExecutionSignalCall[] = [];
+    const runner = runnerWithExecutionSignaler(child, timers, [], platform, calls) as ValidationProcessRunner & { interrupt(): void };
+    const pending = runner.run(request(["validator"]));
+    assert.equal(typeof runner.interrupt, "function");
+    runner.interrupt(); runner.interrupt();
+    let drained = false;
+    const completed = runner.waitForCompletion().then(() => { drained = true; });
+    await Promise.resolve(); assert.equal(drained, false);
+    assert.deepEqual(calls, [{ platform, signal: "SIGTERM" }]);
+    child.close(null, "SIGTERM");
+    assert.deepEqual(await pending, { kind: "aborted", durationMs: 0, outputTail: "" });
+    await completed; assert.equal(drained, true);
+    runner.interrupt(); assert.equal(calls.length, 1);
+    assert.equal(timers.pending.size, 0);
+  });
+}
+
+for (const timeoutMs of [600_000, 2 ** 31 - 2, 2 ** 31 - 1, 2 ** 31, Number.MAX_SAFE_INTEGER * 1000]) {
+  test(`F06 step deadline bounds every Node timer: ${timeoutMs}`, async () => {
+    const child = fakeChild(), timers = new ManualTimer();
+    const runner = new ValidationProcessRunner(starterFor(child, []), timers);
+    const result = runner.run({ ...request(["check"]), timeoutMs });
+    const first = [...timers.pending.values()][0]!;
+    try {
+      assert.ok(first.delayMs <= 2 ** 31 - 1, "Node overflows a larger delay to 1ms");
+      if (timeoutMs > 2 ** 31 - 1) {
+        timers.currentMs = 2 ** 31 - 1;
+        timers.fireNext();
+        assert.deepEqual(child.killSignals, [], "first chunk is not the deadline");
+        assert.equal(timers.pending.size, 1);
+      }
+    } finally { child.close(0); await result; }
+    assert.equal(timers.pending.size, 0);
+  });
+}
+
+for (const terminal of ["exit", "abort", "error", "stdin_error"] as const) {
+  test(`F06 long timer is removed on ${terminal}, including duplicate terminal events`, async () => {
+    const child = fakeChild(), timers = new ManualTimer(), stop = new AbortController();
+    const runner = new ValidationProcessRunner(starterFor(child, []), timers, "darwin");
+    const result = runner.runSupervised({ ...request(["check"]), timeoutMs: 9007199254740991000n }, { signal: stop.signal });
+    const stale = [...timers.pending.values()][0]!.callback;
+    child.writeStdout("partial");
+    if (terminal === "abort") stop.abort();
+    if (terminal === "error") child.error();
+    if (terminal === "stdin_error") child.process.stdin.emit("error", new Error("pipe"));
+    child.close(0); child.close(0); stop.abort(); stale();
+    const outcome = await result;
+    assert.equal(outcome.kind, terminal === "exit" ? "exit" : terminal === "abort" ? "aborted" : "spawn_error");
+    assert.equal(outcome.outputTail, "partial");
+    assert.equal(timers.pending.size, 0);
+    await runner.waitForCompletion();
+  });
+}
+test("F06 pre-abort and spawn exception create no timer", async () => {
+  for (const preAbort of [false, true]) {
+    const timers = new ManualTimer(), stop = new AbortController();
+    if (preAbort) stop.abort();
+    const runner = new ValidationProcessRunner(() => { throw new Error("spawn"); }, timers, "darwin");
+    assert.equal((await runner.runSupervised({ ...request(["check"]), timeoutMs: 2147483648n }, { signal: stop.signal })).kind,
+      preAbort ? "aborted" : "spawn_error");
+    assert.equal(timers.pending.size, 0);
+  }
 });

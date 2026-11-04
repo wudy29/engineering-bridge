@@ -127,6 +127,9 @@ export class RegisteredWorkspaceTaskService {
   private readonly tasks = new Map<Id, TaskRecord>();
   private readonly pinnedTaskIds = new Set<Id>();
   private legacyTerminalTaskIds: Id[] = [];
+  private closing = false;
+  private shutdownPromise: Promise<void> | undefined;
+  private readonly executions = new Set<Promise<void>>();
 
   constructor(
     private readonly registry: RegisteredWorkspaceRegistry,
@@ -139,13 +142,46 @@ export class RegisteredWorkspaceTaskService {
     completedOutputTransform?: CompletedOutputTransform,
     terminalTaskHandler?: TerminalTaskHandler
   ): { taskId: Id } {
+    this.requireAdmission();
     if (request.dashboard_title !== undefined) dashboardLabelSchema.parse(request.dashboard_title);
     if (request.executor === "dsh" && (request.model !== undefined || request.reasoning_effort !== undefined)) throw new CoreError("UNSUPPORTED_ACTION");
     const taskId = newId();
     const normalizedRequest = { ...request, executor: request.executor ?? "codex" };
     this.tasks.set(taskId, { state: "queued", executor: normalizedRequest.executor });
-    queueMicrotask(() => void this.run(taskId, normalizedRequest, completedOutputTransform, terminalTaskHandler));
+    this.schedule(() => this.run(taskId, normalizedRequest, completedOutputTransform, terminalTaskHandler));
     return { taskId };
+  }
+
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.closing = true;
+    const active = [
+      ...[...this.tasks.values()].flatMap(record => "active" in record && record.active ? [record.active] : []),
+      ...[...this.interactive.values()].flatMap(record => record.executor ? [record.executor] : [])
+    ];
+    const drain = (async () => {
+      // Interrupt only requests termination. The original execution promises
+      // own completion and legacy proposal finalization, and must also drain.
+      await Promise.allSettled(active.map(async executor => { await executor.interrupt?.(); }));
+      const results = await Promise.allSettled([...this.executions]);
+      if (results.some(result => result.status === "rejected")) throw new Error("Task shutdown could not be confirmed.");
+    })();
+    let timer: NodeJS.Timeout;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Task shutdown could not be confirmed.")), 10_000);
+    });
+    this.shutdownPromise = Promise.race([drain, deadline]).finally(() => clearTimeout(timer));
+    return this.shutdownPromise;
+  }
+
+  private requireAdmission(): void {
+    if (this.closing) throw new CoreError("INVALID_STATE_TRANSITION");
+  }
+
+  private schedule(run: () => Promise<void>): void {
+    const execution = Promise.resolve().then(run);
+    this.executions.add(execution);
+    void execution.then(() => this.executions.delete(execution), () => this.executions.delete(execution));
   }
 
   pinTask(taskId: Id): void {
@@ -201,6 +237,7 @@ export class RegisteredWorkspaceTaskService {
   // Registers a caller-submitted controlled patch as a retained completed task
   // with submitted provenance: no executor ran, so none is reported.
   submitControlledPatchTask(output: string, pinned: boolean): { taskId: Id } {
+    this.requireAdmission();
     const taskId = newId();
     this.restoreControlledPatchTask(taskId, output, pinned, undefined, "submitted");
     return { taskId };
@@ -219,6 +256,7 @@ export class RegisteredWorkspaceTaskService {
   }
 
   startTask(request: RegisteredWorkspaceTaskRequest): { taskId: Id } {
+    this.requireAdmission();
     if (request.dashboard_title !== undefined) dashboardLabelSchema.parse(request.dashboard_title);
     if (request.executor === "dsh" && (request.model !== undefined || request.reasoning_effort !== undefined)) throw new CoreError("UNSUPPORTED_ACTION");
     const taskId = newId();
@@ -229,7 +267,7 @@ export class RegisteredWorkspaceTaskService {
     };
     this.interactive.set(taskId, record);
     this.publishInteractive(taskId, record);
-    queueMicrotask(() => void this.executeInteractive(taskId));
+    this.schedule(() => this.executeInteractive(taskId));
     return { taskId };
   }
 
@@ -281,6 +319,7 @@ export class RegisteredWorkspaceTaskService {
   }
 
   async controlTask(taskId: unknown, action: "continue" | "steer" | "interrupt" | "accept", instruction?: string): Promise<ControlledTaskView> {
+    if (action === "continue" || action === "steer") this.requireAdmission();
     if (!isId(taskId)) throw new CoreError("INVALID_STATE_TRANSITION");
     const record = this.interactive.get(taskId);
     if (record !== undefined) return this.controlInteractiveTask(taskId, record, action, instruction);
@@ -309,7 +348,7 @@ export class RegisteredWorkspaceTaskService {
       record.state = "queued";
       record.ended_at = null;
       this.publishInteractive(taskId, record);
-      queueMicrotask(() => void this.executeInteractive(taskId));
+      this.schedule(() => this.executeInteractive(taskId));
     } else if (action === "steer") {
       // DSH headless has no steer seam: the action is unsupported for the
       // executor type, not an invalid state transition. Codex steer behavior
@@ -388,6 +427,7 @@ export class RegisteredWorkspaceTaskService {
     record.started_at ??= new Date().toISOString();
     this.publishInteractive(taskId, record);
     try {
+      if (this.closing) throw new CoreError("TASK_INTERRUPTED");
       const registration = this.registry.resolveExecution(record.request.workspace_id);
       const executor = this.executorFactory(record.request.executor, registration.root);
       record.executor = executor;
@@ -437,6 +477,10 @@ export class RegisteredWorkspaceTaskService {
     completedOutputTransform?: CompletedOutputTransform,
     terminalTaskHandler?: TerminalTaskHandler
   ): Promise<void> {
+    if (this.closing) {
+      await this.recordLegacyTerminalTask(taskId, interruptedTaskResult(taskId, ""), terminalTaskHandler);
+      return;
+    }
     this.tasks.set(taskId, { state: "running", executor: request.executor });
     try {
       const workspaceRoot = this.registry.resolve(request.workspace_id);

@@ -30,6 +30,11 @@ export interface GitProcessOptions {
   readonly timers?: GitProcessTimers;
   readonly platform?: NodeJS.Platform;
   readonly signaler?: GitProcessSignaler;
+  readonly signal?: AbortSignal;
+  // Only update-ref --stdin uses this: keep its prepared transaction open
+  // while the caller verifies HEAD under Git's ref locks.
+  readonly afterPrepare?: () => Promise<void>;
+  readonly beforeCommit?: () => void;
 }
 
 export interface GitProcessResult {
@@ -37,7 +42,7 @@ export interface GitProcessResult {
   readonly stdout: string;
 }
 
-const DEFAULT_GIT_PROCESS_TIMING: GitProcessTiming = {
+export const DEFAULT_GIT_PROCESS_TIMING: GitProcessTiming = {
   executionTimeoutMs: 60_000,
   killGraceMs: 2_000
 };
@@ -61,6 +66,7 @@ export function runBoundedGit(
   const timers = options.timers ?? SYSTEM_TIMERS;
   const platform = options.platform ?? process.platform;
   const signaler = options.signaler ?? signalExecution;
+  if (options.signal?.aborted) return Promise.reject(failure());
 
   return new Promise((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams;
@@ -81,6 +87,8 @@ export function runBoundedGit(
     let settled = false;
     let timedOut = false;
     let exited = false;
+    let prepared = false;
+    let preparationFailed = false;
     let deadlineTimer: unknown;
     let graceTimer: unknown;
 
@@ -99,6 +107,7 @@ export function runBoundedGit(
 
     function cleanup(): void {
       clearTimers();
+      options.signal?.removeEventListener("abort", onAbort);
       child.removeListener("error", onError);
       child.removeListener("exit", onExit);
       child.removeListener("close", onClose);
@@ -131,6 +140,22 @@ export function runBoundedGit(
 
     function onData(chunk: string): void {
       stdout += chunk;
+      if (options.afterPrepare !== undefined && !prepared &&
+          stdout === "start: ok\nprepare: ok\n") {
+        prepared = true;
+        void Promise.resolve().then(options.afterPrepare).then(() => {
+          if (!settled && !timedOut && !preparationFailed) {
+            // Once commit can reach Git, shutdown must reconcile this known
+            // publication, not treat a later cancellation as an abort proof.
+            options.signal?.removeEventListener("abort", onAbort);
+            options.beforeCommit?.();
+            child.stdin.end("commit\n");
+          }
+        }, () => {
+          preparationFailed = true;
+          if (!settled && !timedOut) child.stdin.end("abort\n");
+        }).catch(onError);
+      }
     }
 
     function onExit(): void {
@@ -140,22 +165,38 @@ export function runBoundedGit(
     function onClose(code: number | null): void {
       exited = true;
       if (timedOut) return;
+      if (preparationFailed) { fail(); return; }
       settle(() => resolve({ code: code ?? -1, stdout }));
     }
 
     function onError(): void {
-      if (!timedOut) fail();
+      if (timedOut) return;
+      if (options.afterPrepare !== undefined) {
+        preparationFailed = true;
+        // EOF aborts an uncommitted transaction. Await close (or the existing
+        // bounded TERM/KILL deadline) before letting the owner release locks.
+        child.stdin.destroy();
+      } else fail();
     }
 
-    function onDeadline(): void {
+    function onAbort(): void {
+      preparationFailed = true;
+      child.stdin.destroy(); // EOF cannot publish an uncommitted transaction.
+      onDeadline(!exited);
+    }
+
+    function onDeadline(directChildAlive?: boolean): void {
+      if (settled || timedOut) return;
+      if (deadlineTimer !== undefined) timers.clearTimeout(deadlineTimer);
       deadlineTimer = undefined;
-      if (settled) return;
       timedOut = true;
-      signaler(child, platform, "SIGTERM");
+      try { signaler(child, platform, "SIGTERM", directChildAlive); }
+      catch { /* Failed delivery does not prove process termination. */ }
       graceTimer = timers.setTimeout(() => {
         graceTimer = undefined;
         if (settled) return;
-        signaler(child, platform, "SIGKILL", !exited);
+        try { signaler(child, platform, "SIGKILL", !exited); }
+        catch { /* The owner retains unconfirmed processes beyond rejection. */ }
         fail();
       }, timing.killGraceMs);
     }
@@ -170,8 +211,13 @@ export function runBoundedGit(
     child.stderr.on("error", onError);
     child.stderr.resume();
     deadlineTimer = timers.setTimeout(onDeadline, timing.executionTimeoutMs);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) { onAbort(); return; }
     try {
-      child.stdin.end(input);
+      // Empty input is EOF, not a zero-byte write that can race Git closing
+      // its reader. Nonempty input and every stream error keep their checks.
+      if (options.afterPrepare === undefined) child.stdin.end(input === "" ? undefined : input);
+      else child.stdin.write(input);
     } catch {
       onError();
     }

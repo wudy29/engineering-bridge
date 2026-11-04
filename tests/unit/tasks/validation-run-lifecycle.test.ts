@@ -1,3 +1,4 @@
+import { monotonicTimer } from "../../../src/tasks/validation-deadline.js";
 import assert from "node:assert/strict";
 import nodeTest from "node:test";
 import fs from "node:fs/promises";
@@ -286,3 +287,39 @@ for (const event of [{ type: "progress", total_duration_ms: 1 }, { type: "phase"
     assert.equal((await new ValidationRunStore(f.directory).get(run.validation_run_id))?.status, "PASS");
   });
 }
+
+for (const seconds of [2_147_484, Number.MAX_SAFE_INTEGER]) {
+  test(`F06 large total and step deadlines allow a real short validation: ${seconds}`, async t => {
+    const f = await setup(t);
+    await f.profiles.configure("workspace", { preparation: [], validation: [
+      { name: "short", argv: [process.execPath, "-e", "process.stdout.write('completed')"] }
+    ], defaultStepTimeoutSeconds: seconds, totalTimeoutSeconds: seconds });
+    const run = await f.service.start({ patch_task_id: f.patchTaskId, idempotency_key: "large-deadline" });
+    const result = await terminal(f.service, run.validation_run_id);
+    assert.equal(result.status, "PASS", JSON.stringify(result));
+    assert.equal(result.cleanup.state, "success");
+  });
+}
+
+test("F06 total timer is cancelled immediately on shutdown while a checkpoint is held", async t => {
+  const f = await setup(t), entered = deferred(), release = deferred();
+  t.after(() => release.resolve());
+  const pending = new Map<NodeJS.Timeout, () => void>(); let next = 1;
+  t.mock.method(monotonicTimer, "set", (callback: () => void, ms: number) => {
+    assert.ok(ms > 0 && ms <= 2147483647);
+    const handle = next++ as unknown as NodeJS.Timeout; pending.set(handle, callback); return handle;
+  });
+  t.mock.method(monotonicTimer, "clear", (handle: NodeJS.Timeout) => { pending.delete(handle); });
+  t.mock.method(f.patches, "preflightCapturedValidationProposal", async () => {
+    entered.resolve(); await release.promise; throw new Error("held preflight stopped");
+  });
+  const run = await f.service.start({ patch_task_id: f.patchTaskId, idempotency_key: "cancel-long-total" });
+  await entered.promise;
+  assert.equal(pending.size, 1);
+  const stale = [...pending.values()][0]!;
+  const shutdown = f.service.shutdown("bridge_sigterm");
+  try { assert.equal(pending.size, 0, "abort releases the total timer before awaiting held work"); stale(); }
+  finally { release.resolve(); await shutdown; }
+  assert.equal((await f.service.get(run.validation_run_id))?.reason, "bridge_sigterm");
+  assert.equal(pending.size, 0);
+});

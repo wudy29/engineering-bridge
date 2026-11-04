@@ -7,6 +7,8 @@ import test from "node:test";
 
 import { isolateGitLineEndings } from "../helpers/git-fixture.js";
 
+import { z } from "zod";
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -152,6 +154,22 @@ test("MCP and Codex client metadata use the shared package VERSION, and stdio re
     assert.equal(client.getServerVersion()?.version, VERSION);
 
     const listed = await client.listTools();
+    let cursor = listed.nextCursor;
+    while (cursor !== undefined) {
+      const page = await client.listTools({ cursor });
+      listed.tools.push(...page.tools); cursor = page.nextCursor;
+    }
+    const baseline = JSON.parse(readFileSync("tests/fixtures/mcp-tools-v1.6.0.json", "utf8"));
+    // Keep wire objects intact: SDK ToolSchema may strip unknown top-level fields.
+    const rawTools: Tool[] = [];
+    let rawCursor: string | undefined;
+    do {
+      const page = await client.request({ method: "tools/list", params: rawCursor === undefined ? {} : { cursor: rawCursor } },
+        z.object({ tools: z.array(z.custom<Tool>()), nextCursor: z.string().optional() }));
+      rawTools.push(...page.tools); rawCursor = page.nextCursor;
+    } while (rawCursor !== undefined);
+    // Entire objects include defaults, annotations, execution, and absent fields.
+    assert.deepEqual({ server: client.getServerVersion(), tools: rawTools.sort((a, b) => a.name.localeCompare(b.name)) }, baseline);
     assert.deepEqual(listed.tools.map(({ name }) => name).sort(), [
       "apply_controlled_patch",
       "authorize_workspace_write",

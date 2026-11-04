@@ -220,23 +220,36 @@ async function main(): Promise<void> {
   };
 
   let observationsStopped = false;
+  let stopPromise: Promise<boolean> | undefined;
   // Transport EOF/caller cancellation does not own the validation lifecycle.
   // Natural exit releases the owner after active work drains; OS shutdown aborts it.
-  const stop = async (reason: "bridge_shutdown" | "bridge_sigterm") => {
+  const stop = (reason: "bridge_shutdown" | "bridge_sigterm"): Promise<boolean> => {
+    if (stopPromise) return stopPromise;
+    const writes = controlledPatches.shutdown(); // Close write admission synchronously.
     observationsStopped = true;
     try { observationProducer?.stop(); }
     catch { /* Observation shutdown is independent of validation ownership. */ }
-    try { await validationRuns?.shutdown(reason); }
-    catch (error) {
-      process.stderr.write(JSON.stringify(validationError(error)) + "\n");
-      process.exitCode = 1;
-    }
+    stopPromise = Promise.allSettled([writes, service.shutdown(), validation.shutdown(), validationRuns?.shutdown(reason)]).then(results => {
+      for (const [index, result] of results.entries()) if (result.status === "rejected") {
+        process.stderr.write(JSON.stringify(index === 0 ? {
+          code: "INTERNAL_ERROR", message: "Controlled write shutdown could not be confirmed; recovery required."
+        } : validationError(result.reason)) + "\n");
+        process.exitCode = 1;
+      }
+      return results[0]!.status === "fulfilled";
+    });
+    return stopPromise;
   };
   process.once("beforeExit", () => { void stop("bridge_shutdown"); });
   for (const [signal, reason, exitCode] of [
     ["SIGTERM", "bridge_sigterm", 143], ["SIGINT", "bridge_shutdown", 130],
-  ] as const) process.once(signal, () => {
-    void stop(reason).then(() => process.exit(process.exitCode || exitCode));
+  ] as const) process.on(signal, () => {
+    void stop(reason).then(writesDrained => {
+      if (writesDrained) process.exit(process.exitCode || exitCode);
+      // Failed cleanup is not permission to kill the owner of a live publisher.
+      // Close admission/transport and report failure, retaining live handles.
+      else void server.close().catch(error => process.stderr.write(JSON.stringify(validationError(error)) + "\n"));
+    });
   });
   const server = new McpServer({ name: "engineering-bridge", version: VERSION });
 

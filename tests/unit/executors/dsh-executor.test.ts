@@ -119,6 +119,64 @@ async function settlesWithin<T>(promise: Promise<T>, milliseconds = 100): Promis
   ]);
 }
 
+// Node bootstrap is not descendant cleanup. Bound both phases, and arm the
+// original cleanup deadline before allowing the owned parent to exit.
+async function dshStages<T>(start: () => Promise<T>, ready: Promise<void>, release: () => void,
+  note: (event: string) => void = () => {}) {
+  const phase = async <U>(name: string, ms: number, begin: () => Promise<U>) => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => { note(name + "-deadline"); reject(new Error(name + " did not settle")); }, ms);
+      });
+      return await Promise.race([timeout, begin()]);
+    } finally { clearTimeout(timer); }
+  };
+  let completion!: Promise<T>;
+  await phase("startup", 1000, () => {
+    completion = start();
+    return Promise.race([ready, completion.then(() => { throw new Error("DSH finished before ready"); })]);
+  });
+  return phase("cleanup", 500, () => { note("parent-release"); release(); return completion; });
+}
+
+test("F03 phase bounds: delayed ready fails the old window but retains bounded cleanup", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let announce!: () => void, finish!: (value: number) => void, releases = 0, settlements = 0;
+  const ready = new Promise<void>(resolve => { announce = resolve; });
+  const completion = new Promise<number>(resolve => { finish = resolve; });
+  const expired: string[] = [];
+  const oldWindow = assert.rejects(settlesWithin(completion, 500), /promise did not settle/);
+  const staged = dshStages(() => completion, ready, () => { releases++; }, event => expired.push(event))
+    .then(result => { settlements++; return result; });
+  t.mock.timers.tick(600); await oldWindow;
+  announce(); announce(); await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(releases, 1);
+  t.mock.timers.tick(50); finish(7); finish(9);
+  assert.equal(await staged, 7); assert.equal(settlements, 1);
+  t.mock.timers.tick(10_000);
+  assert.deepEqual(expired, ["parent-release"], "both successful stage timers were cleared");
+});
+
+for (const blocked of ["startup", "cleanup", "early-exit", "early-rejection", "release-error"]) {
+  test(`F03 phase bounds: ${blocked} cannot hang or leak a deadline`, async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const events: string[] = []; let releases = 0;
+    const pending = new Promise<void>(() => {});
+    const completion = blocked === "early-exit" ? Promise.resolve() : blocked === "early-rejection" ? Promise.reject(new Error("early rejection")) : pending;
+    const ready = ["cleanup", "release-error"].includes(blocked) ? Promise.resolve() : pending;
+    const work = dshStages(() => completion, ready, () => { releases++; if (blocked === "release-error") throw new Error("release error"); }, event => events.push(event));
+    const rejected = assert.rejects(work, blocked === "early-exit" ? /before ready/ : blocked === "early-rejection" ? /early rejection/ : blocked === "release-error" ? /release error/ : new RegExp(blocked + " did not settle"));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const limit = blocked === "startup" ? 1000 : 500;
+    t.mock.timers.tick(limit - 1); await Promise.resolve();
+    assert.equal(events.some(event => event.endsWith("-deadline")), false);
+    t.mock.timers.tick(1); await rejected; t.mock.timers.tick(10_000);
+    assert.equal(releases, ["cleanup", "release-error"].includes(blocked) ? 1 : 0);
+    assert.deepEqual(events.filter(event => event.endsWith("-deadline")), ["startup", "cleanup"].includes(blocked) ? [blocked + "-deadline"] : []);
+  });
+}
+
 test("uses the official headless interface with a fixed workspace and returns final text", async () => {
   const invocations: Invocation[] = [];
   const hostEnvironment = {
@@ -283,6 +341,7 @@ test("POSIX direct exit terminates a descendant that keeps inherited stdio open"
     }
     assert.ok(descendantPid);
     assert.throws(() => process.kill(descendantPid!, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH");
+    descendantPid = undefined; // Never signal a PID after proving it is gone.
   } finally {
     if (descendantPid !== undefined) {
       try { process.kill(descendantPid, "SIGKILL"); } catch { /* already gone */ }
@@ -310,6 +369,140 @@ test("direct child exit never falls back to signalling its stale PID", async () 
     assert.deepEqual(invocations[0]?.signals, []);
   } finally {
     process.kill = originalKill;
+  }
+});
+
+for (const order of ["close-before-immediate", "exit-immediate-close", "duplicate-and-late-events"]) {
+  for (const code of [0, 7]) {
+    test(`F03 ${order}, exit=${code}, retains owned group TERM-to-KILL cleanup`, async () => {
+      const invocations: Invocation[] = [];
+      const signals: Array<NodeJS.Signals | number | undefined> = [];
+      const originalKill = process.kill;
+      process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+        assert.equal(pid, -424242, "only the group created for this invocation may be signalled");
+        signals.push(signal);
+        return true;
+      }) as typeof process.kill;
+      try {
+        const executor = timedExecutor(fakeStarter({ hold: true, pid: 424242 }, invocations), "darwin");
+        let completed = false;
+        const pending = executor.execute({ taskId: TASK_ID, instruction: "inspect" }).then((result) => { completed = true; return result; });
+        const invocation = invocations[0]!;
+        assert.equal(invocation.options.detached, true);
+        invocation.write("approved output\n");
+        invocation.exit(code);
+        if (order === "exit-immediate-close") await new Promise<void>((resolve) => setImmediate(resolve));
+        invocation.close(code);
+        if (order === "duplicate-and-late-events") { invocation.exit(code); invocation.close(code); }
+        await Promise.resolve();
+        assert.equal(completed, false, "close must not cancel descendant cleanup");
+        const result = await settlesWithin(pending);
+        assert.deepEqual(result, code === 0 ? { kind: "completed", output: "approved output" } : {
+          kind: "failed", error: { code: "DSH_EXECUTION_FAILED", message: "DSH execution failed." }
+        });
+        assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+        assert.deepEqual(invocation.signals, [], "never fall back to a stale direct PID");
+        invocation.exit(code); invocation.close(code); invocation.error();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(signals, ["SIGTERM", "SIGKILL"], "late events cannot signal again");
+      } finally { process.kill = originalKill; }
+    });
+  }
+}
+
+test("F03 a late stream error after direct exit never signals a stale direct PID", async () => {
+  const invocations: Invocation[] = [];
+  const originalKill = process.kill;
+  process.kill = (() => { const error = new Error("group gone") as NodeJS.ErrnoException; error.code = "ESRCH"; throw error; }) as typeof process.kill;
+  try {
+    const executor = timedExecutor(fakeStarter({ hold: true, pid: 424242 }, invocations), "darwin");
+    const pending = executor.execute({ taskId: TASK_ID, instruction: "inspect" });
+    invocations[0]!.exit(0);
+    invocations[0]!.error();
+    assert.equal((await pending).kind, "failed");
+    assert.deepEqual(invocations[0]!.signals, []);
+  } finally { process.kill = originalKill; }
+});
+
+test("F03 POSIX closes ignored stdio while a TERM-resistant descendant remains owned", {
+  skip: process.platform === "win32" ? "POSIX process group fixture" : false
+}, async t => {
+  let descendantPid: number | undefined;
+  let descendantGone = false;
+  let parentPid: number | undefined;
+  let evidencePath: string | undefined;
+  let announce!: () => void, releaseParent!: () => void;
+  const ready = new Promise<void>(resolve => { announce = resolve; });
+  const events: Record<string, unknown>[] = [];
+  const note = (event: string, data = {}) => events.push({ event, ms: Number(process.hrtime.bigint()) / 1e6, ...data });
+  const kill = process.kill;
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    try { const result = kill(pid, signal); if (pid === -parentPid! && signal !== 0) note("signal", { pid, signal }); return result; }
+    catch (error) { if (pid === -parentPid! || pid === descendantPid) note("signal-error", { pid, signal, code: (error as NodeJS.ErrnoException).code }); throw error; }
+  }) as typeof kill;
+  const capture = (error?: unknown) => {
+    const state = (pid: number | undefined) => {
+      if (pid === undefined) return "unknown";
+      try { kill(pid, 0); return "present"; } catch (error) { return (error as NodeJS.ErrnoException).code; }
+    };
+    const parent = process.env.BRIDGE_TEST_EVIDENCE ?? tmpdir(); mkdirSync(parent, { recursive: true });
+    const path = join(mkdtempSync(join(parent, "dsh-")), "timeline.json");
+    evidencePath = path;
+    writeFileSync(path, JSON.stringify({ test: t.name, capturedBeforeTeardown: true,
+      error: error instanceof Error ? error.message : error, events,
+      parentPid, descendantPid, group: state(parentPid === undefined ? undefined : -parentPid), descendant: state(descendantPid),
+      deadlines: { startupMs: 1000, cleanupMs: 500, executionMs: 1000, interruptGraceMs: 20, killGraceMs: 50, descendantGoneMs: 100 },
+    }, null, 2));
+    t.diagnostic(`DSH evidence: ${path}`);
+  };
+  const starter: DshProcessStarter = (_file, _args, options) => {
+    const delayedReady = process.env.BRIDGE_TEST_DSH_DELAY_READY === "1";
+    const descendant = `process.on('SIGTERM',()=>{});${delayedReady ? "setTimeout(()=>process.send('ready'),600);" : "process.send('ready');"}setInterval(()=>{},1000);`;
+    const script = `const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:['ignore','ignore','ignore','ipc']});child.once('message',()=>{process.stdout.write(String(child.pid)+'\\n');process.send({ready:child.pid});});process.once('message',()=>{child.disconnect();process.disconnect();process.exit(0);});`;
+    const child = spawn(process.execPath, ["-e", script], { ...options, cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe", "ipc"] });
+    parentPid = child.pid; note("spawn", { pid: parentPid });
+    child.on("exit", (code, signal) => note("parent-exit", { code, signal }));
+    child.on("close", (code, signal) => note("parent-close", { code, signal }));
+    child.once("message", (message: { ready: number }) => { descendantPid = message.ready; note("ready", { pid: descendantPid }); announce(); });
+    releaseParent = () => child.send("release");
+    return child as ChildProcessWithoutNullStreams;
+  };
+  try {
+    const executor = timedExecutor(starter, process.platform, { executionTimeoutMs: 1000, interruptGraceMs: 20, killGraceMs: 50 });
+    const result = await dshStages(() => {
+      note("execute");
+      return executor.execute({ taskId: TASK_ID, instruction: "inspect" }).then(result => { note("settle", { result }); return result; });
+    }, ready, () => releaseParent(), note);
+    assert.equal(result.kind, "completed");
+    assert.ok(descendantPid);
+    const deadline = Date.now() + 100;
+    while (Date.now() < deadline) {
+      try { process.kill(descendantPid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        descendantGone = true;
+        note("descendant-gone");
+        try { kill(-parentPid!, 0); } catch (groupError) { note("group-state", { code: (groupError as NodeJS.ErrnoException).code }); }
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(descendantGone, true, "the owned descendant has actually exited");
+    assert.ok(events.some(event => event.event === "signal" && event.signal === "SIGKILL"), "product must escalate before fixture teardown");
+    if (process.env.BRIDGE_TEST_CAPTURE_ALL === "1") capture();
+  } catch (error) {
+    note("assertion-failure"); capture(error); throw error;
+  } finally {
+    note("fixture-cleanup-start");
+    process.kill = kill;
+    if (descendantPid !== undefined && !descendantGone) {
+      note("fixture-SIGKILL", { pid: descendantPid });
+      try { process.kill(descendantPid, "SIGKILL"); } catch (error) { note("fixture-signal-error", { code: (error as NodeJS.ErrnoException).code }); }
+    }
+    if (evidencePath) writeFileSync(evidencePath.replace("timeline.json", "after-teardown.json"), JSON.stringify({
+      stage: "after-fixture-signal-request", events, descendantGoneBeforeTeardown: descendantGone,
+      teardownExitConfirmed: descendantGone ? true : "UNKNOWN",
+    }, null, 2));
   }
 });
 
