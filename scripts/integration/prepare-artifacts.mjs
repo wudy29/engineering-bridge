@@ -37,4 +37,4 @@ await fs.writeFile(join(destination, "artifact-check.json"), JSON.stringify({
   status: "PASS", syntheticOnly: true, files: files.map(({ path, sha256 }) => ({ path, sha256 })), excluded,
 }, null, 2) + "\n");
 await fs.appendFile(process.env.GITHUB_OUTPUT, `upload_path=${destination}\n`);
-console.log(`Inspected ${files.length} synthetic evidence files; ${excluded.length} unverified packages excluded.`);
+console.log(`Inspected ${files.length} synthetic evidence files; ${excluded.length} ineligible entries excluded.`);

@@ -13,7 +13,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(contains(github.event.head_commit.message, '[bridge-diagnostic]') && '[{"os":"windows-2025","node":22,"platform":"win32"},{"os":"macos-15","node":24,"platform":"darwin"}]' || '[{"os":"ubuntu-24.04","node":22,"platform":"linux"},{"os":"windows-2025","node":22,"platform":"win32"},{"os":"macos-15","node":24,"platform":"darwin"}]') }}
+        include:
+          - os: ubuntu-24.04
+            node: 22
+            platform: linux
+          - os: macos-15
+            node: 24
+            platform: darwin
+          - os: windows-2025
+            node: 22
+            platform: win32
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -25,7 +34,7 @@ jobs:
       BRIDGE_CI_UPLOAD: ${{ github.workspace }}/../bridge-audit-upload
       BRIDGE_EXPECTED_PLATFORM: ${{ matrix.platform }}
       BRIDGE_EXPECTED_NODE: ${{ matrix.node }}
-      BRIDGE_CI_DIAGNOSTIC: ${{ contains(github.event.head_commit.message, '[bridge-diagnostic]') && '1' || '0' }}
+      BRIDGE_CI_DIAGNOSTIC: '0'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -49,23 +58,17 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: node scripts/integration/record-check.mjs build node "$BRIDGE_NPM_CLI" run build
       - name: Run the complete suite at default concurrency
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.BRIDGE_CI_DIAGNOSTIC != '1' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: node scripts/integration/record-check.mjs full node --test 'dist/tests/unit/**/*.test.js'
       - name: Compare the complete raw MCP schema and input contracts
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.BRIDGE_CI_DIAGNOSTIC != '1' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: node scripts/integration/record-check.mjs schema node --test dist/tests/unit/mcp-stdio.test.js
       - name: Verify real tgz installation, native bin wrapper, and full MCP contract
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && env.BRIDGE_CI_DIAGNOSTIC != '1' }}
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: node scripts/integration/record-check.mjs pack node "$BRIDGE_NPM_CLI" run verify:package -- "$BRIDGE_CI_EVIDENCE"
       - name: Verify native Git transactions and platform lifecycle boundaries
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.BRIDGE_CI_DIAGNOSTIC != '1' }}
-        run: node scripts/integration/record-check.mjs integration node --test --test-concurrency=1 scripts/integration/git-transaction.test.mjs scripts/integration/commit-shutdown.test.mjs scripts/integration/windows-lifecycle.test.mjs
-      - name: Diagnose macOS readiness failure once per failed mixed case
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.BRIDGE_CI_DIAGNOSTIC == '1' && matrix.platform == 'darwin' }}
-        run: node scripts/integration/record-check.mjs diagnostic node --import ./scripts/integration/ci-diagnostic-preload.mjs --test --test-name-pattern='drains alongside' scripts/integration/commit-shutdown.test.mjs
-      - name: Diagnose Windows descendant exit and teardown once per failed case
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.BRIDGE_CI_DIAGNOSTIC == '1' && matrix.platform == 'win32' }}
-        run: node scripts/integration/record-check.mjs diagnostic node --import ./scripts/integration/ci-diagnostic-preload.mjs --test --test-name-pattern='cannot report PASS' scripts/integration/windows-lifecycle.test.mjs
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: node scripts/integration/record-check.mjs integration node --test --test-concurrency=1 scripts/integration/fixture-cleanup.test.mjs scripts/integration/git-transaction.test.mjs scripts/integration/commit-shutdown.test.mjs scripts/integration/windows-lifecycle.test.mjs
       - name: Check synthetic artifacts before upload
         id: artifacts
         if: ${{ always() }}

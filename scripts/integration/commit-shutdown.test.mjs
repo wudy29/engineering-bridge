@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { gone } from "./fixture-cleanup.mjs";
 const source = process.env.BRIDGE_CANDIDATE_ROOT ?? process.cwd();
 const scripts = dirname(fileURLToPath(import.meta.url));
 const evidence = process.env.BRIDGE_INTEGRATION_EVIDENCE ?? await fs.mkdtemp(join(tmpdir(), "bridge-integration-evidence-"));
@@ -18,16 +19,17 @@ const until = async (check, ms = 8000) => {
   const deadline = performance.now() + ms;
   while (!await check()) { if (performance.now() >= deadline) throw new Error("fixture phase did not settle"); await delay(10); }
 };
-const gone = pid => { try { process.kill(pid, 0); return false; } catch (e) { return e.code === "ESRCH"; } };
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const patch = "diff --git a/note.txt b/note.txt\n--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-before\n+after\n";
 const queuedPatch = "diff --git a/queued.txt b/queued.txt\n--- a/queued.txt\n+++ b/queued.txt\n@@ -1 +1 @@\n-unchanged\n+queued\n";
 const posixOnly = process.platform === "win32" ? "native POSIX signal acceptance; Windows requires its own gate" : false;
 
 async function fixture(t, mode, signal, mixed = false) {
-  const root = await fs.mkdtemp(join(tmpdir(), "bridge-commit-signal-")), repo = join(root, "repo");
+  const createdRoot = await fs.mkdtemp(join(tmpdir(), "bridge-commit-signal-"));
+  const root = await fs.realpath(createdRoot), repo = join(root, "repo");
   const label = mode + "-" + signal + (mixed ? "-mixed" : "");
   const trace = (event, data = {}) => appendFileSync(join(root, "events.jsonl"), JSON.stringify({ event, pid: process.pid, ms: String(process.hrtime.bigint() / 1000000n), ...data }) + "\n");
+  trace("fixture_paths", { mkdtemp: createdRoot, realpath: await fs.realpath(createdRoot), root, cwd: process.cwd() });
   const events = () => {
     const text = existsSync(join(root, "events.jsonl")) ? readFileSync(join(root, "events.jsonl"), "utf8") : "";
     return text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map(x => JSON.parse(x));
@@ -50,6 +52,10 @@ async function fixture(t, mode, signal, mixed = false) {
   }
   const config = join(root, "workspaces.json"); await fs.writeFile(config, JSON.stringify(entries));
   const sessions = [], auxiliary = [], runs = [];
+  const runSnapshots = () => Promise.all(runs.map(async id => {
+    try { return JSON.parse(await fs.readFile(join(config + ".validation-runs", id + ".json"), "utf8")); }
+    catch (error) { return { validation_run_id: id, observationError: error.code ?? error.message }; }
+  }));
   const connect = async (injected = false) => {
     const child = spawn(process.execPath, [join(source, "dist/src/mcp-stdio.js"), config], {
       cwd: source, stdio: "pipe", env: { ...process.env, NODE_OPTIONS: injected ? "--import=" + pathToFileURL(join(scripts, "commit-signal-hook.mjs")).href : "",
@@ -74,21 +80,24 @@ async function fixture(t, mode, signal, mixed = false) {
     return { child, client, closed, call };
   };
   t.after(async () => {
-    await fs.writeFile(join(root, "release"), "release owned fixture\n");
-    await fs.writeFile(join(root, "release-children"), "release owned fixture\n");
-    try {
-      for (const s of sessions) {
-        await s.client.close().catch(() => {});
-        if (s.child.exitCode === null && s.child.signalCode === null) s.child.kill("SIGTERM");
-        try { await until(() => s.child.exitCode !== null || s.child.signalCode !== null, 10_000); }
-        catch (error) { s.child.kill("SIGKILL"); throw error; }
-        await s.closed;
+    try { trace("fixture_before_teardown", { runs: await runSnapshots() }); }
+    finally {
+      await fs.writeFile(join(root, "release"), "release owned fixture\n");
+      await fs.writeFile(join(root, "release-children"), "release owned fixture\n");
+      try {
+        for (const s of sessions) {
+          await s.client.close().catch(() => {});
+          if (s.child.exitCode === null && s.child.signalCode === null) s.child.kill("SIGTERM");
+          try { await until(() => s.child.exitCode !== null || s.child.signalCode !== null, 10_000); }
+          catch (error) { s.child.kill("SIGKILL"); throw error; }
+          await s.closed;
+        }
+        for (const event of events().filter(e => ["native_git_spawn", "owned_descendant"].includes(e.event))) await until(() => gone(event.childPid));
+        for (const child of auxiliary) await until(() => gone(child.pid));
+      } finally {
+        for (const name of ["events.jsonl", "stderr.log", "index-install-input", "index-installed", "index-at-bridge-exit"]) if (existsSync(join(root, name))) await fs.copyFile(join(root, name), join(evidence, label + "-" + name));
+        await fs.rm(root, { recursive: true, force: true });
       }
-      for (const event of events().filter(e => ["native_git_spawn", "owned_descendant"].includes(e.event))) await until(() => gone(event.childPid));
-      for (const child of auxiliary) await until(() => gone(child.pid));
-    } finally {
-      for (const name of ["events.jsonl", "stderr.log", "index-install-input", "index-installed", "index-at-bridge-exit"]) if (existsSync(join(root, name))) await fs.copyFile(join(root, name), join(evidence, label + "-" + name));
-      await fs.rm(root, { recursive: true, force: true });
     }
   });
   const session = await connect(true);
@@ -114,8 +123,15 @@ async function fixture(t, mode, signal, mixed = false) {
         assert.equal(start.isError, false, JSON.stringify(start)); runs.push(start.body.validation_run_id);
       }
     }
+    trace("mixed_readiness_wait", { workspace_roots: entries });
     await until(() => existsSync(marker) && readFileSync(marker, "utf8").trim().split("\n").length === 3);
     auxiliary.push(...readFileSync(marker, "utf8").trim().split("\n").map(x => JSON.parse(x)));
+    for (const child of auxiliary) assert.equal(gone(child.pid), false, "each required task must be alive before COMMIT shutdown");
+    const snapshots = await runSnapshots();
+    trace("mixed_ready", { children: auxiliary, runs: snapshots });
+    for (const run of snapshots) {
+      assert.equal(run.state, "running"); assert.equal(run.phase, "validation");
+    }
   }
   return { root, repo, git, base, originalIndex, approvedTree, expectedEnv, session, connect, id, queuedId, trace, events, label, auxiliary, runs, config };
 }
