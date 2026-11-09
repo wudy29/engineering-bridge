@@ -1,6 +1,6 @@
 # Security design
 
-This document separates enforced behavior from operating assumptions for Engineering Bridge 1.6.0.
+This document separates enforced behavior from operating assumptions for Engineering Bridge 1.6.1 release candidate.
 
 ## Enforced in code
 
@@ -37,7 +37,7 @@ The three existing local state files retain their atomic write-temporary-then-re
 
 Async validation adds private `<config>.validation-runs/` containing versioned, atomic write/fsync/rename records (0600), plus sibling service-owner metadata/guard and `<config>.validation-worktrees/`. Their canonical locations must remain outside repositories, registered workspaces and approved onboarding roots. Each output tail is at most 64 KiB and records/storage have explicit capacity limits; no infinite stdout log is retained. Write/fsync/rename failure blocks further persistence and promptly aborts live execution, even while owned temporary-file cleanup is pending. Corrupt/incompatible records return safe errors and block unsafe admission.
 
-Startup converts leftover running records to INCOMPLETE without visiting stale worktrees. Retained ownership and `recovery_required` preserve evidence and block new admission for the affected patch; manually deleting files does not clear that fence. The owner PID is only a conservative same-host liveness veto, never authority to signal an old child or delete a worktree. Ambiguous ownership fails closed. Hard Bridge death can leave live children; explicit later controlled recovery is an operator responsibility. Async v1 is POSIX-only; unavailable async initialization does not disable the legacy tools.
+Startup converts leftover running records to INCOMPLETE without visiting stale worktrees. Retained ownership and `recovery_required` preserve evidence and block new admission for the affected patch; manually deleting files does not clear that fence. The owner PID is only a conservative same-host liveness veto, never authority to signal an old child or delete a worktree. Ambiguous ownership fails closed. Hard Bridge death can leave live children; explicit later controlled recovery is an operator responsibility. Async v1 is POSIX-only; unavailable async initialization does not disable other tools. Since v1.6.1, Windows legacy synchronous validation is independently fail-closed: a known proposal returns INCOMPLETE/unsupported_platform with no steps, before profile access, Git preflight or temporary resources. This is an execution restriction; the tool schema and original report shape remain available.
 
 These files are not a credential store or a complete audit log. Immutable validation profiles retain argv and result tails may contain local data; protect state and keep credentials out of profiles/output. Active executor task supervision state (tasks, threads, evidence, review outputs) remains process-local and disappears on restart.
 

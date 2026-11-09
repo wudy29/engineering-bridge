@@ -36,6 +36,8 @@ jobs:
       BRIDGE_EXPECTED_NODE: ${{ matrix.node }}
       BRIDGE_CI_DIAGNOSTIC: '0'
     steps:
+      - name: Preserve reviewed source bytes on every checkout
+        run: git config --global core.autocrlf false
       - name: Check out repository
         uses: actions/checkout@v4
         with:
@@ -43,7 +45,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: ${{ matrix.node == 22 && '22.23.4' || '24.22.2' }}
           cache: npm
       - name: Record platform and isolate Git configuration
         run: node scripts/integration/ci-environment.mjs
@@ -63,9 +65,9 @@ jobs:
       - name: Compare the complete raw MCP schema and input contracts
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: node scripts/integration/record-check.mjs schema node --test dist/tests/unit/mcp-stdio.test.js
-      - name: Verify real tgz installation, native bin wrapper, and full MCP contract
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: node scripts/integration/record-check.mjs pack node "$BRIDGE_NPM_CLI" run verify:package -- "$BRIDGE_CI_EVIDENCE"
+      - name: Produce the sole release tgz on Ubuntu and consume those exact bytes
+        if: ${{ !cancelled() && matrix.platform == 'linux' && steps.install.outcome == 'success' }}
+        run: BRIDGE_CANDIDATE_TREE="$(git rev-parse HEAD^{tree})" node scripts/integration/record-check.mjs pack node "$BRIDGE_NPM_CLI" run verify:package -- "$BRIDGE_CI_EVIDENCE"
       - name: Verify native Git transactions and platform lifecycle boundaries
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: node scripts/integration/record-check.mjs integration node --test --test-concurrency=1 scripts/integration/fixture-cleanup.test.mjs scripts/integration/git-transaction.test.mjs scripts/integration/commit-shutdown.test.mjs scripts/integration/windows-lifecycle.test.mjs
@@ -78,6 +80,81 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: integration-${{ matrix.os }}-node${{ matrix.node }}
+          path: ${{ steps.artifacts.outputs.upload_path }}
+          retention-days: 14
+          if-no-files-found: error
+
+  consume-release:
+    needs: ci
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            node: 24
+            platform: darwin
+          - os: windows-2025
+            node: 22
+            platform: win32
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      BRIDGE_CI_EVIDENCE: ${{ github.workspace }}/../bridge-release-evidence
+      BRIDGE_CI_UPLOAD: ${{ github.workspace }}/../bridge-release-upload
+      BRIDGE_PACKAGE_INPUT: ${{ runner.temp }}/ubuntu-original-package
+      BRIDGE_EXPECTED_PLATFORM: ${{ matrix.platform }}
+      BRIDGE_EXPECTED_NODE: ${{ matrix.node }}
+      BRIDGE_CI_DIAGNOSTIC: '0'
+    steps:
+      - name: Preserve reviewed source bytes on every checkout
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node == 22 && '22.23.4' || '24.22.2' }}
+          cache: npm
+      - name: Record platform and isolate Git configuration
+        run: node scripts/integration/ci-environment.mjs
+      - name: Install the reviewed test harness dependencies
+        run: node scripts/integration/record-check.mjs install node "$BRIDGE_NPM_CLI" ci --no-audit --no-fund
+      - name: Download this run's verified Ubuntu artifact without repacking
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-ubuntu-24.04-node22
+          path: ${{ env.BRIDGE_PACKAGE_INPUT }}
+      - name: Consume the original tgz through the native installed entry
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs/promises';
+          import { join, dirname, resolve } from 'node:path';
+          import { execFileSync } from 'node:child_process';
+          const input = process.env.BRIDGE_PACKAGE_INPUT;
+          const packages = (await fs.readdir(input, {recursive: true})).filter(p => p.endsWith('.tgz'));
+          assert.equal(packages.length, 1, 'exactly one producer package');
+          const tgz = join(input, packages[0]), manifest = join(dirname(tgz), 'package-manifest.json');
+          const receipt = JSON.parse(await fs.readFile(manifest, 'utf8'));
+          assert.equal(receipt.producer.platform, 'linux');
+          assert.equal(receipt.producer.commit, process.env.GITHUB_SHA);
+          assert.equal(receipt.producer.candidateTree, execFileSync('git', ['rev-parse', 'HEAD^{tree}'], {encoding:'utf8'}).trim());
+          process.env.npm_execpath = process.env.BRIDGE_NPM_CLI;
+          process.argv = [process.execPath, resolve('scripts/verify-package.mjs'), '--consume', tgz, manifest, process.env.BRIDGE_CI_EVIDENCE];
+          await import('./scripts/verify-package.mjs');
+          JS
+      - name: Check synthetic artifacts before upload
+        id: artifacts
+        if: ${{ always() }}
+        run: node scripts/integration/prepare-artifacts.mjs
+      - name: Preserve package consumption results including failures
+        if: ${{ always() && steps.artifacts.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-consumer-${{ matrix.os }}-node${{ matrix.node }}
           path: ${{ steps.artifacts.outputs.upload_path }}
           retention-days: 14
           if-no-files-found: error

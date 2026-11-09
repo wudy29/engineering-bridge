@@ -1,6 +1,6 @@
 # MCP tool reference
 
-This is the tool surface of Engineering Bridge 1.6.0. The local STDIO MCP server exposes fifteen tools. The two async validation tools are additive; the original thirteen contracts remain supported.
+This is the tool surface of Engineering Bridge 1.6.1 release candidate. The local STDIO MCP server exposes fifteen tools. All fifteen names and input schemas remain supported; Windows validation execution has the explicit restriction described below.
 
 ## Codex routing policy
 
@@ -106,7 +106,9 @@ Input: `patch_task_id`.
 
 Runs the retained proposal against the workspace validation profile in a temporary detached worktree after the normal controlled-patch preflight. Results are `PASS`, `FAIL`, or `INCOMPLETE`. Validation is optional and on-demand: it neither changes proposal state nor grants write permission, and the detached worktree protects the registered workspace from candidate build artifacts but is not a host-level sandbox. Unborn-base proposals return `INCOMPLETE` with `reason: "unsupported_unborn_base"`.
 
-This original API is synchronous: the RPC waits for the complete report and does not create an async run. Its input and report shape are unchanged. Use it for short validations or existing callers; use the following pair when execution might outlast a caller's request window.
+This original API is synchronous: the RPC waits for the complete report and does not create an async run. Its input and report shape are unchanged. On POSIX, use it for short validations or existing callers; use the following pair when execution might outlast a caller's request window.
+
+Since v1.6.1, Windows execution is deliberately disabled. Known proposals return `INCOMPLETE` with `reason: "unsupported_platform"`, `steps: []` and `cleanup: "success"` before profile access, Git preflight, temporary worktrees or processes. The cleanup field means no resource needed cleanup, not that a descendant tree was terminated. This reason takes precedence over missing profiles or unborn bases on Windows; unknown/invalid proposals retain the original error. Profile configuration and other tools remain available. The restriction closes a gap in proving descendant quiescence and is an explicit behavior change for old Windows callers.
 
 ## `start_controlled_patch_validation`
 
@@ -169,7 +171,7 @@ Unknown valid UUIDs return `isError: true` with `{error:{code:"VALIDATION_RUN_UN
 
 Use a trusted, canonical configuration directory outside every repository, registered workspace and approved `project_root`. Existing configurations inside those boundaries remain usable for the legacy tools, but async admission/query fail closed. No automatic migration or fallback storage exists; moving a deployment's config and sidecars is an explicit operator action.
 
-For configuration `<config>`, async uses private `<config>.validation-runs/`, sibling `<config>.validation-runs.owner.json` / `.owner-guard`, and `<config>.validation-worktrees/`. Records are atomic write/fsync/rename replacements with bounded 64 KiB per-step tails, a 4 MiB record cap and 256 MiB/4096-entry store limits. Capacity fails closed rather than evicting history. Snapshots retain configured argv; keep credentials out of profiles and output. Only one Bridge can own a store at a time; another instance returns safe async ownership errors while legacy tools remain available. Async v1 requires POSIX; Windows returns `VALIDATION_PLATFORM_UNSUPPORTED` without disabling the old tools.
+For configuration `<config>`, async uses private `<config>.validation-runs/`, sibling `<config>.validation-runs.owner.json` / `.owner-guard`, and `<config>.validation-worktrees/`. Records are atomic write/fsync/rename replacements with bounded 64 KiB per-step tails, a 4 MiB record cap and 256 MiB/4096-entry store limits. Capacity fails closed rather than evicting history. Snapshots retain configured argv; keep credentials out of profiles and output. Only one Bridge can own a store at a time; another instance returns safe async ownership errors while other tools remain available. Async v1 requires POSIX; Windows returns `VALIDATION_PLATFORM_UNSUPPORTED`. Windows synchronous validation separately returns the report described above; its tool name remains registered.
 
 Normal SIGTERM/SIGINT or service shutdown aborts supervised children/process groups within existing bounds and attempts bounded, ownership-verified cleanup. Caller EOF lets active work finish before natural process exit. A hard Bridge crash cannot guarantee child termination; startup never signals an old child, resumes, retries, attaches, visits an old worktree, or deletes a stale scene. Instead it durably converts leftover non-terminal records to `INCOMPLETE` (`supervisor_lost`) with the existing cleanup disposition and recovery fence. Uncertain persistence/ownership fails closed. The fence is not cleared by manually deleting paths; a later explicit controlled recovery is required and no cleanup tool is exposed in v1.6.0.
 

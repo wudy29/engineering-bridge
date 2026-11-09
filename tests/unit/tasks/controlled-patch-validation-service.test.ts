@@ -234,7 +234,10 @@ function makeHarness(options: {
     options.nowMs,
     tempParent,
     options.removeParent,
-    options.cleanupDeadlineTimer
+    options.cleanupDeadlineTimer,
+    // These recording ports model the supported POSIX execution path on every
+    // test host. Native Windows refusal is tested separately without fake ports.
+    "linux"
   );
   return { service, patches, store, runner, tempParent };
 }
@@ -328,7 +331,8 @@ type RealValidationHarness = Awaited<
 >;
 
 function assertRealValidationPreserved(
-  harness: RealValidationHarness
+  harness: RealValidationHarness,
+  temporaryParentCount = 1
 ): void {
   assert.equal(readFileSync(join(harness.root, "note.txt"), "utf8"), "before\n");
   assert.equal(existsSync(join(harness.root, "validation-artifact.txt")), false);
@@ -342,8 +346,8 @@ function assertRealValidationPreserved(
     readFileSync(harness.stateFilePath, "utf8"),
     harness.retainedStateBefore
   );
-  assert.equal(harness.tempParent.created.length, 1);
-  assert.equal(existsSync(harness.tempParent.created[0]!), false);
+  assert.equal(harness.tempParent.created.length, temporaryParentCount);
+  for (const parent of harness.tempParent.created) assert.equal(existsSync(parent), false);
   const worktrees = git(harness.root, "worktree", "list", "--porcelain");
   assert.equal(worktrees.match(/^worktree /gm)?.length ?? 0, 1);
 }
@@ -889,6 +893,14 @@ test("real Git validation uses a detached temporary worktree, isolates candidate
 
   const report = await harness.service.validate(harness.patchTaskId);
 
+  if (process.platform === "win32") {
+    assert.equal(report.status, "INCOMPLETE");
+    assert.equal(report.reason, "unsupported_platform");
+    assert.deepEqual(report.steps, []);
+    assert.deepEqual(harness.tempParent.created, []);
+    assertRealValidationPreserved(harness, 0);
+    return;
+  }
   assert.equal(report.status, "PASS");
   assert.equal(report.cleanup, "success");
   assert.deepEqual(
@@ -909,6 +921,14 @@ test("real Git validation removes the temporary worktree after FAIL without chan
 
   const report = await harness.service.validate(harness.patchTaskId);
 
+  if (process.platform === "win32") {
+    assert.equal(report.status, "INCOMPLETE");
+    assert.equal(report.reason, "unsupported_platform");
+    assert.deepEqual(report.steps, []);
+    assert.deepEqual(harness.tempParent.created, []);
+    assertRealValidationPreserved(harness, 0);
+    return;
+  }
   assert.equal(report.status, "FAIL");
   assert.equal(report.cleanup, "success");
   assert.equal(report.steps[0]?.status, "FAIL");
@@ -944,6 +964,15 @@ test("real Git validation removes the temporary worktree after timeout/INCOMPLET
 
   const report = await harness.service.validate(harness.patchTaskId);
 
+  if (process.platform === "win32") {
+    assert.equal(report.status, "INCOMPLETE");
+    assert.equal(report.reason, "unsupported_platform");
+    assert.deepEqual(report.steps, []);
+    assert.deepEqual(harness.tempParent.created, []);
+    assert.deepEqual(runner.invocations, []);
+    assertRealValidationPreserved(harness, 0);
+    return;
+  }
   assert.equal(report.status, "INCOMPLETE");
   assert.equal(report.cleanup, "success");
   assert.equal(report.steps[0]?.status, "INCOMPLETE");

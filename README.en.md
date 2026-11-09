@@ -2,11 +2,13 @@
 
 **Connect Chat directly to local Codex or DSH: no more shuttling prompts and results—Chat dispatches, supervises, and accepts the executor's work.**
 
-[![v1.6.0](https://img.shields.io/badge/version-v1.6.0-blue)](RELEASE_NOTES.md)
+[![v1.6.1](https://img.shields.io/badge/version-v1.6.1-blue)](RELEASE_NOTES.md)
 [![CI](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[简体中文](README.md) · **v1.6.0 · V1 · Local · Continuously maintainer-tested on macOS.** The version does not imply a tag, GitHub Release, or npm publication; these remain separate actions. Windows has Codex and DSH npm CLI launch smoke coverage. Async validation requires POSIX process-group supervision and returns `VALIDATION_PLATFORM_UNSUPPORTED` on Windows; the old synchronous and other tools keep their existing behavior.
+[简体中文](README.md) · **v1.6.1 release candidate · V1 · Local.** The version does not imply a tag, GitHub Release, or npm publication. Windows synchronous validation is now explicitly disabled: for a known proposal, `validate_controlled_patch` returns `INCOMPLETE` / `unsupported_platform` before temporary worktree creation, Git validation or profile execution. Async validation continues to return `VALIDATION_PLATFORM_UNSUPPORTED` on Windows. Tool names and input schemas remain present; this restriction does not change other Windows tools or POSIX validation.
+
+The repair base `19e32a5` passed [ordinary native CI](https://github.com/wudy29/engineering-bridge/actions/runs/42362379348) on Ubuntu/Node 22, macOS/Node 24 and Windows/Node 22. The new v1.6.1 restriction and final single distribution package still require acceptance for this version; base-commit or old-package results do not certify them. Historical Windows CLI launch smoke is not comprehensive Windows lifecycle certification.
 
 ## Before / now
 
@@ -117,7 +119,7 @@ npm ci
 npm run build
 ```
 
-The current v1.6.0 version has no one-click installer.
+The current v1.6.1 candidate has no one-click installer.
 
 ### 3. Register a workspace
 
@@ -164,7 +166,7 @@ If you use DSH and `DEEPSEEK_API_KEY` is set in the environment Bridge runs unde
 
 **Codex routing policy (optional):** when `ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY` is unset, it defaults to `inherit`, preserving v1.4.x compatibility: Codex may use its existing configuration when `model` or `reasoning_effort` is omitted. Deployments that must fail closed can set it exactly to `explicit`; then every Codex call through `run_task`, `generate_controlled_patch`, or `refine_controlled_patch` must provide both non-blank `model` and `reasoning_effort`, or Bridge returns `CODEX_ROUTING_REQUIRED` before starting a Codex process. After the gate, the existing `model/list` and reasoning validation still run, and the selections are sent through `turn/start`. Invalid values—including an empty string, case variants, or aliases—fail Bridge startup rather than falling back to `inherit`; DSH is not constrained by this policy.
 
-Reconnect the integration and refresh the connector catalog to see these fifteen tools. Existing callers can keep the synchronous API:
+Reconnect the integration and refresh the connector catalog to see these fifteen tools. Existing POSIX callers can keep synchronous validation execution; Windows keeps the same tool with an explicit refusal report:
 
 - `run_task`
 - `task_result`
@@ -242,7 +244,9 @@ Configure one trusted fixed profile per workspace through `configure_validation_
 {"workspace_id":"my-project","confirmation":"CONFIGURE","profile":{"preparation":[],"validation":[{"name":"test","argv":["npm","test"]}]}}
 ```
 
-Omitted timeouts default to 600 seconds per step and 1200 seconds total. A configured step may set `timeout_seconds`; validation callers cannot supply commands, paths or timeouts. The original `validate_controlled_patch({patch_task_id})` still waits for its original report and creates no async run. Use it for short checks or old callers.
+Omitted timeouts default to 600 seconds per step and 1200 seconds total. A configured step may set `timeout_seconds`; validation callers cannot supply commands, paths or timeouts. On POSIX, `validate_controlled_patch({patch_task_id})` still waits for its original report and creates no async run. Use it for short checks or old callers.
+
+Windows can still configure profiles, but synchronous validation of a known proposal now returns the original report shape with `status: "INCOMPLETE"`, `reason: "unsupported_platform"`, `steps: []`, and `cleanup: "success"`. No validation resource was created, so cleanup is a no-op; it does not prove descendant termination. Unknown or invalid proposals retain their original errors. This is an explicit v1.6.1 functionality restriction. Trusted commands can leave descendants, and a direct parent's exit or closed pipes cannot establish quiescence. Do not treat this non-PASS report as completed validation.
 
 For long validation, call `start_controlled_patch_validation`:
 

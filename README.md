@@ -2,11 +2,13 @@
 
 **打通 Chat 与本地 Codex 与 Deepseek harness：不再搬提示词，Chat 直接调度、监督并验收 Codex 与 Deepseek harness。**
 
-[![v1.6.0](https://img.shields.io/badge/version-v1.6.0-blue)](RELEASE_NOTES.md)
+[![v1.6.1](https://img.shields.io/badge/version-v1.6.1-blue)](RELEASE_NOTES.md)
 [![CI](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/wudy29/engineering-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[English](README.en.md) · **v1.6.0 · V1 · 本地运行 · macOS 由维护者持续实测。** 版本号不代表已创建 tag、GitHub Release 或 npm 发布，这些仍是独立操作。Windows 侧已有 Codex 与 DSH npm CLI 启动路径 smoke 验证；本版 async validation 依赖 POSIX process-group supervision，Windows 返回 `VALIDATION_PLATFORM_UNSUPPORTED`，旧同步与其他工具保持既有行为。
+[English](README.en.md) · **v1.6.1 发布候选 · V1 · 本地运行。** 版本号不代表已创建 tag、GitHub Release 或 npm 发布，这些仍是独立操作。Windows 的旧同步验证现已明确禁止执行：已知提案的 `validate_controlled_patch` 返回 `INCOMPLETE` / `unsupported_platform`，不创建临时 worktree、不运行 Git 验证或 profile 命令。Windows async validation 继续返回 `VALIDATION_PLATFORM_UNSUPPORTED`。工具名称和输入 Schema 保留，Windows 其他工具及 POSIX 验证行为不因这一限制改变。
+
+修复基底 `19e32a5` 已通过 Ubuntu/Node 22、macOS/Node 24、Windows/Node 22 的[普通原生 CI](https://github.com/wudy29/engineering-bridge/actions/runs/42362379348)。v1.6.1 新增的平台限制和最终统一发行包仍须通过本版本验收，不能沿用基底或旧包的结果。历史 Windows CLI 启动 smoke 不等于完整 Windows 生命周期认证。
 
 ## 以前 / 现在
 
@@ -91,7 +93,7 @@ Chat 保留需求背景、前面的设计取舍和已经发生过的失败；Cod
 | 写入前生成完整 Git 补丁；managed 工作区经精确 `AUTHORIZE` 后受控写入 | 仅有 loopback 只读看板；没有账号系统、调用方认证或远程 MCP 传输 | DSH 原生 headless session resume |
 | 仅在精确 `APPLY` 后应用，并重新校验 base HEAD 与仓库状态；支持 unborn 仓库新增 100644 文本文件 | 不恢复 task/thread/evidence 监督状态；观测快照不是审计日志，没有资源配额 | 持久 task/audit 历史 |
 | 对已 `APPLY` 的受控补丁仅在精确 `COMMIT` 后创建一个 Git commit；Bridge 绝不 push | 不会自动发布或创建 Release | — |
-| 固定校验 profile（精确 `CONFIGURE`）；保留同步校验，新增 async start/query 与 retained PASS/FAIL/INCOMPLETE | 校验不是主机级沙箱；重启不续跑，不自动清理遗留现场 | — |
+| 固定校验 profile（精确 `CONFIGURE`）；POSIX 保留同步校验与 async start/query 与 retained PASS/FAIL/INCOMPLETE | 校验不是主机级沙箱；重启不续跑，不自动清理遗留现场 | — |
 | 受控补丁提案/应用历史、managed 工作区目录、validation profile 与独立 validation run 跨重启保留 | validation run 不是执行器会话历史 | 谨慎探索多 agent 编排 |
 | 通过 STDIO 提供十五个本地 MCP 工具 | — | — |
 
@@ -117,7 +119,7 @@ npm ci
 npm run build
 ```
 
-当前 v1.6.0 没有一键安装器。
+当前 v1.6.1 候选没有一键安装器。
 
 ### 3. 登记工作区
 
@@ -164,7 +166,7 @@ npm run build
 
 **Codex routing policy（可选）：** `ENGINEERING_BRIDGE_CODEX_ROUTING_POLICY` 未设置时默认为 `inherit`，保持 v1.4.x 的兼容行为：`model` 或 `reasoning_effort` 缺省时允许 Codex 使用其既有配置。需要 fail closed 的部署可将它严格设置为 `explicit`；此时 `run_task`、`generate_controlled_patch` 和 `refine_controlled_patch` 的每次 Codex 调用都必须同时提供非空 `model` 与 `reasoning_effort`，否则在启动 Codex 进程前返回 `CODEX_ROUTING_REQUIRED`。通过 gate 后仍会执行现有 `model/list` / reasoning validation，并把选择传入 `turn/start`。非法值（包括空字符串、大小写变体或其他别名）会使 Bridge 启动失败，不会回退到 `inherit`；DSH 行为不受此策略约束。
 
-重新连接集成并刷新 connector catalog，确认能看到以下十五个工具。旧 caller 可继续使用原同步 API：
+重新连接集成并刷新 connector catalog，确认能看到以下十五个工具。POSIX 旧 caller 可继续使用原同步执行 API；Windows 仅保留明确拒绝执行的同名接口：
 
 - `run_task`
 - `task_result`
@@ -236,7 +238,9 @@ npm run mcp:stdio -- /absolute/path/to/workspaces.json
 
 ### 7. 按需校验受控补丁（可选）
 
-校验是可选、按需的：显式调用同步 `validate_controlled_patch` 或 async `start_controlled_patch_validation` 才会执行校验。`run_task`、generate/refine/submit 与 APPLY 不自动校验；校验不改变提案/任务状态，`PASS` 也不授权 APPLY。没有自动 APPLY、COMMIT、push 或重试。
+校验是可选、按需的，执行仅支持 POSIX：显式调用同步 `validate_controlled_patch` 或 async `start_controlled_patch_validation` 才会执行校验。`run_task`、generate/refine/submit 与 APPLY 不自动校验；校验不改变提案/任务状态，`PASS` 也不授权 APPLY。没有自动 APPLY、COMMIT、push 或重试。
+
+Windows 仍可配置 profile，但旧同步验证对已知提案优先返回原 report 结构：`status: "INCOMPLETE"`、`reason: "unsupported_platform"`、`steps: []`、`cleanup: "success"`。这里的 cleanup 表示未创建验证资源，没有需要清理的现场；不是已证明后代退出。未知/无效提案仍按原错误合同拒绝。这是 v1.6.1 明确的功能限制，不能把非 PASS 当作已完成验证。可信命令也可能留下后代，直接父进程退出或管道关闭不足以证明静止。
 
 每个已登记工作区最多一个固定的校验 profile（v1 只支持完整替换）。调用 `configure_validation_profile` 时，`confirmation` 必须精确等于 `CONFIGURE`（复用 `AUTHORIZE` 会被拒绝）。profile 由 Bridge 的本地 `<config>.validation-profiles.json` sidecar 管理；命令只通过显式 profile 配置进入，校验调用本身不能携带命令、参数或超时。命令是非空 argv 数组，绝不经过 shell，例如：
 
@@ -253,7 +257,7 @@ npm run mcp:stdio -- /absolute/path/to/workspaces.json
 }
 ```
 
-示例命令仅供说明，Bridge 不会硬编码任何项目命令。省略超时设置时，默认每步 600 秒、总预算 1200 秒；每个步骤也可以固定自己的 `timeout_seconds`。旧同步 `validate_controlled_patch` 仍只接受 `patch_task_id`，等待完整报告，适合短校验或旧 caller；它不创建 retained async run。
+示例命令仅供说明，Bridge 不会硬编码任何项目命令。省略超时设置时，默认每步 600 秒、总预算 1200 秒；每个步骤也可以固定自己的 `timeout_seconds`。POSIX 上旧同步 `validate_controlled_patch` 仍只接受 `patch_task_id`，等待完整报告，适合短校验或旧 caller；它不创建 retained async run。
 
 长校验推荐两个独立短 RPC：
 

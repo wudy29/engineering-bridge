@@ -104,7 +104,8 @@ export class ControlledPatchValidationService {
     private readonly removeParent: (temporaryParent: string) => Promise<void> =
       removeTempParent,
     private readonly cleanupDeadlineTimer: CleanupDeadlineTimer =
-      systemCleanupDeadlineTimer
+      systemCleanupDeadlineTimer,
+    private readonly platform: NodeJS.Platform = process.platform
   ) {}
 
   configure(
@@ -149,6 +150,11 @@ export class ControlledPatchValidationService {
   ): Promise<ControlledPatchValidationReport> {
     const startedAt = milliseconds(this.nowMs());
     const proposal = this.controlledPatches.validationProposal(patchTaskId);
+    if (this.platform === "win32") {
+      // A direct child's exit does not prove Windows descendants are quiescent.
+      // Refuse before profile access, Git preflight or temporary worktree creation.
+      return this.report(startedAt, "INCOMPLETE", patchTaskId, proposal, [], "success", "unsupported_platform");
+    }
     const profile = await this.profiles.get(proposal.workspaceId);
 
     if (profile === undefined) {

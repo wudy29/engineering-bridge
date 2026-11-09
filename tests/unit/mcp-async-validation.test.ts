@@ -5,6 +5,7 @@ import { join } from "node:path";
 import nodeTest from "node:test";
 import { mcpValidationFixture, until } from "../helpers/mcp-validation-fixture.js";
 import type { ValidationRun } from "../../src/tasks/validation-run.js";
+import { VERSION } from "../../src/version.js";
 
 const test = process.platform === "win32" ? nodeTest.skip : nodeTest;
 const START = "start_controlled_patch_validation", GET = "get_controlled_patch_validation";
@@ -21,7 +22,7 @@ function gone(pid: number): boolean {
 
 test("real catalog exposes exactly 15 tools and strict async inputs without changing sync schema", async t => {
   const f = await mcpValidationFixture(t);
-  assert.equal(f.connected.client.getServerVersion()?.version, "1.6.0");
+  assert.equal(f.connected.client.getServerVersion()?.version, VERSION);
   const tools = new Map((await f.connected.client.listTools()).tools.map(tool => [tool.name, tool]));
   assert.deepEqual([...tools.keys()].sort(), ["apply_controlled_patch", "authorize_workspace_write", "bind_project", "commit_controlled_patch", "configure_validation_profile", "control_task", "create_project", "generate_controlled_patch", GET, "refine_controlled_patch", "run_task", START, "submit_controlled_patch", "task_result", "validate_controlled_patch"].sort());
   for (const [name, properties] of [[START, ["idempotency_key", "patch_task_id"]], [GET, ["validation_run_id"]], ["validate_controlled_patch", ["patch_task_id"]]] as const) {

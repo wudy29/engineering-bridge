@@ -169,7 +169,8 @@ test("MCP and Codex client metadata use the shared package VERSION, and stdio re
       rawTools.push(...page.tools); rawCursor = page.nextCursor;
     } while (rawCursor !== undefined);
     // Entire objects include defaults, annotations, execution, and absent fields.
-    assert.deepEqual({ server: client.getServerVersion(), tools: rawTools.sort((a, b) => a.name.localeCompare(b.name)) }, baseline);
+    assert.deepEqual({ server: client.getServerVersion(), tools: rawTools.sort((a, b) => a.name.localeCompare(b.name)) },
+      { ...baseline, server: { ...baseline.server, version: VERSION } });
     assert.deepEqual(listed.tools.map(({ name }) => name).sort(), [
       "apply_controlled_patch",
       "authorize_workspace_write",
@@ -1039,7 +1040,7 @@ index 90be1f3..3b18e51 100644
     });
     assert.equal(missingProfile.isError, false);
     assert.equal(missingProfile.body.status, "INCOMPLETE");
-    assert.equal(missingProfile.body.reason, "validation_profile_missing");
+    assert.equal(missingProfile.body.reason, process.platform === "win32" ? "unsupported_platform" : "validation_profile_missing");
 
     for (const args of [
       { patch_task_id: patchTaskId, command: "npm test" },
