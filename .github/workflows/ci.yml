@@ -104,7 +104,7 @@ jobs:
     env:
       BRIDGE_CI_EVIDENCE: ${{ github.workspace }}/../bridge-release-evidence
       BRIDGE_CI_UPLOAD: ${{ github.workspace }}/../bridge-release-upload
-      BRIDGE_PACKAGE_INPUT: ${{ runner.temp }}/ubuntu-original-package
+      BRIDGE_PACKAGE_INPUT: ${{ github.workspace }}/../bridge-ubuntu-original-package
       BRIDGE_EXPECTED_PLATFORM: ${{ matrix.platform }}
       BRIDGE_EXPECTED_NODE: ${{ matrix.node }}
       BRIDGE_CI_DIAGNOSTIC: '0'
