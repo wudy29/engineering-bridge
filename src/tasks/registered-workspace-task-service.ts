@@ -8,6 +8,8 @@ import type { Executor, ExecutorDiagnostics, ExecutorProgressDiagnostics, Execut
 import type { ObservationWrite } from "../observability/observation-publisher.js";
 import { RegisteredWorkspaceRegistry } from "../workspaces/registered-workspace-registry.js";
 
+import { resolveWorkingDirectory } from "../workspaces/workspace-paths.js";
+
 export type ExecutorName = "codex" | "dsh";
 
 export interface RegisteredWorkspaceTaskRequest {
@@ -17,6 +19,7 @@ export interface RegisteredWorkspaceTaskRequest {
   readonly model?: string;
   readonly reasoning_effort?: string;
   readonly dashboard_title?: string;
+  readonly working_subpath?: string;
 }
 
 type NormalizedRegisteredWorkspaceTaskRequest = RegisteredWorkspaceTaskRequest & { readonly executor: ExecutorName };
@@ -429,7 +432,10 @@ export class RegisteredWorkspaceTaskService {
     try {
       if (this.closing) throw new CoreError("TASK_INTERRUPTED");
       const registration = this.registry.resolveExecution(record.request.workspace_id);
-      const executor = this.executorFactory(record.request.executor, registration.root);
+      const cwd = record.request.working_subpath === undefined ? registration.root
+        : await resolveWorkingDirectory(registration.root, record.request.working_subpath);
+      if (this.closing) throw new CoreError("TASK_INTERRUPTED");
+      const executor = this.executorFactory(record.request.executor, cwd);
       record.executor = executor;
       const result = await executor.execute({ taskId, instruction: record.request.instruction,
         sandbox: "read-only",
@@ -484,7 +490,10 @@ export class RegisteredWorkspaceTaskService {
     this.tasks.set(taskId, { state: "running", executor: request.executor });
     try {
       const workspaceRoot = this.registry.resolve(request.workspace_id);
-      const executor = this.executorFactory(request.executor, workspaceRoot);
+      const cwd = request.working_subpath === undefined ? workspaceRoot
+        : await resolveWorkingDirectory(workspaceRoot, request.working_subpath);
+      if (this.closing) throw new CoreError("TASK_INTERRUPTED");
+      const executor = this.executorFactory(request.executor, cwd);
       // Temporarily retain the active executor on the running record so
       // control_task can reach the existing interrupt/steer seam; the terminal
       // record below replaces it once the run settles.

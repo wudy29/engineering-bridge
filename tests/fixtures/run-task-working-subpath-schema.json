@@ -1,0 +1,5 @@
+{
+  "type": "string",
+  "minLength": 1,
+  "description": "Optional existing directory relative to the workspace root, using forward slashes. Selects cwd only; does not grant disk access or restrict controlled patches."
+}

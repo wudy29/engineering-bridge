@@ -161,7 +161,9 @@ test("bind reuses an existing manual workspace with its real allow_write and sou
     workspace_id: "manual",
     root: realpathSync(project),
     allow_write: true,
-    source: "manual"
+    source: "manual",
+    requested_path: project,
+    working_subpath: "."
   });
   assert.deepEqual(catalog.entries(), []);
 });
