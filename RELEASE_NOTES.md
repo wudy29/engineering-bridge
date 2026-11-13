@@ -1,5 +1,33 @@
 # Release notes
 
+## Engineering Bridge v1.6.1 — release candidate / 发布候选
+
+This patch candidate preserves the 15-tool wire definitions and explicit write gates. It is not a tag, npm publication, merge or deployment. The initialization version is 1.6.1; tool names, descriptions, input schemas, defaults, annotations and execution fields remain equal to the complete v1.6.0 tool snapshot.
+
+### 修复与安全边界
+
+- **F01 / F02：受控 Git 写入。** 按字面身份验证路径，保留特殊文件名与原文件类型限制；从已批准内容构建提交 tree，使用 expected-old ref 事务发布并保护共享 index。最后并发窗口不能把外部写入提交为已批准补丁。不重写历史、不接纳任意新 HEAD、不自动删除未知锁。
+- **F03–F05：进程与停机。** 收束 DSH exit/close 竞态及所属 POSIX 后代；POSIX 旧同步验证在监督进程未静止时不返回 PASS 或不安全清理。OS shutdown 同步关闭准入、有界排空普通任务与验证。COMMIT publisher、引用发布结果及共享 index 收尾纳入同一关闭过程，结果不确定时保留恢复阻断。EOF/普通请求取消不升级为全局停机。
+- **F06：长超时。** 用 BigInt 与单调期限分段调度，单段不超过 Node 定时器上限；合法正整数域、默认值、取消和清理语义保留，不静默截断或立即误超时。
+- **M01：验收门。** 保留完整 raw 15-tool 快照、既有 Git 安全/生命周期回归及真实安装检查。统一发行验收由 Ubuntu 锁定构建产出一个 tgz，再消费同一原字节；每个平台自产包不能代替这一门。
+
+**Windows 功能限制是本版本的明确行为变更。** 对已知提案，旧同步 `validate_controlled_patch` 现在返回 `INCOMPLETE`、`reason: "unsupported_platform"`、`steps: []` 和 `cleanup: "success"`，不会读取 profile、执行 Git preflight、创建临时工作树或启动验证命令。cleanup 表示没有创建资源，并非已证明后代静止；此 reason 在 Windows 优先于 profile 缺失和 unborn 原因。未知/无效提案仍保持原错误。Windows async 继续返回 `VALIDATION_PLATFORM_UNSUPPORTED`。配置 profile、其他工具、POSIX 同步及异步合同不因该限制改变。旧调用者应明确处理非 PASS，不能继续依赖 Windows 验证执行。
+
+### Fixes and compatibility
+
+- F01/F02 verify literal Git path identity and commit exactly the approved tree through an expected-old ref transaction, preserving shared-index recovery and external modifications. There is no unsafe fallback, history rewrite or automatic unknown-lock removal.
+- F03–F05 bound DSH exit/close handling and owned POSIX descendants, require quiescence for supported synchronous validation, and close admission/drain active work on OS shutdown. COMMIT publishing, ref disposition and index completion participate in shutdown. Ambiguous outcomes retain recovery barriers. Caller EOF or ordinary request cancellation is not global shutdown.
+- F06 uses monotonic BigInt deadlines with bounded timer chunks, preserving the positive integer input domain, defaults, cancellation and cleanup. M01 retains full raw tool-schema and real single-package installation gates.
+- **Windows synchronous validation execution is deliberately disabled.** A known proposal returns the original report shape with `INCOMPLETE` / `unsupported_platform`, empty steps and no-op successful cleanup before any profile access, validation Git command or temporary resource. This reason takes precedence over missing profiles/unborn bases on Windows. Unknown/invalid proposal errors remain unchanged. Async Windows validation remains unsupported. Profile configuration, other Windows tools and POSIX validation remain available under their existing contracts. Old callers must handle this non-PASS result; this release does not preserve the old Windows execution capability.
+
+### Evidence and limits / 验收与限制
+
+The predecessor `19e32a50f8e11e53a68a4956970432e7559deb98` passed [ordinary native CI 42362379348](https://github.com/wudy29/engineering-bridge/actions/runs/42362379348) on Ubuntu/Node22, macOS/Node24 and Windows/Node22. That evidence belongs to the predecessor. Acceptance of this candidate must identify its new tree, one v1.6.1 tarball SHA, installed bytes, native entry points including Windows `.cmd`, raw tool schema, Windows refusal and supported POSIX validation. A green job does not override documented platform skips. No real CLI account or production deployment acceptance is implied.
+
+本轮沿用基线锁定的依赖图，仅调整根版本；实际 lock 包含 `@modelcontextprotocol/sdk` 1.32.2、`zod` 4.6.7。下方 v1.6.0 的 1.31.0 升级叙述是早期历史说明，不是当前 lock 的解析结果。The reviewed dependency graph is unchanged; only root versions change. Consumer installation tests use that lock graph, while ordinary unpinned npm consumers still resolve the declared ranges.
+
+历史异步 INCOMPLETE、fake 额外 TERM、限时与 Mac 共享挂载 UNKNOWN 继续保留，没有以本轮绿灯追溯定因。Historical async INCOMPLETE, fake extra TERM, timing and Mac shared-mount UNKNOWN records remain unresolved. OS termination refusal, hard SIGKILL/power loss and existing COMMIT recovery boundaries remain; no automatic restart recovery, retry, APPLY, COMMIT, push or deployment is added.
+
 ## Engineering Bridge v1.6.0
 
 Add a Chinese read-only dashboard and best-effort task observations, retain the reviewed Codex compatibility and pre-interrupt diagnostic fixes, and refresh the dependency lockfile. This version identifies a release candidate; it does not imply a commit, tag, GitHub Release, npm publication or deployment.

@@ -198,6 +198,7 @@ export class DshExecutor implements Executor {
       let tail = Buffer.alloc(0);
       let settled = false;
       let directExited = false;
+      let exitHandled = false;
       let deadlineTimer: NodeJS.Timeout | undefined;
       let killTimer: NodeJS.Timeout | undefined;
       let exitImmediate: NodeJS.Immediate | undefined;
@@ -221,7 +222,7 @@ export class DshExecutor implements Executor {
       };
       const stop = (result: ExecutorResult): void => {
         if (settled) return;
-        signalExecution(child, this.platform, "SIGKILL");
+        signalExecution(child, this.platform, "SIGKILL", !directExited);
         finish(result);
       };
       const forceKill = (): void => {
@@ -231,7 +232,7 @@ export class DshExecutor implements Executor {
       const beginTermination = (result: ExecutorResult): void => {
         if (settled || terminationResult !== undefined) return;
         terminationResult = result;
-        signalExecution(child, this.platform, "SIGTERM");
+        signalExecution(child, this.platform, "SIGTERM", !directExited);
         killTimer = setTimeout(forceKill, this.timing.killGraceMs);
       };
       active = {
@@ -269,41 +270,28 @@ export class DshExecutor implements Executor {
         chunks.push(chunk);
       });
       const finishFromExit = (code: number | null): void => {
-        if (settled) return;
+        if (settled || exitHandled) return;
+        exitHandled = true;
         directExited = true;
-        if (terminationResult !== undefined) {
-          // If the direct child exited but its process group still exists, a
-          // descendant is alive. Keep the existing TERM->KILL bound; otherwise
-          // the requested termination is already complete.
-          if (signalProcessGroup(child, this.platform, "SIGTERM")) {
-            if (killTimer === undefined) killTimer = setTimeout(forceKill, this.timing.killGraceMs);
-          } else {
-            finish(currentTerminationResult());
-          }
+        terminationResult ??= code === 0
+          ? this.completedResult(chunks, bytes, truncated, tail)
+          : failure("DSH_EXECUTION_FAILED");
+        // Both close and delayed exit must reap the owned detached group,
+        // including descendants which never inherited the stdio pipes.
+        if (signalProcessGroup(child, this.platform, "SIGTERM")) {
+          if (killTimer === undefined) killTimer = setTimeout(forceKill, this.timing.killGraceMs);
           return;
         }
-        if (code !== 0) {
-          finish(failure("DSH_EXECUTION_FAILED"));
-          return;
-        }
-        finish(this.completedResult(chunks, bytes, truncated, tail));
+        finish(currentTerminationResult());
       };
       child.on("exit", (code) => {
+        if (settled || directExited) return;
         // `close` waits for every inherited stdio handle. A descendant can keep
         // those pipes open after the direct DSH child has exited, so let data
         // already queued for this turn drain once and then settle from `exit`.
         directExited = true;
         exitImmediate = setImmediate(() => {
           exitImmediate = undefined;
-          if (signalProcessGroup(child, this.platform, "SIGTERM")) {
-            if (terminationResult === undefined) {
-              terminationResult = code === 0
-                ? this.completedResult(chunks, bytes, truncated, tail)
-                : failure("DSH_EXECUTION_FAILED");
-            }
-            if (killTimer === undefined) killTimer = setTimeout(forceKill, this.timing.killGraceMs);
-            return;
-          }
           finishFromExit(code);
         });
       });

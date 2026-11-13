@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import type { BigIntStats } from "node:fs";
@@ -7,15 +8,19 @@ import { isAbsolute, posix, resolve } from "node:path";
 
 import { CoreError } from "../core/errors.js";
 import { serializeError } from "../core/errors.js";
+import { signalExecution } from "../executors/executor.js";
 import {
   runBoundedGit,
+  DEFAULT_GIT_PROCESS_TIMING,
   type GitProcessOptions,
   type GitProcessResult,
+  type GitProcessSignaler,
   type GitStarter
 } from "../executors/bounded-git-process.js";
 import { isId } from "../core/ids.js";
 import type { Id } from "../core/ids.js";
 import { RegisteredWorkspaceRegistry } from "../workspaces/registered-workspace-registry.js";
+import { withLockedCommitIndex, type ControlledCommitIndex } from "./controlled-commit-index.js";
 import {
   RegisteredWorkspaceTaskService,
   type ControlledPatchTaskRestore,
@@ -57,6 +62,7 @@ type Proposal = {
 
 type RetainedProposal = Proposal & { taskId: Id; output: string };
 type RetainedState = { proposals: RetainedProposal[]; appliedTaskIds: Id[] };
+type ActiveWrite = { cancel: AbortController | undefined; active: boolean };
 
 const CONTROLLED_PATCH_STATE_VERSION = 1;
 const MAX_APPLIED_PROPOSAL_HISTORY = 100;
@@ -94,6 +100,14 @@ ${changeRequest}`;
 export class ControlledPatchService {
   private readonly proposals = new Map<Id, Proposal>();
   private readonly applyQueues = new Map<string, Promise<void>>();
+  private readonly activeWrites = new Set<ActiveWrite>();
+  private readonly writeContext = new AsyncLocalStorage<ActiveWrite>();
+  private readonly gitProcesses = new Map<ChildProcessWithoutNullStreams, {
+    closed: boolean; exited: boolean; detached: boolean; groupGone: boolean; owner: ActiveWrite | undefined; termAt?: number; killed?: boolean;
+  }>();
+  private closing = false;
+  private shutdownPromise: Promise<void> | undefined;
+  private shutdownWriteFailed = false;
   private appliedProposalTaskIds: Id[] = [];
   private persistenceQueue: Promise<void> = Promise.resolve();
   private writeSequence = 0;
@@ -105,6 +119,97 @@ export class ControlledPatchService {
     private readonly stateFilePath?: string,
     private readonly gitProcessOptions: GitProcessOptions = {}
   ) {}
+
+  // Keep process ownership beyond a command rejection/timeout. A rejected
+  // promise (or a closed parent's stdio) is not proof that its group is gone.
+  private readonly startGit: GitStarter = (executable, args, options) => {
+    this.gitOptions(); // Also fences late continuations holding a private index.
+    const child = this.startProcess(executable, args, options);
+    const state = { closed: false, exited: false, detached: options.detached === true,
+      groupGone: options.detached !== true || child.pid === undefined,
+      owner: this.writeContext.getStore() };
+    this.gitProcesses.set(child, state);
+    child.once("exit", () => { state.exited = true; });
+    child.once("close", () => { state.exited = state.closed = true; this.reapGit(); });
+    return child;
+  };
+
+  private readonly signalGit: GitProcessSignaler = (child, platform, signal, directChildAlive) => {
+    const state = this.gitProcesses.get(child);
+    // A runner's delayed KILL can outlive close + an ESRCH observation. Never
+    // signal a numeric process group after ownership has been released.
+    if (state === undefined) return;
+    if (state.detached && state.groupGone) {
+      if (!state.exited && directChildAlive !== false) child.kill(signal);
+    } else {
+      (this.gitProcessOptions.signaler ?? signalExecution)(child, platform, signal,
+        state.exited ? false : directChildAlive);
+    }
+  };
+
+  private reapGit(): boolean {
+    for (const [child, state] of this.gitProcesses) {
+      if (!state.groupGone && child.pid !== undefined) {
+        try { process.kill(-child.pid, 0); }
+        catch (error) { state.groupGone = (error as NodeJS.ErrnoException).code === "ESRCH"; }
+      }
+      if (state.closed && state.groupGone) { this.gitProcesses.delete(child); continue; }
+      // Only this starter's child/detached group is owned. Reap descendants of
+      // closed parents and processes left by rejected operations, not an active
+      // post-publication command that must still finish index/checks.
+      if (this.closing && (state.closed || !state.owner?.active)) {
+        const grace = (this.gitProcessOptions.timing ?? DEFAULT_GIT_PROCESS_TIMING).killGraceMs;
+        let signal: NodeJS.Signals | undefined;
+        if (state.termAt === undefined) { state.termAt = performance.now(); signal = "SIGTERM"; }
+        else if (!state.killed && performance.now() - state.termAt >= grace) {
+          state.killed = true; signal = "SIGKILL";
+        }
+        if (signal) {
+          try {
+            this.signalGit(child, this.gitProcessOptions.platform ?? process.platform, signal, !state.exited);
+          }
+          catch { /* Unconfirmed delivery remains owned and fails shutdown. */ }
+        }
+      }
+    }
+    return this.gitProcesses.size === 0;
+  }
+
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.closing = true;
+    for (const active of this.activeWrites.values()) active.cancel?.abort();
+    const timing = this.gitProcessOptions.timing ?? DEFAULT_GIT_PROCESS_TIMING;
+    const deadline = performance.now() + timing.executionTimeoutMs + 2 * timing.killGraceMs;
+    this.shutdownPromise = (async () => {
+      // Queue entries own index installation, post-publication checks and
+      // finally cleanup; process observations survive rejected queue entries.
+      while (true) {
+        const quiescent = this.reapGit();
+        if (this.applyQueues.size === 0 && quiescent) break;
+        if (performance.now() >= deadline) throw new Error("Controlled write shutdown could not be confirmed.");
+        await new Promise<void>(done => setTimeout(done, 20));
+      }
+      if (this.shutdownWriteFailed) throw new Error("Controlled write cleanup failed; recovery may be required.");
+    })().catch(error => {
+      // Do not let runBoundedGit's bounded-command unref masquerade as shutdown.
+      for (const child of this.gitProcesses.keys()) child.ref();
+      throw error;
+    });
+    return this.shutdownPromise;
+  }
+
+  private gitOptions(): GitProcessOptions {
+    const active = this.writeContext.getStore();
+    // A late preparation continuation may outlive its rejected command. It
+    // must not spawn new work after its write context has been released.
+    if ((active !== undefined && !active.active) ||
+        (this.closing && (active === undefined || active.cancel !== undefined))) {
+      throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
+    }
+    return { ...this.gitProcessOptions, signaler: this.signalGit,
+      ...(active?.cancel === undefined ? {} : { signal: active.cancel.signal }) };
+  }
 
   async load(): Promise<void> {
     if (this.stateFilePath === undefined) return;
@@ -349,12 +454,23 @@ export class ControlledPatchService {
         throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
       }
       return this.commitAppliedProposal(taskId, proposal, patch, message);
-    });
+    }, true);
   }
 
-  private withApplyLock<T>(workspaceRoot: string, action: () => Promise<T>): Promise<T> {
+  private withApplyLock<T>(workspaceRoot: string, action: () => Promise<T>, cancellable = false): Promise<T> {
+    if (this.closing) throw new CoreError("INVALID_STATE_TRANSITION");
     const previous = this.applyQueues.get(workspaceRoot) ?? Promise.resolve();
-    const current = previous.then(action, action);
+    const run = async (): Promise<T> => {
+      if (this.closing) throw new CoreError("INVALID_STATE_TRANSITION");
+      const active = { cancel: cancellable ? new AbortController() : undefined, active: true };
+      this.activeWrites.add(active);
+      try { return await this.writeContext.run(active, action); }
+      catch (error) {
+        if (this.closing && !active.cancel?.signal.aborted) this.shutdownWriteFailed = true;
+        throw error;
+      } finally { active.active = false; this.activeWrites.delete(active); }
+    };
+    const current = previous.then(run, run);
     const settled = current.then(() => undefined, () => undefined);
     this.applyQueues.set(workspaceRoot, settled);
     return current.finally(() => {
@@ -373,6 +489,31 @@ export class ControlledPatchService {
     commit_sha: string;
   }> {
     await this.verifyWorkspaceRoot(proposal.workspaceRoot);
+    const options = this.gitOptions();
+    const active = this.writeContext.getStore()!;
+    return withLockedCommitIndex(proposal.workspaceRoot, this.startGit, {
+      ...options,
+      beforeCommit: () => {
+        active.cancel = undefined;
+        options.beforeCommit?.();
+      },
+      isQuiescent: () => {
+        this.reapGit();
+        const quiet = ![...this.gitProcesses.values()].some(state => state.owner === active);
+        if (!quiet) this.shutdownWriteFailed = true;
+        return quiet;
+      }
+    },
+      (index) => this.commitWithLockedIndex(taskId, proposal, patch, message, index));
+  }
+
+  private async commitWithLockedIndex(
+    taskId: Id,
+    proposal: Proposal,
+    patch: string,
+    message: string,
+    index: ControlledCommitIndex
+  ): Promise<{ patch_task_id: Id; committed: true; commit_sha: string }> {
     const base = proposal.base;
     const currentBase = await this.detectBase(proposal.workspaceRoot);
     if (!sameBase(currentBase, base)) {
@@ -381,6 +522,13 @@ export class ControlledPatchService {
     const unbornHeadRef = base.kind === "unborn"
       ? await this.verifyUnbornWithoutRefs(proposal.workspaceRoot)
       : undefined;
+    const headReference = await this.headReference(proposal.workspaceRoot);
+    const baseTree = (await this.git(proposal.workspaceRoot, base.kind === "commit"
+      ? ["rev-parse", `${base.head}^{tree}`]
+      : ["hash-object", "-t", "tree", "--stdin"], "")).trim();
+    if ((await index.git(["write-tree"])).trim() !== baseTree) {
+      throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
+    }
 
     const stagedBefore = splitNul(await this.git(proposal.workspaceRoot, [
       "diff",
@@ -437,94 +585,31 @@ export class ControlledPatchService {
       unrelatedUntrackedSnapshot
     );
 
-    try {
-      await this.git(proposal.workspaceRoot, [
-        "apply",
-        "--cached",
-        "--recount",
-        "--unidiff-zero"
-      ], patch);
-      const stagedAfter = splitNul(await this.git(proposal.workspaceRoot, [
-        "diff",
-        "--cached",
-        "--name-only",
-        "-z"
-      ])).sort();
-      if (!sameStrings(stagedAfter, targets)) {
-        throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
-      }
-      const unstagedAfter = splitNul(await this.git(proposal.workspaceRoot, [
-        "diff",
-        "--name-only",
-        "-z",
-        "--"
-      ]));
-      if (unstagedAfter.length !== 0) {
-        throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
-      }
-      if (base.kind === "unborn" &&
-          await this.verifyUnbornWithoutRefs(proposal.workspaceRoot) !== unbornHeadRef) {
-        throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
-      }
-    } catch (error) {
-      if (base.kind === "commit") {
-        await this.unstageCommittedPathsIfHeadRemainsBase(
-          proposal.workspaceRoot,
-          base.head,
-          targets
-        );
-      } else {
-        await this.unstageInitialCommitPathsIfHeadRemainsUnborn(
-          proposal.workspaceRoot,
-          targets
+    await index.git(["apply", "--cached", "--recount", "--unidiff-zero"], patch);
+    const stagedAfter = splitNul(await index.git([
+      "diff", "--cached", "--name-only", "-z"
+    ])).sort();
+    if (!sameStrings(stagedAfter, targets)) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
+    const expectedTree = (await index.git(["write-tree"])).trim();
+    const commitSha = await index.publish(
+      expectedTree, base.kind === "commit" ? base.head : null, message, async () => {
+        // update-ref's prepared transaction holds HEAD and its resolved ref.
+        // Check identity under those locks, including same-OID branch switches.
+        if (await this.headReference(proposal.workspaceRoot) !== headReference ||
+            (base.kind === "unborn" &&
+             await this.verifyUnbornWithoutRefs(proposal.workspaceRoot) !== unbornHeadRef)) {
+          throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
+        }
+        if (splitNul(await index.git(["diff", "--name-only", "-z", "--"])).length !== 0) {
+          throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
+        }
+        await this.verifyUntrackedSnapshot(
+          proposal.workspaceRoot, untrackedBefore, unrelatedUntrackedSnapshot
         );
       }
-      throw error;
-    }
-
-    let commitError: unknown;
-    try {
-      await this.git(proposal.workspaceRoot, [
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "commit.gpgSign=false",
-        "commit",
-        "--no-verify",
-        "-m",
-        message
-      ]);
-    } catch (error) {
-      commitError = error;
-    }
-
-    let commitSha: string;
-    if (base.kind === "commit") {
-      commitSha = (await this.git(proposal.workspaceRoot, [
-        "rev-parse",
-        "HEAD"
-      ])).trim();
-      if (commitSha === base.head) {
-        await this.unstageCommittedPaths(proposal.workspaceRoot, targets);
-        if (commitError !== undefined) throw commitError;
-        throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
-      }
-    } else {
-      const head = await this.gitResult(proposal.workspaceRoot, [
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        "HEAD"
-      ]);
-      if (head.code !== 0) {
-        await this.unstageInitialCommitPathsIfHeadRemainsUnborn(
-          proposal.workspaceRoot,
-          targets
-        );
-        if (commitError !== undefined) throw commitError;
-        throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
-      }
-      commitSha = head.stdout.trim();
+    );
+    if ((await this.git(proposal.workspaceRoot, ["rev-parse", `${commitSha}^{tree}`])).trim() !== expectedTree) {
+      throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
     }
 
     const ancestry = (await this.git(proposal.workspaceRoot, [
@@ -692,36 +777,13 @@ export class ControlledPatchService {
     return new Set(splitNul(result.stdout));
   }
 
-  private async unstageCommittedPathsIfHeadRemainsBase(
-    workspaceRoot: string,
-    baseHead: string,
-    paths: readonly string[]
-  ): Promise<void> {
-    const head = await this.gitResult(workspaceRoot, ["rev-parse", "--verify", "HEAD"]);
-    if (head.code === 0 && head.stdout.trim() === baseHead) {
-      await this.unstageCommittedPaths(workspaceRoot, paths);
+  private async headReference(workspaceRoot: string): Promise<string | null> {
+    const result = await this.gitResult(workspaceRoot, ["symbolic-ref", "--quiet", "HEAD"]);
+    if (result.code === 1) return null;
+    if (result.code !== 0 || !/^refs\/heads\/[^\s]+$/u.test(result.stdout.trim())) {
+      throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
     }
-  }
-
-  private async unstageCommittedPaths(workspaceRoot: string, paths: readonly string[]): Promise<void> {
-    await this.git(workspaceRoot, ["reset", "-q", "HEAD", "--", ...paths]);
-  }
-
-  private async unstageInitialCommitPathsIfHeadRemainsUnborn(
-    workspaceRoot: string,
-    paths: readonly string[]
-  ): Promise<void> {
-    const currentBase = await this.detectBase(workspaceRoot);
-    if (currentBase.kind === "unborn") {
-      await this.git(workspaceRoot, [
-        "rm",
-        "--cached",
-        "-q",
-        "--ignore-unmatch",
-        "--",
-        ...paths
-      ]);
-    }
+    return result.stdout.trim();
   }
 
   private async verifyUnbornWithoutRefs(workspaceRoot: string): Promise<string> {
@@ -771,14 +833,16 @@ export class ControlledPatchService {
         // additions are verifiable; modified targets cannot be checked.
         if (target.kind !== "added") failPatch();
       } else {
-        const entry = await checkedGit(execute, workspaceRoot, ["ls-tree", base.head, "--", target.path]);
+        const entry = await checkedGit(execute, workspaceRoot, ["--literal-pathspecs", "ls-tree", "-z", base.head, "--", target.path]);
         if (target.kind === "modified") {
-          if (!/^(100644|100755) blob [0-9a-f]+\t[^\n]+\n?$/u.test(entry)) failPatch();
+          const separator = entry.indexOf("\t");
+          if (!/^(100644|100755) blob [0-9a-f]+$/u.test(entry.slice(0, separator)) ||
+              entry.slice(separator + 1) !== `${target.path}\0`) failPatch();
           continue;
         }
         if (entry.length !== 0) failPatch();
       }
-      const indexEntry = await checkedGit(execute, workspaceRoot, ["ls-files", "--stage", "--", target.path]);
+      const indexEntry = await checkedGit(execute, workspaceRoot, ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", target.path]);
       if (indexEntry.length !== 0 || await pathExists(resolve(workspaceRoot, target.path))) failPatch();
     }
     await checkedGit(execute, workspaceRoot, ["apply", "--check", "--recount", "--unidiff-zero"], patch);
@@ -935,12 +999,12 @@ export class ControlledPatchService {
 
   private async git(cwd: string, args: readonly string[], input?: string): Promise<string> {
     const result = await runBoundedGit(
-      this.startProcess,
+      this.startGit,
       cwd,
       args,
       input,
       () => new CoreError("WORKSPACE_PRECONDITION_FAILED"),
-      this.gitProcessOptions
+      this.gitOptions()
     );
     if (result.code !== 0) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
     return result.stdout;
@@ -952,12 +1016,12 @@ export class ControlledPatchService {
   // calls keep using git(), which rejects on any nonzero exit.
   private gitResult(cwd: string, args: readonly string[], input?: string): Promise<GitProcessResult> {
     return runBoundedGit(
-      this.startProcess,
+      this.startGit,
       cwd,
       args,
       input,
       () => new CoreError("WORKSPACE_PRECONDITION_FAILED"),
-      this.gitProcessOptions
+      this.gitOptions()
     );
   }
 }

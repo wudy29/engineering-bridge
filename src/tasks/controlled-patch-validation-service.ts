@@ -1,6 +1,8 @@
+import { milliseconds, monotonicTimer, secondsToMilliseconds } from "./validation-deadline.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CoreError } from "../core/errors.js";
 
 import type {
   ControlledPatchService,
@@ -88,17 +90,22 @@ function stepResult(
 }
 
 export class ControlledPatchValidationService {
+  private closing = false;
+  private shutdownPromise: Promise<void> | undefined;
+  private readonly active = new Set<Promise<ControlledPatchValidationReport>>();
+
   constructor(
     private readonly registry: RegisteredWorkspaceRegistry,
     private readonly controlledPatches: ControlledPatchService,
     private readonly profiles: ValidationProfileStore,
     private readonly runner: ValidationProcessRunner,
-    private readonly nowMs: () => number = () => Date.now(),
+    private readonly nowMs: () => number | bigint = () => monotonicTimer.now(),
     private readonly makeTempParent: () => Promise<string> = createTempParent,
     private readonly removeParent: (temporaryParent: string) => Promise<void> =
       removeTempParent,
     private readonly cleanupDeadlineTimer: CleanupDeadlineTimer =
-      systemCleanupDeadlineTimer
+      systemCleanupDeadlineTimer,
+    private readonly platform: NodeJS.Platform = process.platform
   ) {}
 
   configure(
@@ -109,11 +116,45 @@ export class ControlledPatchValidationService {
     return this.profiles.configure(workspaceId, profile);
   }
 
-  async validate(
+  validate(patchTaskId: string): Promise<ControlledPatchValidationReport> {
+    if (this.closing) return Promise.reject(new CoreError("INVALID_STATE_TRANSITION"));
+    const validation = this.validateActive(patchTaskId);
+    this.active.add(validation);
+    void validation.then(() => this.active.delete(validation), () => this.active.delete(validation));
+    return validation;
+  }
+
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.closing = true;
+    const drain = (async () => {
+      this.runner.interrupt();
+      const results = await Promise.allSettled([...this.active]);
+      // A cleanup report can reach its deadline before its runner has finished
+      // TERM/KILL. Keep that process owned until its bounded attempt settles.
+      await this.runner.waitForCompletion();
+      if (results.some(result => result.status === "rejected" || result.value.cleanup === "failed")) {
+        throw new Error("Synchronous validation shutdown could not be confirmed.");
+      }
+    })();
+    let timer: NodeJS.Timeout;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Synchronous validation shutdown could not be confirmed.")), 10_000);
+    });
+    this.shutdownPromise = Promise.race([drain, deadline]).finally(() => clearTimeout(timer));
+    return this.shutdownPromise;
+  }
+
+  private async validateActive(
     patchTaskId: string
   ): Promise<ControlledPatchValidationReport> {
-    const startedAt = this.nowMs();
+    const startedAt = milliseconds(this.nowMs());
     const proposal = this.controlledPatches.validationProposal(patchTaskId);
+    if (this.platform === "win32") {
+      // A direct child's exit does not prove Windows descendants are quiescent.
+      // Refuse before profile access, Git preflight or temporary worktree creation.
+      return this.report(startedAt, "INCOMPLETE", patchTaskId, proposal, [], "success", "unsupported_platform");
+    }
     const profile = await this.profiles.get(proposal.workspaceId);
 
     if (profile === undefined) {
@@ -176,15 +217,22 @@ export class ControlledPatchValidationService {
 
     const worktreeRoot = join(temporaryParent, "worktree");
     const totalTimeoutMs =
-      (profile.totalTimeoutSeconds ?? DEFAULT_TOTAL_TIMEOUT_SECONDS) * 1_000;
+      secondsToMilliseconds(profile.totalTimeoutSeconds ?? DEFAULT_TOTAL_TIMEOUT_SECONDS);
     const steps: ValidationStepResult[] = [];
     let status: ValidationStatus = "INCOMPLETE";
     let reason: string | undefined = "worktree_creation_failed";
+    let cleanupSafe = true;
+    const runWithinBudget = async (
+      request: Omit<ValidationProcessRequest, "timeoutMs">,
+      requestedTimeoutMs = totalTimeoutMs
+    ): Promise<ValidationProcessOutcome | undefined> => {
+      const outcome = await this.runWithinBudget(startedAt, totalTimeoutMs, request, requestedTimeoutMs);
+      if (outcome?.kind === "termination_error") cleanupSafe = false;
+      return outcome;
+    };
 
     try {
-      const worktreeOutcome = await this.runWithinBudget(
-        startedAt,
-        totalTimeoutMs,
+      const worktreeOutcome = await runWithinBudget(
         {
           argv: [
             "git",
@@ -203,9 +251,7 @@ export class ControlledPatchValidationService {
       if (worktreeOutcome === undefined) {
         reason = "total_timeout";
       } else if (succeeded(worktreeOutcome)) {
-        const applyOutcome = await this.runWithinBudget(
-          startedAt,
-          totalTimeoutMs,
+        const applyOutcome = await runWithinBudget(
           {
             argv: ["git", "apply", "--recount", "--unidiff-zero"],
             cwd: worktreeRoot,
@@ -223,13 +269,10 @@ export class ControlledPatchValidationService {
 
           for (const step of [...profile.preparation, ...profile.validation]) {
             const timeoutMs =
-              (step.timeoutSeconds ??
+              secondsToMilliseconds(step.timeoutSeconds ??
                 profile.defaultStepTimeoutSeconds ??
-                DEFAULT_STEP_TIMEOUT_SECONDS) *
-              1_000;
-            const outcome = await this.runWithinBudget(
-              startedAt,
-              totalTimeoutMs,
+                DEFAULT_STEP_TIMEOUT_SECONDS);
+            const outcome = await runWithinBudget(
               {
                 argv: step.argv,
                 cwd: worktreeRoot
@@ -255,15 +298,16 @@ export class ControlledPatchValidationService {
         }
       }
     } catch {
+      cleanupSafe = false;
       status = "INCOMPLETE";
       reason = "infrastructure_failed";
     }
 
-    const cleanup = await this.cleanup(
+    const cleanup = cleanupSafe ? await this.cleanup(
       workspaceRoot,
       worktreeRoot,
       temporaryParent
-    );
+    ) : "failed";
     if (cleanup === "failed") {
       status = "INCOMPLETE";
       reason = "cleanup_failed";
@@ -281,19 +325,20 @@ export class ControlledPatchValidationService {
   }
 
   private async runWithinBudget(
-    startedAt: number,
-    totalTimeoutMs: number,
+    startedAt: bigint,
+    totalTimeoutMs: bigint,
     request: Omit<ValidationProcessRequest, "timeoutMs">,
     requestedTimeoutMs = totalTimeoutMs
   ): Promise<ValidationProcessOutcome | undefined> {
-    const remainingMs = totalTimeoutMs - (this.nowMs() - startedAt);
-    if (remainingMs <= 0) {
+    if (this.closing) return { kind: "aborted", durationMs: 0, outputTail: "" };
+    const remainingMs = totalTimeoutMs - (milliseconds(this.nowMs()) - startedAt);
+    if (remainingMs <= 0n) {
       return undefined;
     }
 
     return this.runner.run({
       ...request,
-      timeoutMs: Math.min(requestedTimeoutMs, remainingMs)
+      timeoutMs: requestedTimeoutMs < remainingMs ? requestedTimeoutMs : remainingMs
     });
   }
 
@@ -328,9 +373,10 @@ export class ControlledPatchValidationService {
           cwd: workspaceRoot,
           timeoutMs: CLEANUP_TIMEOUT_MS
         });
+        if (outcome.kind === "termination_error") return "failed";
         failed = !succeeded(outcome);
       } catch {
-        failed = true;
+        return "failed";
       }
 
       if (deadlineExpired) {
@@ -356,7 +402,7 @@ export class ControlledPatchValidationService {
   }
 
   private report(
-    startedAt: number,
+    startedAt: bigint,
     status: ValidationStatus,
     patchTaskId: string,
     proposal: ControlledPatchValidationProposal,
@@ -369,7 +415,7 @@ export class ControlledPatchValidationService {
       patch_task_id: patchTaskId,
       workspace_id: proposal.workspaceId,
       base_head: proposal.baseHead,
-      total_duration_ms: this.nowMs() - startedAt,
+      total_duration_ms: Number(milliseconds(this.nowMs()) - startedAt),
       steps,
       cleanup,
       ...(reason === undefined ? {} : { reason })

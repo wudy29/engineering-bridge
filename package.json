@@ -1,6 +1,6 @@
 {
   "name": "engineering-bridge",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "A local MCP bridge for supervised read-only Codex and DSH tasks with controlled patch application.",
   "type": "module",
   "files": [
@@ -26,7 +26,8 @@
     "test": "npm run build && node --test \"dist/tests/unit/**/*.test.js\"",
     "mcp:stdio": "node dist/src/mcp-stdio.js",
     "dashboard": "node dist/src/dashboard.js",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "verify:package": "node scripts/verify-package.mjs"
   },
   "keywords": [
     "mcp",

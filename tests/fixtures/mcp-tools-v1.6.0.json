@@ -1,0 +1,515 @@
+{
+  "server": {
+    "name": "engineering-bridge",
+    "version": "1.6.0"
+  },
+  "tools": [
+    {
+      "name": "apply_controlled_patch",
+      "description": "Apply one reviewed patch proposal after exact APPLY confirmation. This tool can modify validated tracked text files or add absent 100644 text files, but never stages, commits, or pushes.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "patch_task_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "confirmation": {
+            "type": "string",
+            "const": "APPLY"
+          }
+        },
+        "required": [
+          "patch_task_id",
+          "confirmation"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "authorize_workspace_write",
+      "description": "Grant persistent controlled-write authorization to a managed workspace after exact AUTHORIZE confirmation. Manual workspaces remain authoritative through workspaces.json. Ordinary run_task calls stay read-only.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "workspace_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "confirmation": {
+            "type": "string",
+            "const": "AUTHORIZE"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "confirmation"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "bind_project",
+      "description": "Register an existing local project directory as a read-only workspace. The path must already exist inside a configured project_root and the call requires exact BIND confirmation.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "confirmation": {
+            "type": "string",
+            "const": "BIND"
+          }
+        },
+        "required": [
+          "project_path",
+          "confirmation"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "commit_controlled_patch",
+      "description": "Create one Git commit containing only an already-APPLYed controlled patch after exact COMMIT confirmation. Never pushes.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "patch_task_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "confirmation": {
+            "type": "string",
+            "const": "COMMIT"
+          }
+        },
+        "required": [
+          "patch_task_id",
+          "message",
+          "confirmation"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "configure_validation_profile",
+      "description": "Configure the fixed validation profile for a registered workspace after exact CONFIGURE confirmation.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "workspace_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "profile": {
+            "type": "object",
+            "properties": {
+              "preparation": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "argv": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "timeout_seconds": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "argv"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "validation": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/properties/profile/properties/preparation/items"
+                }
+              },
+              "default_step_timeout_seconds": {
+                "default": 600,
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              "total_timeout_seconds": {
+                "default": 1200,
+                "type": "integer",
+                "exclusiveMinimum": 0
+              }
+            },
+            "required": [
+              "preparation",
+              "validation"
+            ],
+            "additionalProperties": false
+          },
+          "confirmation": {
+            "type": "string",
+            "const": "CONFIGURE"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "profile",
+          "confirmation"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "control_task",
+      "description": "Steer or interrupt a running task, continue a reviewed task, or accept reviewed output.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "continue",
+              "steer",
+              "interrupt",
+              "accept"
+            ]
+          },
+          "instruction": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "action"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "create_project",
+      "description": "Create a new empty Git project directory inside a configured project_root and register it as a read-only workspace. The call requires exact CREATE confirmation; only mkdir and git init are performed.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "parent": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "confirmation": {
+            "type": "string",
+            "const": "CREATE"
+          }
+        },
+        "required": [
+          "parent",
+          "name",
+          "confirmation"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "generate_controlled_patch",
+      "description": "Generate a read-only patch proposal for review in any registered Git workspace; generation requires no write authorization, and controlled-write authorization is required only to APPLY.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "workspace_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "change_request": {
+            "type": "string",
+            "minLength": 1
+          },
+          "executor": {
+            "default": "codex",
+            "type": "string",
+            "enum": [
+              "codex",
+              "dsh"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reasoning_effort": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "workspace_id",
+          "change_request"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "get_controlled_patch_validation",
+      "description": "Read the retained validation run and ordered bounded results. Returns immediately with running or terminal PASS/FAIL/INCOMPLETE; never executes, waits for validation, changes state, or cleans up. PASS does not authorize APPLY.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "validation_run_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "validation_run_id"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "refine_controlled_patch",
+      "description": "Refine a completed retained patch proposal into a new complete read-only proposal against the same base HEAD.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "patch_task_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "change_request": {
+            "type": "string",
+            "minLength": 1
+          },
+          "executor": {
+            "default": "codex",
+            "type": "string",
+            "enum": [
+              "codex",
+              "dsh"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reasoning_effort": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "patch_task_id",
+          "change_request"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "run_task",
+      "description": "Run a read-only task with the selected executor in a pre-registered workspace. This tool does not modify workspace files.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "workspace_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "instruction": {
+            "type": "string",
+            "minLength": 1
+          },
+          "dashboard_title": {
+            "description": "Optional public title for the local Dashboard (single line, at most 100 characters). Supply explicitly; never derive from private instruction, output, evidence or diagnostics.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+$"
+          },
+          "executor": {
+            "default": "codex",
+            "type": "string",
+            "enum": [
+              "codex",
+              "dsh"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reasoning_effort": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "workspace_id",
+          "instruction"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "start_controlled_patch_validation",
+      "description": "Durably admit validation and return a run id without waiting for execution. Reuse the same idempotency_key on retry; use a new key for explicit revalidation. Uses only the trusted configured profile in a temporary worktree. Does not APPLY, commit, or push; PASS grants no write authorization.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "patch_task_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "idempotency_key": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+          }
+        },
+        "required": [
+          "patch_task_id",
+          "idempotency_key"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "submit_controlled_patch",
+      "description": "Submit a caller-provided complete unified Git diff as a read-only patch proposal against exactly the current commit HEAD. Nothing is written until the returned task is applied with exact APPLY; the proposal carries source: \"submitted\" and no executor identity.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "workspace_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "base_head": {
+            "type": "string",
+            "minLength": 1
+          },
+          "diff": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "workspace_id",
+          "base_head",
+          "diff"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "task_result",
+      "description": "Retrieve the completed output or safe error for a task. This tool is read-only.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "validate_controlled_patch",
+      "description": "Validate one retained controlled patch with its workspace's configured profile.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "patch_task_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "patch_task_id"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    }
+  ]
+}

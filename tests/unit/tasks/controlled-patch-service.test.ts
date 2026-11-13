@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { constants, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -196,11 +196,24 @@ async function appliedUnbornFixture(
 function mutateBeforeCommit(mutate: () => void): GitStarter {
   let mutated = false;
   return (executable, args, options) => {
-    if (!mutated && executable === "git" && args.includes("commit")) {
+    if (!mutated && executable === "git" && args.includes("update-ref")) {
       mutated = true;
       mutate();
     }
     return spawn(executable, args, options);
+  };
+}
+
+function mutateAfterPublication(mutate: () => void): GitStarter {
+  let published = false;
+  let mutated = false;
+  return (executable, args, options) => {
+    if (published && !mutated) { mutated = true; mutate(); }
+    const child = spawn(executable, args, options);
+    if (executable === "git" && args.includes("update-ref")) {
+      child.once("close", (code) => { published = code === 0; });
+    }
+    return child;
   };
 }
 
@@ -220,6 +233,244 @@ const markdownFencePatch = [
   ""
 ].join("\n");
 
+function approvedTree(root: string, patch: string, unborn = false): string {
+  const temporary = mkdtempSync(join(tmpdir(), "engineering-bridge-approved-tree-"));
+  const env = { ...process.env, GIT_INDEX_FILE: join(temporary, "index") };
+  const run = (args: string[], input?: string): string => execFileSync("git", args, {
+    cwd: root, env, encoding: "utf8", ...(input === undefined ? {} : { input })
+  });
+  try {
+    run(["read-tree", unborn ? "--empty" : "HEAD"]);
+    run(["apply", "--cached", "--recount", "--unidiff-zero"], patch);
+    return run(["write-tree"]).trim();
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
+for (const unborn of [false, true]) {
+  for (const samePath of [false, true]) {
+    test(`F02 writer after the LAST prepared check cannot alter ${unborn ? "root" : "ordinary"} commit ${samePath ? "content" : "paths"}`, {
+      skip: noFollowRequiredSkip
+    }, async (t) => {
+      const root = unborn ? unbornRepository() : repository();
+      const evidence = mkdtempSync(join(tmpdir(), "engineering-bridge-final-writer-"));
+      t.after(() => { rmSync(root, { recursive: true, force: true }); rmSync(evidence, { recursive: true, force: true }); });
+      const patch = unborn ? additionPatch : validPatch;
+      const name = samePath ? (unborn ? "added.txt" : "note.txt") : "outside.txt";
+      if (!samePath) writeFileSync(join(root, name), "preserve outside\n");
+      const expected = approvedTree(root, patch, unborn);
+      const marker = join(evidence, "writer.json");
+      const starter: GitStarter = (executable, args, options) => {
+        if (!args.includes("update-ref")) return spawn(executable, args, options);
+        // Proxy the real Git transaction. The competing writer runs only when
+        // the owner sends COMMIT, after all prepared verification has returned.
+        return spawn(process.execPath, ["-e", `
+          const fs=require('node:fs'),cp=require('node:child_process'),path=require('node:path');
+          const [git,argv,name,marker,replace]=process.argv.slice(1);
+          const child=cp.spawn(git,JSON.parse(argv),{stdio:['pipe','inherit','inherit'],shell:false});
+          let input='';process.stdin.setEncoding('utf8');
+          process.stdin.on('data',chunk=>{input+=chunk;let n;while((n=input.indexOf('\\n'))>=0){
+            const line=input.slice(0,n+1);input=input.slice(n+1);
+            if(line==='commit\\n'){
+              if(replace==='yes')fs.writeFileSync(path.join(process.cwd(),name),'late unapproved content\\n');
+              const r=cp.spawnSync(git,['add','--',name],{encoding:'utf8',shell:false});
+              fs.writeFileSync(marker,JSON.stringify({blocked:r.status!==0&&/index\\.lock/.test(r.stderr)}));
+            }
+            child.stdin.write(line);
+          }});
+          process.stdin.on('end',()=>child.stdin.end());
+          child.on('close',code=>process.exit(code??1));
+        `, executable, JSON.stringify(args), name, marker, samePath ? "yes" : "no"], options);
+      };
+      const { controlled, taskId } = await appliedFixture(root, patch, starter);
+      const before = currentHead(root);
+      let failure: unknown;
+      try { await controlled.commit({ patch_task_id: taskId, message: "immutable approved tree", confirmation: "COMMIT" }); }
+      catch (error) { failure = error; }
+      assert.deepEqual(JSON.parse(readFileSync(marker, "utf8")), { blocked: true });
+      assert.notEqual(currentHead(root), before, "the prepared commit was actually published");
+      assert.equal(git(root, "rev-parse", "HEAD^{tree}").trim(), expected);
+      assert.equal(git(root, "write-tree").trim(), expected);
+      assert.equal(readFileSync(join(root, name), "utf8"), samePath ? "late unapproved content\n" : "preserve outside\n");
+      if (samePath) assert.ok(failure instanceof CoreError, "late worktree drift is reported without committing it");
+      else assert.equal(failure, undefined);
+    });
+  }
+}
+
+for (const unborn of [false, true]) {
+  test(`F02 final ${unborn ? "initial " : ""}COMMIT window never publishes concurrent same-path content`, async (t) => {
+    const root = unborn ? unbornRepository() : repository();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const patch = unborn ? additionPatch : validPatch;
+    const name = unborn ? "added.txt" : "note.txt";
+    const expectedTree = approvedTree(root, patch, unborn);
+    let attempted = false;
+    let stageBlocked = false;
+    const starter: GitStarter = (executable, args, options) => {
+      if (!attempted && executable === "git" && args.includes("update-ref")) {
+        attempted = true;
+        writeFileSync(join(root, name), "unapproved concurrent content\n");
+        try { git(root, "add", "--", name); }
+        catch (error) { stageBlocked = /index\.lock/u.test(String((error as { stderr?: unknown }).stderr)); }
+      }
+      return spawn(executable, args, options);
+    };
+    const { controlled, taskId } = await appliedFixture(root, patch, starter);
+    const base = currentHead(root);
+    let failure: unknown;
+    try { await controlled.commit({ patch_task_id: taskId, message: "approved content only", confirmation: "COMMIT" }); }
+    catch (error) { failure = error; }
+    assert.equal(attempted, true);
+    const head = currentHead(root);
+    if (head !== base) {
+      assert.equal(git(root, "rev-parse", "HEAD^{tree}").trim(), expectedTree,
+        "a returned error cannot repair an unapproved published tree");
+    } else {
+      assert.ok(failure instanceof CoreError);
+      assert.equal(git(root, "diff", "--cached", "--name-only"), "");
+    }
+    assert.equal(stageBlocked, true, "the shared index must remain locked across publication");
+    assert.equal(readFileSync(join(root, name), "utf8"), "unapproved concurrent content\n");
+  });
+
+  test(`F02 final ${unborn ? "initial " : ""}COMMIT window cannot include an unrelated staged file`, {
+    skip: noFollowRequiredSkip
+  }, async (t) => {
+    const root = unborn ? unbornRepository() : repository();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const patch = unborn ? additionPatch : validPatch;
+    const expectedTree = approvedTree(root, patch, unborn);
+    writeFileSync(join(root, "outside.txt"), "preserve outside\n");
+    let attempted = false;
+    let blocked = false;
+    const starter: GitStarter = (executable, args, options) => {
+      if (!attempted && executable === "git" && args.includes("update-ref")) {
+        attempted = true;
+        try { git(root, "add", "outside.txt"); }
+        catch (error) { blocked = /index\.lock/u.test(String((error as { stderr?: unknown }).stderr)); }
+      }
+      return spawn(executable, args, options);
+    };
+    const { controlled, taskId } = await appliedFixture(root, patch, starter);
+    let failure: unknown;
+    try { await controlled.commit({ patch_task_id: taskId, message: "exclude concurrent staging", confirmation: "COMMIT" }); }
+    catch (error) { failure = error; }
+    assert.equal(attempted, true);
+    assert.equal(git(root, "rev-parse", "HEAD^{tree}").trim(), expectedTree);
+    assert.equal(blocked, true);
+    assert.equal(failure, undefined);
+    assert.equal(readFileSync(join(root, "outside.txt"), "utf8"), "preserve outside\n");
+    assert.equal(git(root, "ls-files", "--others", "--exclude-standard", "-z"), "outside.txt\0");
+  });
+}
+
+for (const entryPoint of ["submit", "APPLY"]) {
+test(`F01 ${entryPoint} rejects an untracked literal path that Git pathspec magic aliases to a tracked file`, {
+  skip: process.platform === "win32" ? "Windows filenames cannot contain a colon" : false
+}, async (t) => {
+  const root = repository();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const name = ":(literal)note.txt";
+  writeFileSync(join(root, name), "before\n");
+  const patch = validPatch.replaceAll("note.txt", name);
+  const { controlled, tasks } = fixture(root, async () => ({ kind: "completed", output: patch }));
+  const head = git(root, "rev-parse", "HEAD").trim();
+
+  if (entryPoint === "submit") {
+    await expectCode(() => controlled.submit({
+      workspace_id: "workspace", base_head: head, diff: patch
+    }), "WORKSPACE_PRECONDITION_FAILED");
+  } else {
+    const generated = await controlled.generate({ workspace_id: "workspace", change_request: "modify literal name" });
+    await terminal(tasks, generated.taskId);
+    await expectCode(() => controlled.apply({
+      patch_task_id: generated.taskId, confirmation: "APPLY"
+    }), "WORKSPACE_PRECONDITION_FAILED");
+  }
+
+  assert.equal(readFileSync(join(root, name), "utf8"), "before\n");
+  assert.equal(readFileSync(join(root, "note.txt"), "utf8"), "before\n");
+  assert.equal(git(root, "diff", "--cached", "--name-only"), "");
+});
+}
+
+for (const name of ["[literal].txt", "café.txt", ":(literal)note.txt", "star*.txt", "question?.txt"]) {
+  test(`F01 preserves tracked literal filename ${name} through submit, APPLY and COMMIT`, {
+    skip: process.platform === "win32" && /[:*?]/u.test(name)
+      ? "This filename is not legal on Windows" : false
+  }, async (t) => {
+    const root = repository();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    writeFileSync(join(root, name), "before\n");
+    git(root, "--literal-pathspecs", "add", "--", name);
+    git(root, "commit", "-qm", "add literal filename");
+    const { controlled } = fixture(root, async () => { throw new Error("must not execute"); });
+    const submitted = await controlled.submit({
+      workspace_id: "workspace", base_head: git(root, "rev-parse", "HEAD").trim(),
+      diff: validPatch.replaceAll("note.txt", name)
+    });
+    const applied = await controlled.apply({ patch_task_id: submitted.taskId, confirmation: "APPLY" });
+    assert.deepEqual(applied.changed_paths, [name]);
+    await controlled.commit({ patch_task_id: submitted.taskId, message: "update literal filename", confirmation: "COMMIT" });
+    assert.equal(git(root, "show", `HEAD:${name}`), "after\n");
+    assert.equal(git(root, "show", "HEAD:note.txt"), "before\n");
+    assert.equal(git(root, "status", "--porcelain"), "");
+  });
+}
+
+test("F01 permits an absent literal addition whose pathspec expansion names an existing tracked file", {
+  skip: process.platform === "win32" ? "Windows filenames cannot contain a colon" : false
+}, async (t) => {
+  const root = repository();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const name = ":(literal)note.txt";
+  const { controlled, taskId } = await appliedFixture(root, additionPatch.replaceAll("added.txt", name));
+  await controlled.commit({ patch_task_id: taskId, message: "add literal filename", confirmation: "COMMIT" });
+  assert.equal(git(root, "show", `HEAD:${name}`), "added\n");
+  assert.equal(git(root, "show", "HEAD:note.txt"), "before\n");
+});
+
+for (const unborn of [false, true]) {
+  test(`F01/F02 failed ${unborn ? "initial " : ""}COMMIT preserves literal targets without staging them`, {
+    skip: noFollowRequiredSkip
+  }, async (t) => {
+    const root = unborn ? unbornRepository() : repository();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const name = "[x].txt";
+    writeFileSync(join(root, "x.txt"), "before\n");
+    if (!unborn) {
+      writeFileSync(join(root, name), "before\n");
+      git(root, "--literal-pathspecs", "add", "--", name, "x.txt");
+      git(root, "commit", "-qm", "add cleanup fixtures");
+    }
+    let commitCalls = 0;
+    const starter: GitStarter = (executable, args, options) => {
+      if (executable === "git" && args.includes("update-ref")) {
+        commitCalls += 1;
+        writeFileSync(join(root, "x.txt"), "external change\n");
+        assert.throws(() => git(root, "add", "--", "x.txt"), /index\.lock/u);
+        return spawn(process.execPath, ["-e", "process.exit(1)"], options);
+      }
+      return spawn(executable, args, options);
+    };
+    const patch = unborn
+      ? additionPatch.replaceAll("added.txt", name)
+      : validPatch.replaceAll("note.txt", name);
+    const { controlled, taskId } = await appliedFixture(root, patch, starter);
+    const head = currentHead(root);
+    await expectCode(() => controlled.commit({
+      patch_task_id: taskId, message: "failing commit", confirmation: "COMMIT"
+    }), "WORKSPACE_PRECONDITION_FAILED");
+    assert.equal(commitCalls, 1);
+    assert.equal(currentHead(root), head);
+    assert.equal(git(root, "diff", "--cached", "--name-only", "-z"), "");
+    assert.equal(readFileSync(join(root, name), "utf8"), unborn ? "added\n" : "after\n");
+    assert.equal(readFileSync(join(root, "x.txt"), "utf8"), "external change\n");
+  });
+}
+
 const staleHunkCountPatch = [
   "diff --git a/README.md b/README.md",
   "--- a/README.md",
@@ -231,6 +482,146 @@ const staleHunkCountPatch = [
   "+after",
   ""
 ].join("\n");
+
+for (const change of ["advance", "same-OID branch switch", "detach", "unborn branch switch"]) {
+  test(`F02 reference ${change} before publication preserves the concurrent ref and index`, async (t) => {
+    const unborn = change === "unborn branch switch";
+    const root = unborn ? unbornRepository() : repository();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const before = currentHead(root);
+    const originalRef = git(root, "symbolic-ref", "HEAD").trim();
+    const external = change === "advance"
+      ? git(root, "commit-tree", "HEAD^{tree}", "-p", before!, "-m", "external commit").trim()
+      : before;
+    if (change === "same-OID branch switch") git(root, "branch", "other", before!);
+    let changed = false;
+    const starter = mutateBeforeCommit(() => {
+      changed = true;
+      if (change === "advance") git(root, "update-ref", "HEAD", external!, before!);
+      else if (change === "detach") git(root, "update-ref", "--no-deref", "HEAD", before!, before!);
+      else git(root, "symbolic-ref", "HEAD", "refs/heads/other");
+    });
+    const { controlled, taskId } = await appliedFixture(root, unborn ? additionPatch : validPatch, starter);
+    const indexPath = join(root, ".git", "index");
+    const beforeIndex = existsSync(indexPath) ? readFileSync(indexPath) : undefined;
+    await expectCode(() => controlled.commit({ patch_task_id: taskId, message: "must not publish", confirmation: "COMMIT" }), "WORKSPACE_PRECONDITION_FAILED");
+    assert.equal(changed, true);
+    assert.equal(currentHead(root), external);
+    if (beforeIndex === undefined) assert.equal(existsSync(indexPath), false);
+    else assert.deepEqual(readFileSync(indexPath), beforeIndex);
+    assert.equal(existsSync(`${indexPath}.lock`), false);
+    if (!unborn && change !== "advance") assert.equal(git(root, "rev-parse", originalRef).trim(), before);
+  });
+}
+
+test("F02 respects an existing index lock without deleting or replacing it", async (t) => {
+  const root = repository();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const { controlled, taskId } = await appliedFixture(root);
+  const base = currentHead(root);
+  const indexPath = join(root, ".git", "index");
+  const original = readFileSync(indexPath);
+  writeFileSync(`${indexPath}.lock`, "owned by another process\n");
+  await expectCode(() => controlled.commit({ patch_task_id: taskId, message: "blocked", confirmation: "COMMIT" }), "WORKSPACE_PRECONDITION_FAILED");
+  assert.equal(currentHead(root), base);
+  assert.deepEqual(readFileSync(indexPath), original);
+  assert.equal(readFileSync(`${indexPath}.lock`, "utf8"), "owned by another process\n");
+});
+
+for (const mode of ["detached", "linked worktree", "split index", "index flags"]) {
+  test(`F02 exact approved tree and shared index are preserved with ${mode}`, async (t) => {
+    const primary = repository();
+    t.after(() => rmSync(primary, { recursive: true, force: true }));
+    let root = primary;
+    if (mode === "detached") git(root, "checkout", "--detach", "-q");
+    if (mode === "linked worktree") {
+      const holder = mkdtempSync(join(tmpdir(), "engineering-bridge-linked-"));
+      t.after(() => rmSync(holder, { recursive: true, force: true }));
+      root = join(holder, "worktree");
+      git(primary, "worktree", "add", "--detach", "-q", root);
+    }
+    if (mode === "split index") git(root, "update-index", "--split-index");
+    if (mode === "index flags") {
+      writeFileSync(join(root, "anchor.txt"), "unchanged\n");
+      git(root, "add", "anchor.txt"); git(root, "commit", "-qm", "anchor");
+      git(root, "update-index", "--assume-unchanged", "anchor.txt");
+      git(root, "update-index", "--skip-worktree", "anchor.txt");
+    }
+    const expected = approvedTree(root, validPatch);
+    const { controlled, taskId } = await appliedFixture(root);
+    await controlled.commit({ patch_task_id: taskId, message: "exact approved tree", confirmation: "COMMIT" });
+    assert.equal(git(root, "rev-parse", "HEAD^{tree}").trim(), expected);
+    assert.equal(git(root, "write-tree").trim(), expected);
+    assert.equal(git(root, "status", "--porcelain"), "");
+    if (mode === "index flags") assert.equal(git(root, "ls-files", "-v", "anchor.txt"), "s anchor.txt\n");
+    if (mode === "linked worktree") assert.equal(git(primary, "show", "HEAD:note.txt"), "before\n");
+  });
+}
+
+for (const suffix of [" trailing space ", "trailing-cr\r"]) {
+  test(`F02 preserves the exact alternate-index pathname ${JSON.stringify(suffix)}`, {
+    skip: process.platform === "win32" ? "Windows does not preserve these filename suffixes" : false
+  }, async (t) => {
+    const root = repository();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const path = join(root, ".git", `alternate-${suffix}`);
+    const original = readFileSync(join(root, ".git", "index"));
+    writeFileSync(path, original);
+    const starter: GitStarter = (executable, args, options) => spawn(executable, args, {
+      ...options, env: { ...process.env, GIT_INDEX_FILE: path, ...options.env }
+    });
+    const expected = approvedTree(root, validPatch);
+    const { controlled, taskId } = await appliedFixture(root, validPatch, starter);
+    await controlled.commit({ patch_task_id: taskId, message: "alternate index", confirmation: "COMMIT" });
+    assert.equal(git(root, "rev-parse", "HEAD^{tree}").trim(), expected);
+    assert.deepEqual(readFileSync(join(root, ".git", "index")), original);
+    assert.equal(execFileSync("git", ["write-tree"], { cwd: root, encoding: "utf8", env: { ...process.env, GIT_INDEX_FILE: path } }).trim(), expected);
+    assert.equal(existsSync(`${path}.lock`), false);
+  });
+}
+
+test("F02 preserves distinct author and committer identity and disables hooks and signing", async (t) => {
+  const root = repository();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  for (const [key, value] of Object.entries({
+    "author.name": "Approved Author", "author.email": "author@example.invalid",
+    "committer.name": "Approved Committer", "committer.email": "committer@example.invalid",
+    "commit.gpgSign": "true", "gpg.program": "must-not-execute-signing"
+  })) git(root, "config", key, value);
+  const hooks = join(root, ".git", "test-hooks"); mkdirSync(hooks);
+  git(root, "config", "core.hooksPath", hooks);
+  const marker = join(root, "hook-ran");
+  for (const hook of ["pre-commit", "post-commit", "commit-msg", "reference-transaction"]) {
+    const path = join(hooks, hook);
+    writeFileSync(path, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)},'ran');process.exit(1);\n`);
+    chmodSync(path, 0o755);
+  }
+  const config = git(root, "config", "--local", "--list");
+  const expected = approvedTree(root, validPatch);
+  const { controlled, taskId } = await appliedFixture(root);
+  await controlled.commit({ patch_task_id: taskId, message: "approved identity", confirmation: "COMMIT" });
+  assert.equal(git(root, "log", "-1", "--format=%an|%ae|%cn|%ce").trim(), "Approved Author|author@example.invalid|Approved Committer|committer@example.invalid");
+  assert.equal(git(root, "rev-parse", "HEAD^{tree}").trim(), expected);
+  assert.equal(existsSync(marker), false);
+  assert.equal(git(root, "config", "--local", "--list"), config);
+});
+
+test("F02 failed index installation preserves the approved commit and native recovery lock", async (t) => {
+  const root = repository();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const indexPath = join(root, ".git", "index");
+  const expected = approvedTree(root, validPatch);
+  const starter = mutateAfterPublication(() => {
+    rmSync(indexPath); mkdirSync(indexPath);
+    writeFileSync(join(indexPath, "external-owner"), "preserve\n");
+  });
+  const { controlled, taskId } = await appliedFixture(root, validPatch, starter);
+  await expectCode(() => controlled.commit({ patch_task_id: taskId, message: "approved tree only", confirmation: "COMMIT" }), "WORKSPACE_PRECONDITION_FAILED");
+  assert.equal(git(root, "rev-parse", "HEAD^{tree}").trim(), expected);
+  assert.equal(readFileSync(join(indexPath, "external-owner"), "utf8"), "preserve\n");
+  assert.equal(existsSync(`${indexPath}.lock`), true);
+  assert.equal(execFileSync("git", ["write-tree"], { cwd: root, encoding: "utf8", env: { ...process.env, GIT_INDEX_FILE: `${indexPath}.lock` } }).trim(), expected);
+});
 
 const zeroContextPatch = [
   "diff --git a/README.md b/README.md",
@@ -734,7 +1125,7 @@ test("COMMIT fails closed before staging when ordinary untracked fingerprinting 
   let commitCalls = 0;
   const starter: GitStarter = (executable, args, options) => {
     if (executable === "git" && args[0] === "apply" && args.includes("--cached")) cachedApplyCalls += 1;
-    if (executable === "git" && args.includes("commit")) commitCalls += 1;
+    if (executable === "git" && args.includes("update-ref")) commitCalls += 1;
     return spawn(executable, args, options);
   };
   try {
@@ -924,7 +1315,7 @@ test("initial COMMIT failure cleans up only Bridge-staged proposal targets", { s
   const anchorPath = "recovery-anchor.md";
   let commitCalls = 0;
   const starter: GitStarter = (executable, args, options) => {
-    if (executable === "git" && args.includes("commit")) {
+    if (executable === "git" && args.includes("update-ref")) {
       commitCalls += 1;
       return spawn(process.execPath, ["-e", "process.exit(1)"], options);
     }
@@ -957,7 +1348,7 @@ test("initial COMMIT failure cleans up only Bridge-staged proposal targets", { s
   }
 });
 
-test("initial COMMIT preserves a created root commit when exact-path post-verification fails", { skip: noFollowRequiredSkip }, async () => {
+test("initial COMMIT preserves a created root commit when post-publication preservation checks fail", { skip: noFollowRequiredSkip }, async () => {
   const root = unbornRepository();
   const anchorPath = "recovery-anchor.md";
   try {
@@ -965,7 +1356,7 @@ test("initial COMMIT preserves a created root commit when exact-path post-verifi
     const { controlled, taskId } = await appliedUnbornFixture(
       root,
       additionPatch,
-      mutateBeforeCommit(() => git(root, "add", anchorPath))
+      mutateAfterPublication(() => writeFileSync(join(root, anchorPath), "external change\n"))
     );
 
     await expectCode(
@@ -989,10 +1380,11 @@ test("initial COMMIT preserves a created root commit when exact-path post-verifi
         .trim()
         .split("\n")
         .sort(),
-      ["added.txt", anchorPath]
+      ["added.txt"]
     );
     assert.equal(git(root, "diff", "--cached", "--name-only"), "");
     assert.equal(git(root, "diff", "--name-only"), "");
+    assert.equal(readFileSync(join(root, anchorPath), "utf8"), "external change\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1328,7 +1720,7 @@ test("COMMIT reports post-commit verification failure without rolling back and r
     const { controlled, taskId } = await appliedFixture(
       root,
       validPatch,
-      mutateBeforeCommit(() => writeFileSync(anchorPath, "after\n"))
+      mutateAfterPublication(() => writeFileSync(anchorPath, "after\n"))
     );
     const beforeHead = git(root, "rev-parse", "HEAD").trim();
 
@@ -1666,21 +2058,15 @@ test("COMMIT creates one commit from exactly the applied proposal paths", async 
     );
     assert.equal(git(root, "status", "--porcelain"), "");
 
-    const commitCalls = gitCalls.filter(({ args }) => args.includes("commit"));
+    const commitCalls = gitCalls.filter(({ args }) => args.includes("update-ref"));
     assert.deepEqual(commitCalls, [{
       executable: "git",
-      args: [
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "commit.gpgSign=false",
-        "commit",
-        "--no-verify",
-        "-m",
-        "feat: commit applied patch"
-      ],
+      args: ["-c", "core.hooksPath=/dev/null", "update-ref", "-m",
+        "commit: feat: commit applied patch", "--stdin"],
       shell: false
     }]);
+    assert.equal(gitCalls.filter(({ args }) => args.includes("commit-tree")).length, 1);
+    assert.equal(git(root, "rev-parse", "HEAD^{tree}").trim(), git(root, "write-tree").trim());
     assert.equal(gitCalls.some(({ args }) => args.includes("push")), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1718,7 +2104,7 @@ test("COMMIT fails closed on missing Git identity without editing config", async
 test("COMMIT failure unstages only Bridge paths and preserves modified worktree content", async () => {
   const root = repository();
   const starter: GitStarter = (executable, args, options) => {
-    if (args.includes("commit")) {
+    if (args.includes("update-ref")) {
       return spawn(process.execPath, ["-e", "process.exit(1)"], options);
     }
     return spawn(executable, args, options);
@@ -1749,7 +2135,7 @@ test("COMMIT failure unstages only Bridge paths and preserves modified worktree 
 test("COMMIT failure leaves an added proposal file present and untracked after cleanup", async () => {
   const root = repository();
   const starter: GitStarter = (executable, args, options) => {
-    if (args.includes("commit")) {
+    if (args.includes("update-ref")) {
       return spawn(process.execPath, ["-e", "process.exit(1)"], options);
     }
     return spawn(executable, args, options);
@@ -1780,7 +2166,7 @@ test("COMMIT recovers success when the subprocess reports failure after HEAD adv
   const gitCalls: Array<readonly string[]> = [];
   const starter: GitStarter = (executable, args, options) => {
     gitCalls.push(args);
-    if (args.includes("commit")) {
+    if (args.includes("update-ref")) {
       return spawn(process.execPath, [
         "-e",
         "const cp=require('node:child_process');const [git,argsJson]=process.argv.slice(1);const r=cp.spawnSync(git,JSON.parse(argsJson),{cwd:process.cwd(),stdio:'inherit',shell:false});process.exit(r.status===0?1:(r.status??1));",
@@ -1806,23 +2192,20 @@ test("COMMIT recovers success when the subprocess reports failure after HEAD adv
     assert.equal(git(root, "rev-parse", "HEAD^").trim(), beforeHead);
     assert.equal(git(root, "status", "--porcelain"), "");
 
-    const commitCallIndex = gitCalls.findIndex((args) => args.includes("commit"));
+    const commitCallIndex = gitCalls.findIndex((args) => args.includes("update-ref"));
     assert.notEqual(commitCallIndex, -1);
-    assert.deepEqual(gitCalls.slice(commitCallIndex + 1), [
-      ["rev-parse", "HEAD"],
+    for (const expected of [
       ["rev-list", "--parents", "-n", "1", "HEAD"],
       ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD"],
       ["log", "-1", "--format=%s"],
       ["diff", "--cached", "--name-only", "-z"],
       ["diff", "--name-only", "-z", "--"],
-      ["rev-parse", "HEAD"],
-      ["rev-parse", "--git-dir"],
-      ["ls-files", "--stage", "-z", "--"],
-      ["ls-files", "--others", "--exclude-standard", "-z", "--"],
-      ["ls-files", "--others", "--exclude-standard", "-z", "--"],
-      ["rev-parse", "--git-dir"],
-      ["ls-files", "--stage", "-z", "--"]
-    ]);
+      ["ls-files", "--others", "--exclude-standard", "-z", "--"]
+    ]) {
+      assert.ok(gitCalls.slice(commitCallIndex + 1).some((args) => JSON.stringify(args) === JSON.stringify(expected)));
+    }
+    assert.equal(gitCalls.some((args) => args.includes("reset") || args.includes("rm")), false);
+    assert.equal(git(root, "rev-parse", "HEAD^{tree}").trim(), git(root, "write-tree").trim());
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

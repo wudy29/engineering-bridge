@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,14 +11,24 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { isolateGitLineEndings } from "./git-fixture.js";
 import { PATCH, until } from "./validation-run-fixture.js";
+import type { ValidationRun } from "../../src/tasks/validation-run.js";
 
 export { until };
 export async function mcpValidationFixture(t: TestContext) {
   const root = await fs.realpath(await fs.mkdtemp(join(tmpdir(), "bridge-mcp-async-")));
   const cleanup: Array<() => Promise<unknown>> = [];
+  const sessions: Array<() => Promise<unknown>> = [];
+  const retained: string[] = [];
   t.after(async () => {
     try { for (const close of cleanup.reverse()) await close(); }
-    finally { await fs.rm(root, { recursive: true, force: true }); }
+    finally {
+      try {
+        if (retained.length) {
+          const after = JSON.stringify({ stage: "after-fixture-cleanup", sessions: await Promise.all(sessions.map(snapshot => snapshot())) }, null, 2);
+          for (const path of retained) await fs.writeFile(join(path, "after-teardown.json"), after);
+        }
+      } finally { await fs.rm(root, { recursive: true, force: true }); }
+    }
   });
   const workspace = join(root, "project"); await fs.mkdir(workspace);
   const git = (...args: string[]) => execFileSync("git", args, { cwd: workspace, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -33,10 +44,20 @@ export async function mcpValidationFixture(t: TestContext) {
   const ready = join(root, "ready");
   const release = join(root, "release");
 
-  async function session(configPath = config) {
-    const child = spawn(process.execPath, [join(process.cwd(), "dist/src/mcp-stdio.js"), configPath], {
-      cwd: process.cwd(), env: getDefaultEnvironment(), stdio: "pipe", shell: false,
+  async function session(configPath = config, environment: Record<string, string> = {}) {
+    const tracePath = join(root, `trace-${sessions.length}.json`);
+    const diagnostic = process.env.BRIDGE_TEST_DIAGNOSTICS === "1";
+    const events: Record<string, unknown>[] = [];
+    const note = (event: string, data = {}) => events.push({ event, ms: Number(process.hrtime.bigint()) / 1e6, ...data });
+    const child = spawn(process.execPath, [
+      ...(diagnostic ? ["--import", join(process.cwd(), "dist/tests/helpers/validation-diagnostics.js")] : []),
+      join(process.cwd(), "dist/src/mcp-stdio.js"), configPath], {
+      cwd: process.cwd(), env: { ...getDefaultEnvironment(), ...environment,
+        ...(diagnostic ? { BRIDGE_TEST_TRACE: tracePath } : {}) }, stdio: "pipe", shell: false,
     });
+    note("bridge-spawn", { pid: child.pid });
+    child.on("exit", (code, signal) => note("bridge-exit", { code, signal }));
+    child.on("close", (code, signal) => note("bridge-close", { code, signal }));
     let stderr = "";
     child.stderr.on("data", chunk => { stderr = (stderr + String(chunk)).slice(-16_384); });
     child.stdin.on("error", () => undefined);
@@ -47,20 +68,27 @@ export async function mcpValidationFixture(t: TestContext) {
     const transport = new StdioServerTransport(child.stdout, child.stdin);
     const exited = () => child.exitCode !== null || child.signalCode !== null;
     const close = async () => {
+      note("fixture-cleanup-start");
       await client.close(); child.stdout.resume(); child.stdin.end();
       if (!exited()) child.kill("SIGTERM");
       try { await until(async () => exited(), 10_000); }
       finally { if (!exited()) child.kill("SIGKILL"); }
       await finished;
     };
+    sessions.push(async () => ({ pid: child.pid, stderr, events,
+      trace: diagnostic ? await fs.readFile(tracePath, "utf8").then(JSON.parse, error => ({ unavailable: error.code })) : null }));
     cleanup.push(close);
     await client.connect(transport);
     const call = async (name: string, args: Record<string, unknown>, timeout = 2500) => {
-      const result = await client.request({ method: "tools/call", params: { name, arguments: args } }, CallToolResultSchema, { timeout });
+      note("request", { name });
+      const result = await client.request({ method: "tools/call", params: { name, arguments: args } }, CallToolResultSchema, { timeout }).catch(error => {
+        note("request-error", { name, code: error.code, message: error.message }); throw error;
+      });
       const text = result.content.find(item => item.type === "text");
       let body: Record<string, unknown>;
       try { body = JSON.parse(text?.type === "text" ? text.text : "{}"); }
       catch { body = { raw: text?.type === "text" ? text.text : "" }; }
+      note("response", { name, state: body.state, status: body.status, reason: body.reason });
       return { isError: result.isError === true, body };
     };
     const ok = async (name: string, args: Record<string, unknown>, timeout?: number) => {
@@ -90,6 +118,33 @@ export async function mcpValidationFixture(t: TestContext) {
     workspace_id: "workspace", profile: profile(code, stepSeconds), confirmation: "CONFIGURE",
   });
   const readRun = async (id: string) => JSON.parse(await fs.readFile(join(directory, id + ".json"), "utf8"));
+  // Capture the actual request path and synthetic record BEFORE assertions and
+  // teardown. Diagnostic output lives outside the run store and never mutates it.
+  const terminal = async (id: string, expectedStatus: string) => {
+    const record = join(directory, id + ".json");
+    const before = await fs.readFile(record, "utf8");
+    let result: ValidationRun | undefined, requestError: unknown;
+    try { result = await connected.ok("get_controlled_patch_validation", { validation_run_id: id }) as unknown as ValidationRun; }
+    catch (error) { requestError = error; }
+    const after = await fs.readFile(record, "utf8");
+    let evidencePath: string | undefined;
+    if (result?.status !== expectedStatus || before !== after || process.env.BRIDGE_TEST_CAPTURE_ALL === "1") {
+      const parent = process.env.BRIDGE_TEST_EVIDENCE ?? tmpdir();
+      await fs.mkdir(parent, { recursive: true });
+      const evidence = await fs.mkdtemp(join(parent, "validation-")); evidencePath = join(evidence, "terminal.json");
+      retained.push(evidence);
+      const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+      await fs.writeFile(evidencePath, JSON.stringify({ test: t.name, capturedBeforeTeardown: true,
+        diagnostic: process.env.BRIDGE_TEST_DIAGNOSTICS === "1", expectedStatus, result,
+        requestError: requestError instanceof Error ? { message: requestError.message, code: (requestError as NodeJS.ErrnoException).code } : requestError,
+        before, after, beforeSha256: sha256(before), afterSha256: sha256(after), changed: before !== after,
+        sessions: await Promise.all(sessions.map(snapshot => snapshot())),
+      }, null, 2));
+      t.diagnostic(`terminal evidence: ${evidencePath}`);
+    }
+    if (!result) throw requestError;
+    return { result, evidencePath };
+  };
   // Raw rename visibility precedes directory fsync/publication. Wait for the
   // public committed snapshot before asserting a terminal query or revalidation.
   const waitForTerminal = (id: string) => until(async () =>
@@ -100,6 +155,6 @@ export async function mcpValidationFixture(t: TestContext) {
     assert.equal(await fs.readFile(config + ".controlled-patches.json", "utf8"), proposalSource,
       "validation must not change retained proposal lifecycle or applied history");
   };
-  return { root, workspace, config, directory, counter, ready, release, baseHead, patchTaskId,
+  return { root, workspace, config, directory, counter, ready, release, baseHead, patchTaskId, terminal,
     session, connected, configure, profile, script, blocking, readRun, waitForTerminal, untouched, cleanup, git };
 }

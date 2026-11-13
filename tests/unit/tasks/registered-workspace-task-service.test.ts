@@ -1587,3 +1587,80 @@ test("invalid explicit Dashboard titles are rejected before execution or observa
   assert.equal(executions, 0);
   assert.deepEqual(seen, []);
 });
+
+function shutdownService(service: RegisteredWorkspaceTaskService): Promise<void> {
+  const lifecycle = service as RegisteredWorkspaceTaskService & { shutdown(): Promise<void> };
+  assert.equal(typeof lifecycle.shutdown, "function", "F05 service owns bounded shutdown");
+  return lifecycle.shutdown();
+}
+
+for (const kind of ["legacy", "interactive"] as const) {
+  test(`F05 shutdown prevents queued ${kind} execution and rejects new admission`, async () => {
+    let executions = 0;
+    let finalized = 0;
+    const service = new RegisteredWorkspaceTaskService(registry(), () => ({ execute: async () => { executions++; return { kind: "completed", output: "unexpected" }; } }));
+    const request = { workspace_id: "known", instruction: "inspect" };
+    const { taskId } = kind === "legacy" ? service.runTask(request, undefined, () => { finalized++; }) : service.startTask(request);
+    const stopped = shutdownService(service);
+    assert.equal(shutdownService(service), stopped, "idempotent shutdown promise");
+    for (const admit of [() => service.runTask(request), () => service.startTask(request), () => service.submitControlledPatchTask("diff", true)]) {
+      assert.throws(admit, (error: unknown) => error instanceof CoreError && error.code === "INVALID_STATE_TRANSITION");
+    }
+    await stopped;
+    assert.equal(executions, 0);
+    assert.equal(service.taskView(taskId)?.error?.code, "TASK_INTERRUPTED");
+    assert.equal(finalized, kind === "legacy" ? 1 : 0);
+  });
+
+  test(`F05 shutdown waits for running ${kind} execution and retained partial output`, async () => {
+    const pending = deferred<ExecutorResult>();
+    let interrupts = 0;
+    const service = new RegisteredWorkspaceTaskService(registry(), () => ({
+      execute: () => pending.promise, interrupt: async () => { interrupts++; }
+    }));
+    const request = { workspace_id: "known", instruction: "inspect" };
+    const { taskId } = kind === "legacy" ? service.runTask(request) : service.startTask(request);
+    await Promise.resolve();
+    const stopped = shutdownService(service);
+    let settled = false; void stopped.then(() => { settled = true; });
+    await Promise.resolve();
+    assert.equal(interrupts, 1);
+    assert.equal(settled, false, "interrupt acknowledgement is not task completion");
+    pending.resolve({ kind: "interrupted", output: "real partial output" });
+    await stopped;
+    assert.equal(service.taskView(taskId)?.error?.code, "TASK_INTERRUPTED");
+    assert.equal(service.taskView(taskId)?.partial_output, "real partial output");
+  });
+}
+
+test("F05 shutdown leaves review output intact and blocks continuation", async () => {
+  const service = new RegisteredWorkspaceTaskService(registry(), () => ({ execute: async () => ({ kind: "completed", output: "review" }) }));
+  const { taskId } = service.startTask({ workspace_id: "known", instruction: "inspect" });
+  await waitForInteractiveReady(service, taskId);
+  await shutdownService(service);
+  assert.equal(service.taskView(taskId)?.review_output, "review");
+  await assert.rejects(service.controlTask(taskId, "continue", "again"), (error: unknown) => error instanceof CoreError && error.code === "INVALID_STATE_TRANSITION");
+  assert.equal(service.taskView(taskId)?.state, "waiting_for_supervisor_review");
+});
+
+test("F05 shutdown joins an already interrupted DSH task without losing partial output", async () => {
+  const harness = dshHarness();
+  const { taskId } = harness.service.startTask({ workspace_id: "known", instruction: "inspect", executor: "dsh" });
+  await Promise.resolve(); harness.write("partial before shutdown");
+  await harness.service.controlTask(taskId, "interrupt");
+  const stopped = shutdownService(harness.service);
+  harness.close(null); await stopped;
+  assert.equal(harness.service.taskView(taskId)?.partial_output, "partial before shutdown");
+  assert.equal(harness.service.taskView(taskId)?.error?.code, "TASK_INTERRUPTED");
+});
+
+test("F05 shutdown rejects at its bound when an executor does not settle", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const pending = deferred<ExecutorResult>();
+  const service = new RegisteredWorkspaceTaskService(registry(), () => ({ execute: () => pending.promise, interrupt: async () => undefined }));
+  service.startTask({ workspace_id: "known", instruction: "inspect" }); await Promise.resolve();
+  const stopped = shutdownService(service);
+  const rejected = assert.rejects(stopped, /shutdown/i);
+  t.mock.timers.tick(10_000); await rejected;
+  pending.resolve({ kind: "interrupted", output: "" });
+});
