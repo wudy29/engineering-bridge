@@ -168,6 +168,10 @@ test("MCP and Codex client metadata use the shared package VERSION, and stdio re
         z.object({ tools: z.array(z.custom<Tool>()), nextCursor: z.string().optional() }));
       rawTools.push(...page.tools); rawCursor = page.nextCursor;
     } while (rawCursor !== undefined);
+    // Separately reviewed additive schema delta; preserve the historical snapshot.
+    const runBaseline = baseline.tools.find((tool: Tool) => tool.name === "run_task");
+    runBaseline.inputSchema.properties.working_subpath = JSON.parse(
+      readFileSync("tests/fixtures/run-task-working-subpath-schema.json", "utf8"));
     // Entire objects include defaults, annotations, execution, and absent fields.
     assert.deepEqual({ server: client.getServerVersion(), tools: rawTools.sort((a, b) => a.name.localeCompare(b.name)) },
       { ...baseline, server: { ...baseline.server, version: VERSION } });
@@ -454,7 +458,9 @@ test("bind_project and create_project register workspaces inside approved projec
       workspace_id: "manual",
       root: manualProject,
       allow_write: true,
-      source: "manual"
+      source: "manual",
+      requested_path: manualProject,
+      working_subpath: "."
     });
 
     // Binding a new project creates a managed workspace and reuses its id.
@@ -1180,5 +1186,43 @@ test("malformed validation profile state stays lazy for startup, listing, and an
     assert.equal(readFileSync(profilePath, "utf8"), "{not-json\n");
   } finally {
     await client.close();
+  }
+});
+
+test("MCP nested BIND registers Git root and run_task enforces forwarded working_subpath for both executors", async t => {
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "bridge-subproject-mcp-")));
+  const repo = join(root, "repo"); const sub = join(repo, "app");
+  mkdirSync(sub, { recursive: true }); execFileSync("git", ["init", "--quiet", repo]);
+  const config = join(root, "workspaces.json");
+  writeFileSync(config, JSON.stringify([{ kind: "project_root", root }]));
+  const client = new Client({ name: "subproject-test", version: "1" });
+  const transport = new StdioClientTransport({ command: process.execPath,
+    args: [join(process.cwd(), "dist/src/mcp-stdio.js"), config], cwd: process.cwd(), stderr: "pipe" });
+  t.after(async () => { await client.close(); rmSync(root, { recursive: true, force: true }); });
+  await client.connect(transport);
+  const call = async (name: string, args: Record<string, unknown>) => {
+    const result = await client.callTool({ name, arguments: args });
+    const text = (result.content as Array<{ text: string }>)[0]!.text;
+    let body;
+    try { body = JSON.parse(text); } catch { body = { raw: text }; }
+    return { isError: result.isError === true, body };
+  };
+  const bound = await call("bind_project", { project_path: sub, confirmation: "BIND" });
+  assert.equal(bound.isError, false); assert.equal(bound.body.root, repo);
+  assert.equal(bound.body.requested_path, sub); assert.equal(bound.body.working_subpath, "app");
+  for (const executor of ["codex", "dsh"]) {
+    const run = await call("run_task", { workspace_id: bound.body.workspace_id, instruction: "inspect", executor, working_subpath: "../outside" });
+    assert.equal(run.isError, false);
+    let view;
+    for (let i = 0; i < 100; i++) {
+      view = (await call("task_result", { task_id: run.body.task_id })).body;
+      if (view.ready) break;
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(view.error?.code, "WORKSPACE_BOUNDARY_VIOLATION");
+  }
+  for (const working_subpath of ["", 42, null]) {
+    const rejected = await call("run_task", { workspace_id: bound.body.workspace_id, instruction: "inspect", working_subpath });
+    assert.equal(rejected.isError, true); assert.equal(rejected.body.task_id, undefined);
   }
 });

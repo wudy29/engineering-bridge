@@ -259,18 +259,20 @@ async function main(): Promise<void> {
     description: "Run a read-only task with the selected executor in a pre-registered workspace. This tool does not modify workspace files.",
     inputSchema: z.object({
       workspace_id: z.string().min(1),
+      working_subpath: z.string().min(1).optional().describe("Optional existing directory relative to the workspace root, using forward slashes. Selects cwd only; does not grant disk access or restrict controlled patches."),
       instruction: z.string().min(1),
       dashboard_title: dashboardLabelSchema.optional().describe("Optional public title for the local Dashboard (single line, at most 100 characters). Supply explicitly; never derive from private instruction, output, evidence or diagnostics."),
       executor: z.enum(["codex", "dsh"]).optional().default("codex"),
       model: z.string().min(1).optional(),
       reasoning_effort: z.string().min(1).optional()
     }).meta({ additionalProperties: false })
-  }, ({ workspace_id, instruction, dashboard_title, executor, model, reasoning_effort }) => {
+  }, ({ workspace_id, working_subpath, instruction, dashboard_title, executor, model, reasoning_effort }) => {
     try {
       if (executor === "dsh" && (model !== undefined || reasoning_effort !== undefined)) {
         throw new CoreError("UNSUPPORTED_ACTION");
       }
       const { taskId } = service.startTask({ workspace_id, instruction, executor,
+        ...(working_subpath === undefined ? {} : { working_subpath }),
         ...(dashboard_title === undefined ? {} : { dashboard_title }),
         ...(model === undefined ? {} : { model }),
         ...(reasoning_effort === undefined ? {} : { reasoning_effort }) });

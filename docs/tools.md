@@ -12,9 +12,11 @@ Any other policy value, including an empty string or a case variant, fails Bridg
 
 ## `run_task`
 
-Inputs: `workspace_id`, `instruction`, optional `executor` (`"codex" | "dsh"`, default `codex`), and optional Codex-only `model` and `reasoning_effort`.
+Inputs: `workspace_id`, `instruction`, optional `working_subpath`, optional `executor` (`"codex" | "dsh"`, default `codex`), and optional Codex-only `model` and `reasoning_effort`.
 
 Starts a supervised task with the selected executor and returns `task_id`. `run_task` is always read-only: Codex uses approval `never`, a read-only sandbox policy, and disabled network access; DSH is pinned read-only per process. Codex validates requested model/reasoning support through `model/list`; DSH rejects either option. An unknown workspace becomes a failed task; it does not grant access to a new path. The executor selection is fixed for the task lifetime and reported honestly in `task_result`.
+
+`working_subpath` selects an existing directory relative to the registered workspace root for both executors. Omit it to retain the existing root cwd, or use `.` for the root. Use forward slashes; absolute, drive-relative, UNC, backslash, NUL and `..` segments are rejected. Canonical resolution rejects symlinks escaping the workspace; missing paths and files also fail before executor creation. Continuation rechecks the selected directory. This parameter grants no disk authorization and imposes no write scope; `run_task` stays read-only. Controlled patches still use the registered Git root and their existing APPLY/COMMIT gates.
 
 ## `task_result`
 
@@ -50,7 +52,15 @@ Running generated/refined proposal tasks also accept `interrupt`, and Codex prop
 
 Inputs: `project_path`, `confirmation` (must equal `BIND` exactly).
 
-Registers an existing directory inside a configured `project_root` as a read-only managed workspace. The path must already exist, resolve inside an approved root (canonical real-path containment), and not already be registered. Returns the `workspace_id`; registration persists to `<config>.managed-workspaces.json`. A managed workspace does not gain controlled-write permission from binding.
+Registers an existing directory inside a configured `project_root` as a read-only managed workspace. The path must already exist, resolve inside an approved root (canonical real-path containment), and may reuse an existing root registration. Returns the `workspace_id`; registration persists to `<config>.managed-workspaces.json`. A managed workspace does not gain controlled-write permission from binding.
+
+When binding a directory inside Git, Bridge discovers the actual top-level and requires both the requested directory and the Git root to remain within configured `project_root` authorization. A root outside that boundary is rejected even if already registered. The response adds `requested_path` (the original input) and `working_subpath` (canonical, forward-slash relative path, or `.`). Bind the returned `workspace_id` with that `working_subpath` when starting a subproject task.
+
+Registration deduplicates by canonical Git root, retaining an existing root registration's ID, source and write permission. Non-Git directories remain supported. Legacy child-root IDs and persisted configuration remain valid without migration or widened authorization; if no root registration exists, a new read-only root ID is created and the old child ID is retained. Linked Git worktrees retain their own top-level identity. Corrupt Git metadata fails closed.
+
+### Subproject MCP schema review
+
+The only input Schema change is optional `run_task.working_subpath`: string, minimum length 1, no default, absent from `required`. Names, other properties, defaults, annotations, execution metadata and confirmation literals of all 15 tools remain unchanged. `bind_project` adds response fields only. Full source and package catalog checks compare the historical v1.6.0 snapshot plus `tests/fixtures/run-task-working-subpath-schema.json`; the historical snapshot is unchanged. This is an unreleased candidate change requiring separate schema approval before integration.
 
 ## `create_project`
 

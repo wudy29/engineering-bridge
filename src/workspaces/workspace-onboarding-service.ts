@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { lstat, mkdir, realpath, rmdir } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 
 import { CoreError } from "../core/errors.js";
 import {
@@ -18,6 +18,8 @@ export type { GitStarter };
 export interface BindWorkspaceResult {
   readonly workspace_id: string;
   readonly root: string;
+  readonly requested_path: string;
+  readonly working_subpath: string;
   readonly allow_write: boolean;
   readonly source: "manual" | "managed";
 }
@@ -46,18 +48,24 @@ export class WorkspaceOnboardingService {
   async bind(request: { project_path: string }): Promise<BindWorkspaceResult> {
     const canonical = await this.canonicalizeWithinApprovedRoot(request.project_path);
     if (!(await isDirectory(canonical))) throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
-    const existing = this.registry.findByRoot(canonical);
+    const root = await this.workspaceRoot(canonical);
+    const location = {
+      requested_path: request.project_path,
+      working_subpath: relative(root, canonical).split(sep).join("/") || "."
+    };
+    const existing = this.registry.findByRoot(root);
     if (existing !== undefined) {
       return {
+        ...location,
         workspace_id: existing.id,
         root: existing.root,
         allow_write: existing.allowWrite,
         source: existing.source
       };
     }
-    const { id } = await this.catalog.registerOnce(canonical);
-    this.registry.registerManaged(id, canonical);
-    return { workspace_id: id, root: canonical, allow_write: false, source: "managed" };
+    const { id } = await this.catalog.registerOnce(root);
+    this.registry.registerManaged(id, root);
+    return { ...location, workspace_id: id, root, allow_write: false, source: "managed" };
   }
 
   async create(request: { parent: string; name: string }): Promise<CreateWorkspaceResult> {
@@ -98,6 +106,27 @@ export class WorkspaceOnboardingService {
     await this.catalog.authorize(root);
     this.registry.authorizeWrite(workspaceId);
     return { workspace_id: workspaceId, allow_write: true };
+  }
+
+  private async workspaceRoot(canonical: string): Promise<string> {
+    // Locate repository metadata before invoking Git: plain directories keep
+    // working without Git installed; corrupt repositories must fail closed.
+    let directory = canonical;
+    while (true) {
+      if (await pathExists(join(directory, ".git"))) {
+        await this.canonicalizeWithinApprovedRoot(directory);
+        const output = await this.git(canonical, ["rev-parse", "--show-toplevel"]);
+        // Remove only Git's record terminator, preserving whitespace in paths.
+        const root = await this.canonicalizeWithinApprovedRoot(output.replace(process.platform === "win32" ? /\r?\n$/ : /\n$/, ""));
+        if (root !== directory || !isPathWithin(root, canonical)) {
+          throw new CoreError("WORKSPACE_PRECONDITION_FAILED");
+        }
+        return root;
+      }
+      const parent = dirname(directory);
+      if (parent === directory) return canonical;
+      directory = parent;
+    }
   }
 
   private async canonicalizeWithinApprovedRoot(path: string): Promise<string> {

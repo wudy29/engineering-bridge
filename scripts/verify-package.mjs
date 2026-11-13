@@ -23,6 +23,9 @@ const root = await fs.realpath(await fs.mkdtemp(join(keep ? resolve(keep) : tmpd
 const staging = join(root, "source"), consumer = join(root, "consumer");
 const marker = "PRIVATE_PACK_SENTINEL_" + randomUUID();
 const baseline = JSON.parse(await fs.readFile(join(source, "tests/fixtures/mcp-tools-v1.6.0.json"), "utf8"));
+// The next candidate adds only this separately reviewed optional run_task input.
+baseline.tools.find(tool => tool.name === "run_task").inputSchema.properties.working_subpath =
+  JSON.parse(await fs.readFile(join(source, "tests/fixtures/run-task-working-subpath-schema.json"), "utf8"));
 const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
 const declared = JSON.parse(await fs.readFile(join(source, "package.json"), "utf8"));
 const lockBytes = await fs.readFile(join(source, "package-lock.json"));
