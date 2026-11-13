@@ -1190,7 +1190,7 @@ test("malformed validation profile state stays lazy for startup, listing, and an
 });
 
 test("MCP nested BIND registers Git root and run_task enforces forwarded working_subpath for both executors", async t => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "bridge-subproject-mcp-")));
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "bridge-subproject-mcp-")));
   const repo = join(root, "repo"); const sub = join(repo, "app");
   mkdirSync(sub, { recursive: true }); execFileSync("git", ["init", "--quiet", repo]);
   const config = join(root, "workspaces.json");

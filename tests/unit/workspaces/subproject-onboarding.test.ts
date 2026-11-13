@@ -11,7 +11,7 @@ import { WorkspaceOnboardingService } from "../../../src/workspaces/workspace-on
 import { RegisteredWorkspaceTaskService } from "../../../src/tasks/registered-workspace-task-service.js";
 
 function fixture(t: test.TestContext) {
-  const approved = realpathSync(mkdtempSync(join(tmpdir(), "bridge-subproject-")));
+  const approved = realpathSync.native(mkdtempSync(join(tmpdir(), "bridge-subproject-")));
   t.after(() => rmSync(approved, { recursive: true, force: true }));
   const repo = join(approved, process.platform === "win32" ? "硅基秘书 space" : "硅基秘书 space ");
   const sub = join(repo, "material-secretary");
